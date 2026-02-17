@@ -17,7 +17,7 @@ import qualified Data.Vector.Mutable as MV
 
 import Audio.Envelope
 import Audio.Filter
-import Audio.Oscillator
+import Audio.Oscillator (oscSetHz, oscStepWrap, oscResetPhase0)
 import Sound.Miniaudio.RingBuffer
 
 import Audio.Thread.Types
@@ -88,28 +88,30 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
                 env0 = if hold <= 0 then envRelease (vEnv v) else vEnv v
                 (env1, lvl) = envStep srF (vADSR v) env0
 
+            -- vibrato ratio
             let ph0 = vVibPhase v
                 vibOn = vibRateHz > 0 && vibDepthCents > 0
                 vibCents = if vibOn then vibDepthCents * sin (2*pi*ph0) else 0
                 vibRatio = if vibOn then centsToRatio vibCents else 1
-
                 ph1 =
                   if vibOn
                     then let x = ph0 + (vibRateHz / srF)
                          in x - fromIntegral (floor x ∷ Int)
                     else ph0
 
-                o0 = vOsc v
-                oVib = o0 { oTargetInc = vBaseInc v * vibRatio }
-                (osc1, x0) = oscStep oVib
+            -- Step osc layers with hard-sync (Step B)
+            let nOsc = vOscCount v
+            xSum <- stepOscsSync4 srF nOsc vibRatio v
 
-                (mfilt1, mfenv1, tick1, x1) =
+            -- filter
+            let (mfilt1, mfenv1, tick1, x1) =
                   case vFilter v of
-                    Nothing -> (Nothing, vFiltEnv v, vFiltTick v, x0)
+                    Nothing -> (Nothing, vFiltEnv v, vFiltTick v, xSum)
                     Just fs0 ->
                       let spec = fsSpec fs0
                           tick0 = vFiltTick v
                           tickN = tick0 + 1
+
                           (mfenvN, envLvl) =
                             if fEnvAmountOct spec == 0 && fQEnvAmount spec == 0
                               then (vFiltEnv v, 0)
@@ -128,10 +130,10 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
                               then filterRetune srF cutoffHz qEff fs0
                               else fs0
 
-                          (fs1, y0) = filterStep srF fsRetuned x0
+                          (fs1, y0) = filterStep srF fsRetuned xSum
                       in (Just fs1, mfenvN, tickN, y0)
 
-                sL = realToFrac (x1 * (vAmpL v * lvl)) :: CFloat
+            let sL = realToFrac (x1 * (vAmpL v * lvl)) :: CFloat
                 sR = realToFrac (x1 * (vAmpR v * lvl)) :: CFloat
 
             curL <- peek p
@@ -140,8 +142,7 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
             poke (p `advancePtr` 1) (curR + sR)
 
             let v' = v
-                  { vOsc = osc1
-                  , vFilter = mfilt1
+                  { vFilter = mfilt1
                   , vFiltEnv = mfenv1
                   , vFiltTick = tick1
                   , vEnv = env1
@@ -150,4 +151,55 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
                   }
 
             go (i+1) (p `advancePtr` 2) v'
+
   go 0 out v0
+
+-- | Step up to 4 oscillator layers, applying hard sync:
+-- if layer i has vSyncMaster[i] = m >= 0, and master m wrapped this sample,
+-- reset layer i phase to 0 before stepping.
+--
+-- No allocations; uses fixed locals for wrapped flags.
+stepOscsSync4 ∷ Float → Int → Float → Voice → IO Float
+stepOscsSync4 srF n vibRatio v = do
+  let baseHz = vNoteHz v
+
+  let stepOne li wm0 wm1 wm2 wm3 = do
+        osc0 <- MV.read (vOscs v) li
+        lvl  <- MV.read (vLevels v) li
+        rat  <- MV.read (vPitchRat v) li
+        off  <- MV.read (vHzOffset v) li
+        m    <- MV.read (vSyncMaster v) li
+
+        let masterWrapped =
+              case m of
+                0 -> wm0
+                1 -> wm1
+                2 -> wm2
+                3 -> wm3
+                _ -> False
+            oscR = if m >= 0 && masterWrapped then oscResetPhase0 osc0 else osc0
+
+        let hz = max 0 (baseHz * rat * vibRatio + off)
+            oscT = oscSetHz srF hz oscR
+            (osc1, x, wrapped) = oscStepWrap oscT
+
+        MV.write (vOscs v) li osc1
+        pure (lvl * x, wrapped)
+
+  -- layer 0
+  (x0, w0) <-
+    if n > 0 then stepOne 0 False False False False else pure (0, False)
+
+  -- layer 1
+  (x1, w1) <-
+    if n > 1 then stepOne 1 w0 False False False else pure (0, False)
+
+  -- layer 2
+  (x2, w2) <-
+    if n > 2 then stepOne 2 w0 w1 False False else pure (0, False)
+
+  -- layer 3
+  (x3, _w3) <-
+    if n > 3 then stepOne 3 w0 w1 w2 False else pure (0, False)
+
+  pure (x0 + x1 + x2 + x3)

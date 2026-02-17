@@ -4,6 +4,8 @@ module Audio.Oscillator
   ( Osc(..)
   , oscInit
   , oscStep
+  , oscStepWrap
+  , oscResetPhase0
   , hzToPhaseInc
   , oscSetHz
   , oscSetGlideSec
@@ -23,7 +25,6 @@ data Osc = Osc
   , oGlideCoeff  ∷ !Float
 
   -- Triangle integrator state (used only for WaveTriangle).
-  -- We keep it always so waveform switching can be click-free.
   , oTriState    ∷ !Float
   } deriving (Eq, Show)
 
@@ -35,7 +36,7 @@ oscInit wf sampleRate hz =
       , oPhase = 0
       , oPhaseInc = inc
       , oTargetInc = inc
-      , oGlideCoeff = 1  -- default: no glide unless configured
+      , oGlideCoeff = 1
       , oTriState = 0
       }
 
@@ -43,16 +44,10 @@ hzToPhaseInc ∷ Float → Float → Float
 hzToPhaseInc sampleRate hz =
   if sampleRate <= 0 then 0 else hz / sampleRate
 
--- | Set target frequency (for legato glide).
 oscSetHz ∷ Float → Float → Osc → Osc
 oscSetHz sampleRate hz o =
   o { oTargetInc = hzToPhaseInc sampleRate hz }
 
--- | Configure glide time (seconds). 0 disables glide.
--- We compute a per-sample smoothing coefficient:
---   inc += coeff * (target - inc)
--- with:
---   coeff = 1 - exp(-1/(glideSec*sampleRate))
 oscSetGlideSec ∷ Float → Float → Osc → Osc
 oscSetGlideSec sampleRate glideSec o =
   let coeff
@@ -63,26 +58,34 @@ oscSetGlideSec sampleRate glideSec o =
             in 1 - realToFrac a
   in o { oGlideCoeff = coeff }
 
+-- NEW
+oscResetPhase0 ∷ Osc → Osc
+oscResetPhase0 o = o { oPhase = 0 }
+
 -- | Step oscillator by one sample, returning (newOsc, sample in [-1,1]).
 oscStep ∷ Osc → (Osc, Float)
 oscStep o0 =
+  let (o1, s, _wrapped) = oscStepWrap o0
+  in (o1, s)
+
+-- NEW: like oscStep, but also returns phase wrap indicator.
+oscStepWrap ∷ Osc → (Osc, Float, Bool)
+oscStepWrap o0 =
   let coeff = oGlideCoeff o0
       inc0  = oPhaseInc o0
       incT  = oTargetInc o0
       inc1  = inc0 + coeff * (incT - inc0)
 
       ph0 = oPhase o0
-
-      -- Produce sample; triangle needs to update integrator state.
       (s, tri1) = oscSample (oWaveform o0) ph0 inc1 (oTriState o0)
 
       p1 = ph0 + inc1
+      wrapped = p1 >= 1
       p' = p1 - fromIntegral (floor p1 ∷ Int)
       o1 = o0 { oPhase = p', oPhaseInc = inc1, oTriState = tri1 }
-  in (o1, s)
+  in (o1, s, wrapped)
 
--- | PolyBLEP function for band-limiting waveform discontinuities.
--- t in [0,1), dt = phase increment (cycles/sample).
+-- PolyBLEP
 polyBlep ∷ Float → Float → Float
 polyBlep t dt
   | dt <= 0   = 0
@@ -94,8 +97,6 @@ polyBlep t dt
       in x*x + x + x + 1
   | otherwise = 0
 
--- | Band-limited square (PolyBLEP corrected).
--- Returns output in roughly [-1,1].
 blSquare ∷ Float → Float → Float
 blSquare ph dt =
   let naive = if ph < 0.5 then 1 else -1
@@ -110,7 +111,6 @@ clamp lo hi x
   | x > hi    = hi
   | otherwise = x
 
--- | Sample oscillator. Returns (sample, newTriangleState).
 oscSample ∷ Waveform → Float → Float → Float → (Float, Float)
 oscSample wf ph dt tri0 =
   case wf of
@@ -125,16 +125,9 @@ oscSample wf ph dt tri0 =
       (blSquare ph dt, tri0)
 
     WaveTriangle ->
-      -- Triangle via leaky integration of band-limited square.
-      --
-      -- Ideal relationship: triangle is integral of square.
-      -- Discrete time: tri[n] = tri[n-1] + k * square[n]
-      --
-      -- Use k = 4*dt so amplitude stays ~[-1,1] across frequency.
-      -- Add a tiny leak to avoid DC drift.
       let sq = blSquare ph dt
           k  = 4 * dt
-          leak = 0.001  -- small; performance-first, good enough
+          leak = 0.001
           tri1 = (1 - leak) * (tri0 + k * sq)
           triOut = clamp (-1) 1 tri1
       in (triOut, tri1)

@@ -12,9 +12,7 @@ module Audio.Thread.Voice
   , panGains
   ) where
 
-import Control.Monad (when)
 import Data.Word (Word32)
-import Data.Word (Word64)
 import qualified Data.Vector.Mutable as MV
 
 import Audio.Types
@@ -27,6 +25,7 @@ import Audio.Filter
   , keyTrackedBaseCutoff
   )
 import Audio.Filter.Types (FilterSpec(..))
+
 import Audio.Thread.Types
 import Audio.Thread.InstrumentTable
   ( lookupInstrument
@@ -43,6 +42,72 @@ noteIdToHz nid =
 
 midiToHz ∷ Int → Float
 midiToHz n = 440 * (2 ** ((fromIntegral n - 69) / 12))
+
+pitchSpecRatio ∷ PitchSpec → Float
+pitchSpecRatio ps =
+  let oct = fromIntegral (psOctaves ps) ∷ Float
+      semi = psSemitones ps
+      cents = psCents ps
+  in (2 ** oct) * (2 ** (semi / 12)) * (2 ** (cents / 1200))
+
+normalizeLayers ∷ Instrument → [OscLayer]
+normalizeLayers inst =
+  case iOscs inst of
+    [] ->
+      [ OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync ]
+    xs -> take maxLayers xs
+
+layerMasterIx ∷ Int → SyncSpec → Int
+layerMasterIx layerIx s =
+  case s of
+    NoSync -> -1
+    HardSyncTo m ->
+      if m >= 0 && m < layerIx then m else -1
+
+mkVoiceLayers
+  ∷ Float
+  → Float
+  → [OscLayer]
+  → IO ( MV.IOVector Osc
+       , MV.IOVector Float
+       , MV.IOVector Float
+       , MV.IOVector Float
+       , MV.IOVector Int
+       , Int
+       )
+mkVoiceLayers srF baseHz layers = do
+  oscs   <- MV.new maxLayers
+  levels <- MV.new maxLayers
+  rats   <- MV.new maxLayers
+  hzOff  <- MV.new maxLayers
+  syncM  <- MV.new maxLayers
+
+  let n = length layers
+
+  let go i
+        | i >= maxLayers = pure ()
+        | i < n =
+            case layers !! i of
+              OscLayer wf ps lvl syncSpec -> do
+                let ratio = pitchSpecRatio ps
+                    hz    = baseHz * ratio + psHzOffset ps
+                    master = layerMasterIx i syncSpec
+                MV.write oscs i (oscInit wf srF (max 0 hz))
+                MV.write levels i lvl
+                MV.write rats i ratio
+                MV.write hzOff i (psHzOffset ps)
+                MV.write syncM i master
+                go (i+1)
+        | otherwise = do
+            MV.write oscs i (oscInit WaveSine srF 0)
+            MV.write levels i 0
+            MV.write rats i 1
+            MV.write hzOff i 0
+            MV.write syncM i (-1)
+            go (i+1)
+
+  go 0
+  pure (oscs, levels, rats, hzOff, syncM, max 1 n)
 
 findLegatoVoiceIxNewest ∷ InstrumentId → AudioState → IO (Maybe Int)
 findLegatoVoiceIxNewest iid st = do
@@ -74,46 +139,36 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
           ampR = baseR
           adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
           env0 = envInit
-          osc0 = oscInit WaveSine srF freqHz
-          baseInc = hzToPhaseInc srF freqHz
 
-          v = Voice osc0 Nothing Nothing 0 freqHz baseInc holdFrames baseL baseR ampL ampR
-                    adsr' env0 Nothing Nothing (stNow st) 0
+      (oscs, levels, rats, hzOff, syncM, oscCount) <-
+        mkVoiceLayers srF freqHz [OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync]
+
+      let v = Voice
+                { vOscs = oscs
+                , vOscCount = oscCount
+                , vLevels = levels
+                , vPitchRat = rats
+                , vHzOffset = hzOff
+                , vSyncMaster = syncM
+                , vFilter = Nothing
+                , vFiltEnv = Nothing
+                , vFiltTick = 0
+                , vNoteHz = freqHz
+                , vHoldRemain = holdFrames
+                , vBaseAmpL = baseL
+                , vBaseAmpR = baseR
+                , vAmpL = ampL
+                , vAmpR = ampR
+                , vADSR = adsr'
+                , vEnv = env0
+                , vNoteId = Nothing
+                , vInstrId = Nothing
+                , vStartedAt = stNow st
+                , vVibPhase = 0
+                }
 
       MV.write vec n v
       pure st { stActiveCount = n + 1, stNow = stNow st + 1 }
-
-releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
-releaseInstrumentAllVoices iid st = do
-  let vec = stVoices st
-      n   = stActiveCount st
-      go i
-        | i >= n = pure st
-        | otherwise = do
-            v <- MV.read vec i
-            if vInstrId v == Just iid
-              then do
-                let fe' = fmap envRelease (vFiltEnv v)
-                MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe', vHoldRemain = 0 }
-              else pure ()
-            go (i+1)
-  go 0
-
-releaseInstrumentNote ∷ InstrumentId → NoteId → AudioState → IO AudioState
-releaseInstrumentNote iid nid st = do
-  let vec = stVoices st
-      n   = stActiveCount st
-      go i
-        | i >= n    = pure st
-        | otherwise = do
-            v <- MV.read vec i
-            if vInstrId v == Just iid && vNoteId v == Just nid
-              then do
-                let fe' = fmap envRelease (vFiltEnv v)
-                MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe' }
-              else pure ()
-            go (i+1)
-  go 0
 
 applyInstrumentToActiveVoices ∷ Word32 → InstrumentId → Instrument → AudioState → IO AudioState
 applyInstrumentToActiveVoices srW iid inst st = do
@@ -121,7 +176,9 @@ applyInstrumentToActiveVoices srW iid inst st = do
       n   = stActiveCount st
       srF = fromIntegral srW ∷ Float
 
-      needsFiltEnv ∷ FilterSpec → Bool
+      layers = normalizeLayers inst
+      layerN = length layers
+
       needsFiltEnv spec = fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0
 
       go i
@@ -131,12 +188,33 @@ applyInstrumentToActiveVoices srW iid inst st = do
             if vInstrId v /= Just iid
               then go (i+1)
               else do
-                let osc1 = (vOsc v) { oWaveform = iWaveform inst }
-                    ampL' = vBaseAmpL v * iGain inst
+                let baseHz = vNoteHz v
+                let updateLayer li
+                      | li >= maxLayers = pure ()
+                      | li < layerN =
+                          case layers !! li of
+                            OscLayer wf ps lvl syncSpec -> do
+                              osc0 <- MV.read (vOscs v) li
+                              MV.write (vOscs v) li (osc0 { oWaveform = wf })
+                              MV.write (vLevels v) li lvl
+                              MV.write (vPitchRat v) li (pitchSpecRatio ps)
+                              MV.write (vHzOffset v) li (psHzOffset ps)
+                              MV.write (vSyncMaster v) li (layerMasterIx li syncSpec)
+                              updateLayer (li+1)
+                      | otherwise = do
+                          MV.write (vLevels v) li 0
+                          MV.write (vPitchRat v) li 1
+                          MV.write (vHzOffset v) li 0
+                          MV.write (vSyncMaster v) li (-1)
+                          updateLayer (li+1)
+
+                updateLayer 0
+
+                let ampL' = vBaseAmpL v * iGain inst
                     ampR' = vBaseAmpR v * iGain inst
                     adsr' = iAdsrDefault inst
 
-                    (mfilt', mfenv') =
+                let (mfilt', mfenv') =
                       case iFilter inst of
                         Nothing -> (Nothing, Nothing)
                         Just spec ->
@@ -148,18 +226,24 @@ applyInstrumentToActiveVoices srW iid inst st = do
                                   else Nothing
                               fs' =
                                 case vFilter v of
-                                  Nothing -> filterStateInit srF (vNoteHz v) spec
+                                  Nothing -> filterStateInit srF baseHz spec
                                   Just fs0 ->
-                                    let baseCutoff = keyTrackedBaseCutoff (vNoteHz v) spec
+                                    let baseCutoff = keyTrackedBaseCutoff baseHz spec
                                         qEff      = fQ spec
                                         fs1 = fs0 { fsSpec = spec }
                                     in filterRetune srF baseCutoff qEff fs1
                           in (Just fs', env')
 
-                    v' = v { vOsc = osc1, vAmpL = ampL', vAmpR = ampR', vADSR = adsr'
-                           , vFilter = mfilt', vFiltEnv = mfenv', vFiltTick = 0
-                           }
-                MV.write vec i v'
+                MV.write vec i v
+                  { vOscCount = max 1 layerN
+                  , vAmpL = ampL'
+                  , vAmpR = ampR'
+                  , vADSR = adsr'
+                  , vFilter = mfilt'
+                  , vFiltEnv = mfenv'
+                  , vFiltTick = 0
+                  }
+
                 go (i+1)
 
   go 0
@@ -180,8 +264,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
     Nothing -> pure st
     Just inst -> do
       let srF = fromIntegral (sampleRate h) ∷ Float
-          freqHz = noteIdToHz nid
-          baseInc = hzToPhaseInc srF freqHz
+          baseHz = noteIdToHz nid
           holdFrames = maxBound `div` 4
           now' = stNow st + 1
 
@@ -192,12 +275,40 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
       legRetrigAmp <- lookupLegatoAmpRetrig iid st
       mLegIx <- findLegatoVoiceIxNewest iid st
 
+      let layers = normalizeLayers inst
+          layerN = length layers
+
       case mLegIx of
         Just ix -> do
           v <- MV.read (stVoices st) ix
 
-          let osc1 = oscSetGlideSec srF glideSec $ oscSetHz srF freqHz (vOsc v)
-              ampL' = vBaseAmpL v * iGain inst
+          let updateLayer li
+                | li >= maxLayers = pure ()
+                | li < layerN =
+                    case layers !! li of
+                      OscLayer wf ps lvl syncSpec -> do
+                        let ratio = pitchSpecRatio ps
+                            hz    = baseHz * ratio + psHzOffset ps
+                        osc0 <- MV.read (vOscs v) li
+                        let osc1 = oscSetGlideSec srF glideSec
+                                 $ oscSetHz srF (max 0 hz)
+                                 $ (osc0 { oWaveform = wf })
+                        MV.write (vOscs v) li osc1
+                        MV.write (vLevels v) li lvl
+                        MV.write (vPitchRat v) li ratio
+                        MV.write (vHzOffset v) li (psHzOffset ps)
+                        MV.write (vSyncMaster v) li (layerMasterIx li syncSpec)
+                        updateLayer (li+1)
+                | otherwise = do
+                    MV.write (vLevels v) li 0
+                    MV.write (vPitchRat v) li 1
+                    MV.write (vHzOffset v) li 0
+                    MV.write (vSyncMaster v) li (-1)
+                    updateLayer (li+1)
+
+          updateLayer 0
+
+          let ampL' = vBaseAmpL v * iGain inst
               ampR' = vBaseAmpR v * iGain inst
               adsr' = iAdsrDefault inst
               envAmp' = if legRetrigAmp then envInit else vEnv v
@@ -208,9 +319,9 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                   Just spec ->
                     let fs' =
                           case vFilter v of
-                            Nothing -> filterStateInit srF freqHz spec
+                            Nothing -> filterStateInit srF baseHz spec
                             Just fs0 ->
-                              let baseCutoff = keyTrackedBaseCutoff freqHz spec
+                              let baseCutoff = keyTrackedBaseCutoff baseHz spec
                                   qEff = fQ spec
                                   fs1 = fs0 { fsSpec = spec }
                               in filterRetune srF baseCutoff qEff fs1
@@ -225,15 +336,21 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                             else Nothing
                     in (Just fs', env')
 
-              v' = v { vOsc = osc1, vNoteHz = freqHz, vBaseInc = baseInc
-                     , vNoteId = Just nid, vHoldRemain = holdFrames
-                     , vAmpL = ampL', vAmpR = ampR'
-                     , vADSR = adsr', vEnv = envAmp'
-                     , vFilter = mfilt', vFiltEnv = mfenv', vFiltTick = 0
-                     , vStartedAt = now'
-                     }
+          MV.write (stVoices st) ix v
+            { vOscCount = max 1 layerN
+            , vNoteHz = baseHz
+            , vNoteId = Just nid
+            , vHoldRemain = holdFrames
+            , vAmpL = ampL'
+            , vAmpR = ampR'
+            , vADSR = adsr'
+            , vEnv = envAmp'
+            , vFilter = mfilt'
+            , vFiltEnv = mfenv'
+            , vFiltTick = 0
+            , vStartedAt = now'
+            }
 
-          MV.write (stVoices st) ix v'
           pure st { stNow = now' }
 
         Nothing -> do
@@ -250,23 +367,85 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                   adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
                   env0 = envInit
 
-                  osc0 = oscSetGlideSec srF glideSec $ oscInit (iWaveform inst) srF freqHz
+              (oscs, levels, rats, hzOff, syncM, oscCount) <-
+                mkVoiceLayers srF baseHz layers
 
-                  filt0 =
+              let initLayer li
+                    | li >= oscCount = pure ()
+                    | otherwise = do
+                        osc0 <- MV.read oscs li
+                        MV.write oscs li (oscSetGlideSec srF glideSec osc0)
+                        initLayer (li+1)
+              initLayer 0
+
+              let filt0 =
                     case iFilter inst of
                       Nothing   -> Nothing
-                      Just spec -> Just (filterStateInit srF freqHz spec)
+                      Just spec -> Just (filterStateInit srF baseHz spec)
 
                   filtEnv0 =
                     case iFilter inst of
                       Nothing   -> Nothing
                       Just spec -> if needsFiltEnv spec then Just envInit else Nothing
 
-                  vNew = Voice osc0 filt0 filtEnv0 0 freqHz baseInc holdFrames baseL baseR ampL ampR
-                            adsr' env0 (Just nid) (Just iid) now' 0
+              let vNew = Voice
+                    { vOscs = oscs
+                    , vOscCount = oscCount
+                    , vLevels = levels
+                    , vPitchRat = rats
+                    , vHzOffset = hzOff
+                    , vSyncMaster = syncM
+                    , vFilter = filt0
+                    , vFiltEnv = filtEnv0
+                    , vFiltTick = 0
+                    , vNoteHz = baseHz
+                    , vHoldRemain = holdFrames
+                    , vBaseAmpL = baseL
+                    , vBaseAmpR = baseR
+                    , vAmpL = ampL
+                    , vAmpR = ampR
+                    , vADSR = adsr'
+                    , vEnv = env0
+                    , vNoteId = Just nid
+                    , vInstrId = Just iid
+                    , vStartedAt = now'
+                    , vVibPhase = 0
+                    }
 
               MV.write vec n vNew
               pure st { stActiveCount = n + 1, stNow = now' }
+
+releaseInstrumentNote ∷ InstrumentId → NoteId → AudioState → IO AudioState
+releaseInstrumentNote iid nid st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      go i
+        | i >= n    = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid && vNoteId v == Just nid
+              then do
+                let fe' = fmap envRelease (vFiltEnv v)
+                MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe' }
+              else pure ()
+            go (i+1)
+  go 0
+
+releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
+releaseInstrumentAllVoices iid st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      go i
+        | i >= n = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid
+              then do
+                let fe' = fmap envRelease (vFiltEnv v)
+                MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe', vHoldRemain = 0 }
+              else pure ()
+            go (i+1)
+  go 0
 
 panGains ∷ Float → Float → (Float, Float)
 panGains amp pan =

@@ -7,6 +7,9 @@ module Audio.Types
   , Waveform(..)
   , InstrumentId(..)
   , Instrument(..)
+  , PitchSpec(..)
+  , SyncSpec(..)
+  , OscLayer(..)
   ) where
 
 import Data.Word (Word32)
@@ -29,8 +32,35 @@ data Waveform
 newtype InstrumentId = InstrumentId Int
   deriving (Eq, Ord, Show)
 
+-- pitch transform relative to the voice base note.
+data PitchSpec = PitchSpec
+  { psOctaves   ∷ !Int
+  , psSemitones ∷ !Float
+  , psCents     ∷ !Float
+  , psHzOffset  ∷ !Float
+  } deriving (Eq, Show)
+
+-- hard sync routing for an oscillator layer.
+data SyncSpec
+  = NoSync
+  | HardSyncTo
+      { masterLayerIx ∷ !Int   -- 0..3; must be < slave index
+      }
+  deriving (Eq, Show)
+
+-- one oscillator "layer" inside an instrument voice.
+data OscLayer = OscLayer
+  { olWaveform ∷ !Waveform
+  , olPitch    ∷ !PitchSpec
+  , olLevel    ∷ !Float
+  , olSync     ∷ !SyncSpec   -- NEW
+  } deriving (Eq, Show)
+
 data Instrument = Instrument
-  { iWaveform    ∷ !Waveform
+  { -- NEW: up to 4 layers; interpret [] as “default single layer” (WaveSine, unity).
+    -- For Step A we’ll enforce non-empty in your code that constructs instruments.
+    iOscs        ∷ ![OscLayer]
+
   , iAdsrDefault ∷ !ADSR
   , iGain        ∷ !Float
   , iFilter      ∷ !(Maybe FilterSpec)

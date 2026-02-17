@@ -21,15 +21,17 @@ main =
     putStrLn "Terminal synth test (mono legato mode):"
     putStrLn "  c / d    : set pitch to C / D (legato; will glide if enabled)"
     putStrLn "  space    : release (NoteOffInstrument)"
-    putStrLn "  <tab>    : LIVE cycle waveform on instruments 0 and 1 (sine->saw->square->tri)"
-    putStrLn "  1 / 2 / 3: select filter preset (updates instruments 0 and 1)"
-    putStrLn "  g        : toggle glide (portamento) on instruments 0 and 1"
-    putStrLn "  r        : toggle legato filter env retrigger on instruments 0 and 1"
-    putStrLn "  a        : toggle legato amp env retrigger on instruments 0 and 1"
+    putStrLn "  <tab>    : LIVE cycle waveform on instrument 0 (all layers)"
+    putStrLn "  s        : toggle hard-sync (layer 1 syncs to layer 0)"
+    putStrLn "  u        : toggle unison detune (2 layers) on/off"
+    putStrLn "  1 / 2 / 3: select filter preset (instrument 0)"
+    putStrLn "  g        : toggle glide (portamento) on instrument 0"
+    putStrLn "  r        : toggle legato filter env retrigger on instrument 0"
+    putStrLn "  a        : toggle legato amp env retrigger on instrument 0"
     putStrLn "  v        : toggle vibrato on instrument 0 (pitch LFO)"
     putStrLn "  [ / ]    : vibrato depth -/+ (cents)"
     putStrLn "  - / =    : vibrato rate  -/+ (Hz)"
-    putStrLn "  p        : play plucky sound (one-shot) on both notes"
+    putStrLn "  p        : play plucky sound (one-shot) on C"
     putStrLn "  q        : quit"
 
     let envAmpNormal = ADSR
@@ -90,14 +92,6 @@ main =
             , fQEnvAmount = 0.0
             }
 
-        mkInst wf gain env mFilt =
-          Instrument
-            { iWaveform = wf
-            , iAdsrDefault = env
-            , iGain = gain
-            , iFilter = mFilt
-            }
-
         nextWaveform ∷ Waveform → Waveform
         nextWaveform wf =
           case wf of
@@ -107,30 +101,52 @@ main =
             WaveTriangle -> WaveSine
 
         iid0 = InstrumentId 0
-        iid1 = InstrumentId 1
 
-    -- Mutable instrument definitions
-    inst0Ref <- newIORef (mkInst WaveSine 1.0 envAmpNormal Nothing)
-    inst1Ref <- newIORef (mkInst WaveSaw  0.8 envAmpNormal Nothing)
+        basePitch = PitchSpec 0 0 0 0
+        detuneUp c = PitchSpec 0 0 c 0
+        detuneDown c = PitchSpec 0 0 (-c) 0
 
-    let push0 = readIORef inst0Ref >>= sendAudio sys . AudioSetInstrument iid0
-        push1 = readIORef inst1Ref >>= sendAudio sys . AudioSetInstrument iid1
-        pushBoth = push0 >> push1
+        mkInst ∷ Waveform → Float → ADSR → Maybe FilterSpec → Bool → Bool → Instrument
+        mkInst wf gain env mFilt unisonOn syncOn =
+          let layers
+                | not unisonOn =
+                    [ OscLayer wf basePitch 1.0 NoSync
+                    ]
+                | otherwise =
+                    [ OscLayer wf (detuneDown 7) 0.5 NoSync
+                    , OscLayer wf (detuneUp 7)   0.5 (if syncOn then HardSyncTo 0 else NoSync)
+                    ]
+          in Instrument
+              { iOscs = layers
+              , iAdsrDefault = env
+              , iGain = gain
+              , iFilter = mFilt
+              }
 
-        setFilters mFilt = do
-          modifyIORef' inst0Ref (\i -> i { iFilter = mFilt })
-          modifyIORef' inst1Ref (\i -> i { iFilter = mFilt })
-          pushBoth
+    wfRef       <- newIORef WaveSaw
+    filtRef     <- newIORef (Nothing ∷ Maybe FilterSpec)
+    unisonRef   <- newIORef False
+    syncRef     <- newIORef False
+    instGainRef <- newIORef 1.0
 
-    pushBoth
+    let pushInst0 = do
+          wf <- readIORef wfRef
+          mf <- readIORef filtRef
+          uni <- readIORef unisonRef
+          sy <- readIORef syncRef
+          g0 <- readIORef instGainRef
+          let inst0 = mkInst wf g0 envAmpNormal mf uni sy
+          sendAudio sys (AudioSetInstrument iid0 inst0)
+
+    pushInst0
 
     glideOnRef  <- newIORef False
     fRetrigRef  <- newIORef False
     aRetrigRef  <- newIORef False
 
     vibOnRef    <- newIORef False
-    vibRateRef  <- newIORef 5.0   -- Hz
-    vibDepthRef <- newIORef 20.0  -- cents
+    vibRateRef  <- newIORef 5.0
+    vibDepthRef <- newIORef 20.0
 
     let middleC = NoteMidi 60
         dNext   = NoteMidi 62
@@ -141,31 +157,46 @@ main =
         noteOffLegato =
           sendAudio sys (AudioNoteOffInstrument iid0)
 
-        playPluck iid nid =
-          sendAudio sys (AudioNoteOn iid 0.35 0.0 nid (Just envAmpPluck))
-
         doPluck = do
-          setFilters (Just pluckFilter)
-          playPluck iid0 middleC
-          playPluck iid1 dNext
-
+          writeIORef filtRef (Just pluckFilter)
+          pushInst0
+          sendAudio sys (AudioNoteOn iid0 0.35 0.0 middleC (Just envAmpPluck))
           _ <- forkIO $ do
             threadDelay 120000
             sendAudio sys (AudioNoteOffInstrument iid0)
           _ <- forkIO $ do
-            threadDelay 120000
-            sendAudio sys (AudioNoteOffInstrument iid1)
-          _ <- forkIO $ do
             threadDelay 200000
-            setFilters Nothing
+            writeIORef filtRef Nothing
+            pushInst0
           pure ()
 
         cycleWaveformsLive = do
-          modifyIORef' inst0Ref (\i -> i { iWaveform = nextWaveform (iWaveform i) })
-          modifyIORef' inst1Ref (\i -> i { iWaveform = nextWaveform (iWaveform i) })
-          pushBoth
-          i0 <- readIORef inst0Ref
-          putStrLn ("\nWaveform -> " <> show (iWaveform i0) <> " (applied live)\n")
+          modifyIORef' wfRef nextWaveform
+          pushInst0
+          wf <- readIORef wfRef
+          putStrLn ("\nWaveform -> " <> show wf <> " (applied live)\n")
+
+        toggleUnison = do
+          modifyIORef' unisonRef not
+          pushInst0
+          on <- readIORef unisonRef
+          putStrLn $ if on then "\nUnison ON (2 layers)\n" else "\nUnison OFF\n"
+
+        toggleSync = do
+          modifyIORef' syncRef not
+          pushInst0
+          on <- readIORef syncRef
+          putStrLn $ if on then "\nHard-sync ON (layer1 -> layer0)\n" else "\nHard-sync OFF\n"
+
+        setFilterPreset k = do
+          writeIORef filtRef (presetFilter k)
+          pushInst0
+          putStrLn $
+            case k of
+              '1' -> "\nFilter preset 1 (off)\n"
+              '2' -> "\nFilter preset 2\n"
+              '3' -> "\nFilter preset 3\n"
+              _   -> ""
 
         toggleGlide = do
           on <- readIORef glideOnRef
@@ -173,7 +204,6 @@ main =
               glideSec = if on' then 0.12 else 0.0
           writeIORef glideOnRef on'
           sendAudio sys (AudioSetGlideSec iid0 glideSec)
-          sendAudio sys (AudioSetGlideSec iid1 glideSec)
           putStrLn $ if on' then "\nGlide ON (0.12s)\n" else "\nGlide OFF\n"
 
         toggleFilterRetrig = do
@@ -181,7 +211,6 @@ main =
           let on' = not on
           writeIORef fRetrigRef on'
           sendAudio sys (AudioSetLegatoFilterRetrig iid0 on')
-          sendAudio sys (AudioSetLegatoFilterRetrig iid1 on')
           putStrLn $
             if on'
               then "\nLegato filter env retrigger: ON\n"
@@ -192,7 +221,6 @@ main =
           let on' = not on
           writeIORef aRetrigRef on'
           sendAudio sys (AudioSetLegatoAmpRetrig iid0 on')
-          sendAudio sys (AudioSetLegatoAmpRetrig iid1 on')
           putStrLn $
             if on'
               then "\nLegato amp env retrigger: ON\n"
@@ -229,7 +257,6 @@ main =
           applyVibrato0
           printVib
 
-    -- default vibrato off
     applyVibrato0
 
     forever $ do
@@ -241,10 +268,12 @@ main =
           exitSuccess
 
         '\t' -> cycleWaveformsLive
+        'u'  -> toggleUnison
+        's'  -> toggleSync
 
-        '1' -> setFilters (presetFilter '1') >> putStrLn "\nFilter preset 1 (off)\n"
-        '2' -> setFilters (presetFilter '2') >> putStrLn "\nFilter preset 2\n"
-        '3' -> setFilters (presetFilter '3') >> putStrLn "\nFilter preset 3\n"
+        '1' -> setFilterPreset '1'
+        '2' -> setFilterPreset '2'
+        '3' -> setFilterPreset '3'
 
         'g' -> toggleGlide
         'r' -> toggleFilterRetrig
