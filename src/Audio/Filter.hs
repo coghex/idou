@@ -8,7 +8,10 @@ module Audio.Filter
   , FilterProfile(..)
   , FilterState(..)
   , filterStateInit
-  , keyTrackedCutoff
+  , keyTrackedBaseCutoff
+  , filterEnvCutoff
+  , filterEnvQ
+  , filterRetune
   , filterStep
   ) where
 
@@ -19,14 +22,13 @@ import Audio.Filter.Biquad
   , biquadCoeffs
   , biquadStateInit
   , biquadStep
+  , clampQ
   )
 
 --------------------------------------------------------------------------------
 -- State (per voice)
 --------------------------------------------------------------------------------
 
--- | Up to 4 cascaded biquad stages, with a single coefficient set shared by all stages.
--- Stages beyond fsStages are ignored.
 data FilterState = FilterState
   { fsSpec   ∷ !FilterSpec
   , fsStages ∷ !Int            -- 1..4
@@ -50,9 +52,9 @@ filterStateInit
   → FilterSpec
   → FilterState
 filterStateInit sampleRate noteHz spec =
-  let cutoff = keyTrackedCutoff noteHz spec
-      nStages = clampStages (slopeStages (fSlope spec))
-      c = biquadCoeffs (fType spec) sampleRate cutoff (fQ spec)
+  let baseCutoff = keyTrackedBaseCutoff noteHz spec
+      nStages    = clampStages (slopeStages (fSlope spec))
+      c          = biquadCoeffs (fType spec) sampleRate baseCutoff (fQ spec)
   in FilterState
       { fsSpec = spec
       , fsStages = nStages
@@ -64,23 +66,44 @@ filterStateInit sampleRate noteHz spec =
       }
 
 --------------------------------------------------------------------------------
--- Key tracking
+-- Key tracking + envelope mapping helpers
 --------------------------------------------------------------------------------
 
--- | Apply key tracking to the base cutoff.
+-- | Base cutoff after key tracking, before envelope modulation.
 -- cutoff = baseCutoff * (noteHz/440)^keyTrack
-keyTrackedCutoff ∷ Float → FilterSpec → Float
-keyTrackedCutoff noteHz spec =
+keyTrackedBaseCutoff ∷ Float → FilterSpec → Float
+keyTrackedBaseCutoff noteHz spec =
   let KeyTrack kt = fKeyTrack spec
       base = fCutoffHz spec
       ratio = if noteHz <= 0 then 1 else noteHz / 440
   in base * (ratio ** kt)
 
+-- | Envelope-modulated cutoff in octaves:
+-- cutoff = baseCutoff * 2^(envAmountOct * envLevel)
+filterEnvCutoff ∷ Float → Float → FilterSpec → Float
+filterEnvCutoff baseCutoff envLevel spec =
+  let amt = fEnvAmountOct spec
+  in if amt == 0
+       then baseCutoff
+       else baseCutoff * (2 ** (amt * envLevel))
+
+-- | Envelope-modulated Q (additive):
+-- Q = clampQ (baseQ + qAmt * envLevel)
+filterEnvQ ∷ Float → FilterSpec → Float
+filterEnvQ envLevel spec =
+  clampQ (fQ spec + fQEnvAmount spec * envLevel)
+
 --------------------------------------------------------------------------------
--- Processing
+-- Retuning + processing
 --------------------------------------------------------------------------------
 
--- | Process one sample through N cascaded stages.
+-- | Update coefficients in-place for new cutoff/Q, keeping state (z1/z2) untouched.
+filterRetune ∷ Float → Float → Float → FilterState → FilterState
+filterRetune sampleRate cutoffHz q fs =
+  let spec = fsSpec fs
+      c = biquadCoeffs (fType spec) sampleRate cutoffHz q
+  in fs { fsCoeffs = c }
+
 filterStep ∷ Float → FilterState → Float → (FilterState, Float)
 filterStep _sampleRate fs0 x0 =
   let c = fsCoeffs fs0

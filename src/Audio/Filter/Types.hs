@@ -9,9 +9,9 @@ module Audio.Filter.Types
   , FilterProfile(..)
   ) where
 
+import Audio.Envelope (ADSR)
 import Audio.Filter.Biquad (FilterType(..))
 
--- | How many 2-pole stages to cascade (12dB/oct per stage).
 data FilterSlope
   = S12
   | S24
@@ -32,14 +32,20 @@ newtype KeyTrack = KeyTrack Float
   deriving (Eq, Show)
 
 data FilterSpec = FilterSpec
-  { fType      ∷ !FilterType
-  , fCutoffHz  ∷ !Float
-  , fQ         ∷ !Float
-  , fSlope     ∷ !FilterSlope
-  , fKeyTrack  ∷ !KeyTrack
+  { fType         ∷ !FilterType
+  , fCutoffHz     ∷ !Float
+  , fQ            ∷ !Float
+  , fSlope        ∷ !FilterSlope
+  , fKeyTrack     ∷ !KeyTrack
+
+  -- Envelope -> cutoff in octaves:
+  , fEnvAmountOct ∷ !Float
+  , fEnvADSR      ∷ !ADSR
+  -- Envelope -> Q (additive). Effective Q = baseQ + fQEnvAmount * envLevel
+  -- You can set this to 0 for "no Q modulation".
+  , fQEnvAmount   ∷ !Float
   } deriving (Eq, Show)
 
--- | Future-proof profile type; you can ignore for now.
 data FilterProfile
   = FPNode !FilterSpec
   | FPSeries ![FilterProfile]

@@ -24,8 +24,10 @@ import Engine.Core.Queue as Q
 import Audio.Types
 import Audio.Envelope
 import Audio.Oscillator
-import Audio.Filter (FilterState, filterStep, filterStateInit)
-
+import Audio.Filter (FilterState(..), filterStep, filterStateInit
+                    , filterRetune, keyTrackedBaseCutoff
+                    , filterEnvCutoff, filterEnvQ)
+import Audio.Filter.Types (FilterSpec(..))
 import Sound.Miniaudio
 import Sound.Miniaudio.RingBuffer
 
@@ -36,6 +38,9 @@ import Sound.Miniaudio.RingBuffer
 data Voice = Voice
   { vOsc        ∷ !Osc
   , vFilter     ∷ !(Maybe FilterState)
+  , vFiltEnv    ∷ !(Maybe EnvState)  -- optional envelope
+  , vFiltTick   ∷ !Int      -- frames until next filter envelope step
+  , vNoteHz     ∷ !Float    -- for filter key tracking
   , vHoldRemain ∷ !Int      -- frames until we trigger release
   , vAmpL       ∷ !Float
   , vAmpR       ∷ !Float
@@ -255,7 +260,8 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
           adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
           env0 = envInit
           osc0 = oscInit WaveSine srF freqHz
-          v = Voice osc0 Nothing holdFrames ampL ampR adsr' env0 Nothing Nothing
+          v = Voice osc0 Nothing Nothing 0 freqHz holdFrames ampL ampR
+                    adsr' env0 Nothing Nothing
 
       MV.write vec n v
       pure st { stActiveCount = n + 1 }
@@ -292,10 +298,18 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
               env0 = envInit
               freqHz = noteIdToHz nid
               osc0 = oscInit (iWaveform inst) srF freqHz
-              filt0 = case iFilter inst of
-                Nothing -> Nothing
-                Just spec -> Just (filterStateInit srF freqHz spec)
-              v = Voice osc0 filt0 holdFrames ampL ampR adsr'
+              filt0 =
+                case iFilter inst of
+                  Nothing   -> Nothing
+                  Just spec -> Just (filterStateInit srF freqHz spec)
+              
+              filtEnv0 =
+                case iFilter inst of
+                  Nothing   -> Nothing
+                  Just spec -> if fEnvAmountOct spec == 0 && fQEnvAmount spec == 0
+                                  then Nothing
+                                  else Just envInit
+              v = Voice osc0 filt0 filtEnv0 0 freqHz holdFrames ampL ampR adsr'
                         env0 (Just nid) (Just iid)
 
           MV.write vec n v
@@ -317,7 +331,9 @@ releaseInstrumentNote iid nid st = do
         | otherwise = do
             v <- MV.read vec i
             if vInstrId v == Just iid && vNoteId v == Just nid
-              then MV.write vec i v { vEnv = envRelease (vEnv v) }
+              then do
+                let fe' = fmap envRelease (vFiltEnv v)
+                MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe' }
               else pure ()
             go (i+1)
   go 0
@@ -417,6 +433,9 @@ mixOneVoice sr chunkFrames out v0 = do
       ampR = vAmpR v0
       adsrSpec = vADSR v0
 
+      -- coefficient retune rate (in samples). 16 is a good start.
+      retuneEvery = 16 ∷ Int
+
       go :: Int -> Ptr CFloat -> Voice -> IO Voice
       go i p v
         | i >= framesToDo = pure v
@@ -426,27 +445,54 @@ mixOneVoice sr chunkFrames out v0 = do
                 (env1, lvl) = envStep sr adsrSpec env0
 
                 (osc1, x0) = oscStep (vOsc v)
-            
-                (mfilt1, x1) =
+
+                -- Filter processing (with optional env-driven retune)
+                (mfilt1, mfenv1, tick1, x1) =
                   case vFilter v of
-                    Nothing    -> (Nothing, x0)
-                    Just filt0 ->
-                      let (filt1, y0) = filterStep sr filt0 x0
-                      in (Just filt1, y0)
-            
+                    Nothing -> (Nothing, vFiltEnv v, vFiltTick v, x0)
+                    Just fs0 ->
+                      let spec = fsSpec fs0
+                          tick0 = vFiltTick v
+                          tickN = tick0 + 1
+
+                          -- Only step filter env if we actually modulate cutoff or Q.
+                          (mfenvN, envLvl) =
+                            if fEnvAmountOct spec == 0 && fQEnvAmount spec == 0
+                              then (vFiltEnv v, 0)
+                              else case vFiltEnv v of
+                                     Nothing ->
+                                       -- Shouldn't happen if initialized correctly, but be robust:
+                                       (Just envInit, 0)
+                                     Just fe0 ->
+                                       let (fe1, e) = envStep sr (fEnvADSR spec) fe0
+                                       in (Just fe1, e)
+
+                          -- Base cutoff (key tracked), then envelope in octaves
+                          baseCutoff = keyTrackedBaseCutoff (vNoteHz v) spec
+                          cutoffHz   = filterEnvCutoff baseCutoff envLvl spec
+                          qEff       = if fQEnvAmount spec == 0 then fQ spec else filterEnvQ envLvl spec
+
+                          fsRetuned =
+                            if (fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0) && (tickN `mod` retuneEvery == 0)
+                              then filterRetune sr cutoffHz qEff fs0
+                              else fs0
+
+                          (fs1, y0) = filterStep sr fsRetuned x0
+                      in (Just fs1, mfenvN, tickN, y0)
+
                 sL = realToFrac (x1 * (ampL * lvl)) :: CFloat
                 sR = realToFrac (x1 * (ampR * lvl)) :: CFloat
 
             curL <- peek p
             curR <- peek (p `advancePtr` 1)
-            let l = realToFrac curL + sL
-                r = realToFrac curR + sR
-            poke p (realToFrac (softClipCubic l) :: CFloat)
-            poke (p `advancePtr` 1) (realToFrac (softClipCubic r) :: CFloat)
+            poke p (curL + sL)
+            poke (p `advancePtr` 1) (curR + sR)
 
             let v' = v
                   { vOsc = osc1
                   , vFilter = mfilt1
+                  , vFiltEnv = mfenv1
+                  , vFiltTick = tick1
                   , vEnv = env1
                   , vHoldRemain = hold - 1
                   }
