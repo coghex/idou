@@ -1,3 +1,3 @@
-import Distrobution.Simple
+import Distribution.Simple
 main ∷ IO ()
 main = defaultMain

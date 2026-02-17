@@ -1,5 +1,5 @@
 cabal-version:      3.16
-name:               idou
+name:               miniaudio-hs
 version:            0.1.0.0
 build-type:         Simple
 
@@ -33,6 +33,5 @@ executable miniaudio-hs-example
   main-is:          Main.hs
   build-depends:    base >=4.14 && <5
                 ,   idou
-                ,   stm
-  default-language: GHC2024
+  default-language: Haskell2010
   ghc-options:      -Wall -threaded -rtsopts
