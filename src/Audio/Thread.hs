@@ -330,6 +330,27 @@ panGains amp pan =
       gR = realToFrac (sin ang) ∷ Float
   in (amp * gL, amp * gR)
 
+--------------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------------
+
+-- | Cheap soft clipper that limits smoothly into [-1,1].
+--   For |x| <= 1: y = x - x^3/3 (soft saturation)
+--   For |x| > 1 : y = sign(x) * 2/3
+--
+-- This is a classic "cubic soft clip". It prevents extreme resonance spikes
+-- from producing painful digital clipping.
+softClipCubic ∷ CFloat → CFloat
+softClipCubic x =
+  let ax = abs x
+  in if ax <= 1
+       then x - (x*x*x)/3
+       else (signum x) * (2/3)
+
+-- | A gentler soft clipper that limits smoothly into [-1,1] using tanh.
+softClipTanh ∷ Float → Float
+softClipTanh x = tanh x
+
 clamp01 ∷ Float → Float
 clamp01 x
   | x < 0     = 0
@@ -418,8 +439,10 @@ mixOneVoice sr chunkFrames out v0 = do
 
             curL <- peek p
             curR <- peek (p `advancePtr` 1)
-            poke p (curL + sL)
-            poke (p `advancePtr` 1) (curR + sR)
+            let l = realToFrac curL + sL
+                r = realToFrac curR + sR
+            poke p (realToFrac (softClipCubic l) :: CFloat)
+            poke (p `advancePtr` 1) (realToFrac (softClipCubic r) :: CFloat)
 
             let v' = v
                   { vOsc = osc1
