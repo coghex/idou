@@ -31,6 +31,10 @@ executable idou
                   Engine.Core.Queue
                   Audio.Types
                   Audio.Thread
+                  Audio.Thread.Types
+                  Audio.Thread.Render
+                  Audio.Thread.Voice
+                  Audio.Thread.InstrumentTable
                   Audio.Envelope
                   Audio.Oscillator
                   Audio.Filter
