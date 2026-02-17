@@ -20,11 +20,15 @@ main =
   withRawStdin $ do
     putStrLn "Terminal synth test (mono legato mode):"
     putStrLn "  c / d    : set pitch to C / D (legato; will glide if enabled)"
-    putStrLn "  space    : release (NoteOff for last pitch)"
+    putStrLn "  space    : release (NoteOffInstrument)"
     putStrLn "  <tab>    : LIVE cycle waveform on instruments 0 and 1 (sine->saw->square->tri)"
     putStrLn "  1 / 2 / 3: select filter preset (updates instruments 0 and 1)"
     putStrLn "  g        : toggle glide (portamento) on instruments 0 and 1"
     putStrLn "  r        : toggle legato filter env retrigger on instruments 0 and 1"
+    putStrLn "  a        : toggle legato amp env retrigger on instruments 0 and 1"
+    putStrLn "  v        : toggle vibrato on instrument 0 (pitch LFO)"
+    putStrLn "  [ / ]    : vibrato depth -/+ (cents)"
+    putStrLn "  - / =    : vibrato rate  -/+ (Hz)"
     putStrLn "  p        : play plucky sound (one-shot) on both notes"
     putStrLn "  q        : quit"
 
@@ -120,31 +124,22 @@ main =
 
     pushBoth
 
-    glideOnRef <- newIORef False
-    retrigOnRef <- newIORef False
+    glideOnRef  <- newIORef False
+    fRetrigRef  <- newIORef False
+    aRetrigRef  <- newIORef False
 
-    -- Mono legato test state: track whether instrument 0 voice is "down" and last pitch used,
-    -- so <space> can release the correct NoteId.
-    voiceDownRef <- newIORef False
-    lastNoteRef  <- newIORef (NoteMidi 60)
+    vibOnRef    <- newIORef False
+    vibRateRef  <- newIORef 5.0   -- Hz
+    vibDepthRef <- newIORef 20.0  -- cents
 
     let middleC = NoteMidi 60
         dNext   = NoteMidi 62
 
-        noteOnLegato nid = do
-          writeIORef lastNoteRef nid
-          down <- readIORef voiceDownRef
-          -- Always send NoteOn; audio thread will reuse voice for iid0 if already active (legato).
-          -- Use a stronger amp so the legato pitch change is obvious.
+        noteOnLegato nid =
           sendAudio sys (AudioNoteOn iid0 0.25 0.0 nid Nothing)
-          whenNot down (writeIORef voiceDownRef True)
 
-        noteOffLegato = do
-          down <- readIORef voiceDownRef
-          when down $ do
-            nid <- readIORef lastNoteRef
-            sendAudio sys (AudioNoteOff iid0 nid)
-            writeIORef voiceDownRef False
+        noteOffLegato =
+          sendAudio sys (AudioNoteOffInstrument iid0)
 
         playPluck iid nid =
           sendAudio sys (AudioNoteOn iid 0.35 0.0 nid (Just envAmpPluck))
@@ -156,10 +151,10 @@ main =
 
           _ <- forkIO $ do
             threadDelay 120000
-            sendAudio sys (AudioNoteOff iid0 middleC)
+            sendAudio sys (AudioNoteOffInstrument iid0)
           _ <- forkIO $ do
             threadDelay 120000
-            sendAudio sys (AudioNoteOff iid1 dNext)
+            sendAudio sys (AudioNoteOffInstrument iid1)
           _ <- forkIO $ do
             threadDelay 200000
             setFilters Nothing
@@ -181,16 +176,61 @@ main =
           sendAudio sys (AudioSetGlideSec iid1 glideSec)
           putStrLn $ if on' then "\nGlide ON (0.12s)\n" else "\nGlide OFF\n"
 
-        toggleRetrig = do
-          on <- readIORef retrigOnRef
+        toggleFilterRetrig = do
+          on <- readIORef fRetrigRef
           let on' = not on
-          writeIORef retrigOnRef on'
+          writeIORef fRetrigRef on'
           sendAudio sys (AudioSetLegatoFilterRetrig iid0 on')
           sendAudio sys (AudioSetLegatoFilterRetrig iid1 on')
           putStrLn $
             if on'
               then "\nLegato filter env retrigger: ON\n"
               else "\nLegato filter env retrigger: OFF\n"
+
+        toggleAmpRetrig = do
+          on <- readIORef aRetrigRef
+          let on' = not on
+          writeIORef aRetrigRef on'
+          sendAudio sys (AudioSetLegatoAmpRetrig iid0 on')
+          sendAudio sys (AudioSetLegatoAmpRetrig iid1 on')
+          putStrLn $
+            if on'
+              then "\nLegato amp env retrigger: ON\n"
+              else "\nLegato amp env retrigger: OFF\n"
+
+        applyVibrato0 = do
+          on <- readIORef vibOnRef
+          rate <- readIORef vibRateRef
+          depth <- readIORef vibDepthRef
+          let (r,d) = if on then (rate, depth) else (0, 0)
+          sendAudio sys (AudioSetVibrato iid0 r d)
+
+        printVib = do
+          on <- readIORef vibOnRef
+          rate <- readIORef vibRateRef
+          depth <- readIORef vibDepthRef
+          putStrLn $
+            "\nVibrato " <> (if on then "ON" else "OFF")
+              <> "  rate=" <> show rate <> "Hz"
+              <> "  depth=" <> show depth <> "c\n"
+
+        toggleVibrato = do
+          modifyIORef' vibOnRef not
+          applyVibrato0
+          printVib
+
+        vibDepthDelta d = do
+          modifyIORef' vibDepthRef (\x -> max 0 (x + d))
+          applyVibrato0
+          printVib
+
+        vibRateDelta d = do
+          modifyIORef' vibRateRef (\x -> max 0 (x + d))
+          applyVibrato0
+          printVib
+
+    -- default vibrato off
+    applyVibrato0
 
     forever $ do
       ch <- hGetChar stdin
@@ -207,15 +247,19 @@ main =
         '3' -> setFilters (presetFilter '3') >> putStrLn "\nFilter preset 3\n"
 
         'g' -> toggleGlide
-        'r' -> toggleRetrig
+        'r' -> toggleFilterRetrig
+        'a' -> toggleAmpRetrig
+
+        'v' -> toggleVibrato
+        '[' -> vibDepthDelta (-5)
+        ']' -> vibDepthDelta 5
+        '-' -> vibRateDelta (-0.5)
+        '=' -> vibRateDelta 0.5
 
         'p' -> doPluck
 
-        -- Mono legato pitch set
         'c' -> noteOnLegato middleC
         'd' -> noteOnLegato dNext
-
-        -- release
         ' ' -> noteOffLegato
 
         _ -> pure ()
@@ -232,9 +276,3 @@ withRawStdin action = do
         hSetEcho stdin e
         hSetBuffering stdin b)
     (\_ -> action)
-
-when ∷ Bool → IO () → IO ()
-when b action = if b then action else pure ()
-
-whenNot ∷ Bool → IO () → IO ()
-whenNot b action = if b then pure () else action

@@ -52,11 +52,15 @@ data AudioMsg
       , retrigFilter ∷ !Bool
       }
 
-  -- NEW: per-instrument behavior on legato note changes:
-  -- if True, retrigger the AMP envelope; if False, keep it running (true legato).
   | AudioSetLegatoAmpRetrig
       { instrumentId ∷ !InstrumentId
       , retrigAmp    ∷ !Bool
+      }
+
+  | AudioSetVibrato
+      { instrumentId  ∷ !InstrumentId
+      , vibRateHz     ∷ !Float
+      , vibDepthCents ∷ !Float
       }
 
   | AudioPlayBeep

@@ -48,6 +48,10 @@ data Voice = Voice
   , vFiltTick   ∷ !Int               -- frames until next filter envelope step
   , vNoteHz     ∷ !Float             -- cached Hz for key tracking
 
+  -- NEW: stable base pitch increment (cycles/sample) used for vibrato.
+  -- (Do NOT derive vibrato from oTargetInc; that compounds and gets noisy.)
+  , vBaseInc    ∷ !Float
+
   , vHoldRemain ∷ !Int               -- frames until we trigger release
 
   , vBaseAmpL   ∷ !Float             -- amp * panL (no instrument gain)
@@ -61,6 +65,7 @@ data Voice = Voice
   , vInstrId    ∷ !(Maybe InstrumentId)   -- Nothing for one-shots
 
   , vStartedAt  ∷ !Word64
+  , vVibPhase   ∷ !Float
   }
 
 data AudioState = AudioState
@@ -71,6 +76,8 @@ data AudioState = AudioState
   , stGlideSec       ∷ !(MV.IOVector Float) -- length 256
   , stLegFiltRetrig  ∷ !(MV.IOVector Bool)  -- length 256
   , stLegAmpRetrig   ∷ !(MV.IOVector Bool)  -- length 256
+  , stVibRateHz      ∷ !(MV.IOVector Float) -- length 256
+  , stVibDepthCents  ∷ !(MV.IOVector Float) -- length 256
   , stNow            ∷ !Word64
   }
 
@@ -85,26 +92,24 @@ data AudioSystem = AudioSystem
   }
 
 data AudioUserData = AudioUserData
-  { aud_rb            ∷ !(Ptr MaRB)
-  , aud_channels      ∷ !Word32
-  , aud_underruns     ∷ !(IORef Word64) -- NEW: callback increments on short reads
+  { aud_rb        ∷ !(Ptr MaRB)
+  , aud_channels  ∷ !Word32
+  , aud_underruns ∷ !(IORef Word64)
   }
 
 --------------------------------------------------------------------------------
 -- Public API
 --------------------------------------------------------------------------------
 
+sr ∷ Word32
+sr = 48000
+
 sendAudio ∷ AudioSystem → AudioMsg → IO ()
 sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
 
 startAudioSystem ∷ IO AudioSystem
 startAudioSystem = do
-  -- Reasonable low-latency defaults that still perform well:
-  -- - chunkFrames 256 => ~5.3ms of synthesis work per chunk @ 48k
-  -- - ring buffer capacity 8192 => ~170ms max, but we'll keep target much lower
-  -- - target queue ~= 4 chunks => ~21ms of queued audio
-  let sr  = 48000 ∷ Word32
-      ch  = 2     ∷ Word32
+  let ch  = 2     ∷ Word32
       chunkFrames = 256 ∷ Int
       rbCapacityFrames = 8192 ∷ Word32
       maxVoices = 256 ∷ Int
@@ -127,9 +132,7 @@ startAudioSystem = do
             outF = castPtr pOut
         got <- rbReadF32 rb' outF frameCount
         when (got < frameCount) $ do
-          -- track underrun and zero-fill remainder
           modifyIORef' uref (+1)
-
           let samplesGot  = fromIntegral got * fromIntegral ch'
               samplesWant = fromIntegral frameCount * fromIntegral ch'
               remainingSamples = samplesWant - samplesGot
@@ -155,8 +158,11 @@ startAudioSystem = do
   glideVec <- MV.replicate 256 0
   legFiltRetrigVec <- MV.replicate 256 False
   legAmpRetrigVec <- MV.replicate 256 False
+  vibRateVec <- MV.replicate 256 0
+  vibDepthVec <- MV.replicate 256 0
+
   mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
-  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec legAmpRetrigVec 0)
+  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec legAmpRetrigVec vibRateVec vibDepthVec 0)
 
   controlRef <- newIORef ThreadRunning
   tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames underrunRef
@@ -203,29 +209,26 @@ runAudioLoop
   → IO ()
 runAudioLoop h controlRef stRef rb chunkFrames underrunRef = go 0
   where
-    -- print at most once per second, only if underruns increased
     go ∷ Word64 → IO ()
-    go lastPrintedCount = do
+    go lastPrinted = do
       control <- readIORef controlRef
       case control of
         ThreadStopped -> pure ()
-        ThreadPaused  -> threadDelay 10000 >> go lastPrintedCount
+        ThreadPaused  -> threadDelay 10000 >> go lastPrinted
         ThreadRunning -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
           st2 <- renderIfNeeded h rb chunkFrames st1
           writeIORef stRef st2
 
-          -- check underruns and print only on change (rate-limited)
           u <- readIORef underrunRef
-          when (u /= lastPrintedCount) $ do
+          when (u /= lastPrinted) $ do
             putStrLn ("[audio] underruns: " <> show u)
-            -- sleep a bit so we don't spam if underruns happen every callback
             threadDelay 1000000
             go u
 
           threadDelay 1000
-          go lastPrintedCount
+          go lastPrinted
 
 processMsgs ∷ AudioHandle → Ptr MaRB → AudioState → IO AudioState
 processMsgs h rb st = do
@@ -259,6 +262,11 @@ processMsgs h rb st = do
           st' <- setLegatoAmpRetrig iid ra st
           processMsgs h rb st'
 
+        -- NEW: vibrato config
+        AudioSetVibrato iid rate depth -> do
+          st' <- setVibrato iid rate depth st
+          processMsgs h rb st'
+
         AudioNoteOffInstrument iid -> do
           st' <- releaseInstrumentAllVoices iid st
           processMsgs h rb st'
@@ -276,7 +284,7 @@ processMsgs h rb st = do
           processMsgs h rb st'
 
 --------------------------------------------------------------------------------
--- Instrument tables / config
+-- Per-instrument tables
 --------------------------------------------------------------------------------
 
 setInstrument ∷ InstrumentId → Instrument → AudioState → IO AudioState
@@ -286,52 +294,87 @@ setInstrument (InstrumentId i) inst st = do
     then do
       putStrLn ("[audio] warning: InstrumentId out of range: " <> show i)
       pure st
-    else do
-      MV.write vec i (Just inst)
-      pure st
+    else MV.write vec i (Just inst) >> pure st
 
 setGlide ∷ InstrumentId → Float → AudioState → IO AudioState
 setGlide (InstrumentId i) gs st = do
   let vec = stGlideSec st
       gs' = max 0 gs
-  if i < 0 || i >= MV.length vec
-    then pure st
-    else MV.write vec i gs' >> pure st
+  if i < 0 || i >= MV.length vec then pure st else MV.write vec i gs' >> pure st
 
 lookupGlide ∷ InstrumentId → AudioState → IO Float
 lookupGlide (InstrumentId i) st = do
   let vec = stGlideSec st
-  if i < 0 || i >= MV.length vec
-    then pure 0
-    else MV.read vec i
+  if i < 0 || i >= MV.length vec then pure 0 else MV.read vec i
 
 setLegatoFilterRetrig ∷ InstrumentId → Bool → AudioState → IO AudioState
 setLegatoFilterRetrig (InstrumentId i) rf st = do
   let vec = stLegFiltRetrig st
-  if i < 0 || i >= MV.length vec
-    then pure st
-    else MV.write vec i rf >> pure st
+  if i < 0 || i >= MV.length vec then pure st else MV.write vec i rf >> pure st
 
 lookupLegatoFilterRetrig ∷ InstrumentId → AudioState → IO Bool
 lookupLegatoFilterRetrig (InstrumentId i) st = do
   let vec = stLegFiltRetrig st
-  if i < 0 || i >= MV.length vec
-    then pure False
-    else MV.read vec i
+  if i < 0 || i >= MV.length vec then pure False else MV.read vec i
 
 setLegatoAmpRetrig ∷ InstrumentId → Bool → AudioState → IO AudioState
 setLegatoAmpRetrig (InstrumentId i) ra st = do
   let vec = stLegAmpRetrig st
-  if i < 0 || i >= MV.length vec
-    then pure st
-    else MV.write vec i ra >> pure st
+  if i < 0 || i >= MV.length vec then pure st else MV.write vec i ra >> pure st
 
 lookupLegatoAmpRetrig ∷ InstrumentId → AudioState → IO Bool
 lookupLegatoAmpRetrig (InstrumentId i) st = do
   let vec = stLegAmpRetrig st
-  if i < 0 || i >= MV.length vec
-    then pure False
-    else MV.read vec i
+  if i < 0 || i >= MV.length vec then pure False else MV.read vec i
+
+-- NEW
+setVibrato ∷ InstrumentId → Float → Float → AudioState → IO AudioState
+setVibrato (InstrumentId i) rate depthC st = do
+  let vr = stVibRateHz st
+      vd = stVibDepthCents st
+      rate' = max 0 rate
+      depth' = max 0 depthC
+  if i < 0 || i >= MV.length vr
+    then pure st
+    else do
+      MV.write vr i rate'
+      MV.write vd i depth'
+      pure st
+
+lookupVibrato ∷ InstrumentId → AudioState → IO (Float, Float)
+lookupVibrato (InstrumentId i) st = do
+  let vr = stVibRateHz st
+      vd = stVibDepthCents st
+  if i < 0 || i >= MV.length vr
+    then pure (0,0)
+    else do
+      r <- MV.read vr i
+      d <- MV.read vd i
+      pure (r,d)
+
+--------------------------------------------------------------------------------
+-- Release helper (needed by AudioNoteOffInstrument)
+--------------------------------------------------------------------------------
+
+releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
+releaseInstrumentAllVoices iid st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      go i
+        | i >= n = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid
+              then do
+                let fe' = fmap envRelease (vFiltEnv v)
+                MV.write vec i v
+                  { vEnv = envRelease (vEnv v)
+                  , vFiltEnv = fe'
+                  , vHoldRemain = 0
+                  }
+              else pure ()
+            go (i+1)
+  go 0
 
 --------------------------------------------------------------------------------
 -- Live instrument updates
@@ -434,6 +477,10 @@ findLegatoVoiceIxNewest iid st = do
               else go (i+1) bestIx bestStamp
   go 0 Nothing 0
 
+--------------------------------------------------------------------------------
+-- Voice creation
+--------------------------------------------------------------------------------
+
 addBeepVoice ∷ AudioHandle → AudioState → Float → Float → Float → Float → ADSR → IO AudioState
 addBeepVoice h st amp pan freqHz durSec adsrSpec = do
   let n = stActiveCount st
@@ -450,11 +497,54 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
           adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
           env0 = envInit
           osc0 = oscInit WaveSine srF freqHz
-          v = Voice osc0 Nothing Nothing 0 freqHz holdFrames baseL baseR ampL ampR
-                    adsr' env0 Nothing Nothing (stNow st)
+          baseInc = hzToPhaseInc srF freqHz
+
+          v = Voice osc0 Nothing Nothing 0 freqHz baseInc holdFrames baseL baseR ampL ampR
+                    adsr' env0 Nothing Nothing (stNow st) 0
 
       MV.write vec n v
       pure st { stActiveCount = n + 1, stNow = stNow st + 1 }
+
+lookupInstrument ∷ InstrumentId → AudioState → IO (Maybe Instrument)
+lookupInstrument (InstrumentId i) st = do
+  let vec = stInstruments st
+  if i < 0 || i >= MV.length vec
+    then pure Nothing
+    else MV.read vec i
+
+releaseInstrumentNote ∷ InstrumentId → NoteId → AudioState → IO AudioState
+releaseInstrumentNote iid nid st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      go i
+        | i >= n    = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid && vNoteId v == Just nid
+              then do
+                let fe' = fmap envRelease (vFiltEnv v)
+                MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe' }
+              else pure ()
+            go (i+1)
+  go 0
+
+panGains ∷ Float → Float → (Float, Float)
+panGains amp pan =
+  let panClamped = max (-1) (min 1 pan)
+      ang = (realToFrac (panClamped + 1) ∷ Double) * (pi/4)
+      gL = realToFrac (cos ang) ∷ Float
+      gR = realToFrac (sin ang) ∷ Float
+  in (amp * gL, amp * gR)
+
+--------------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------------
+
+clamp01 ∷ Float → Float
+clamp01 x
+  | x < 0     = 0
+  | x > 1     = 1
+  | otherwise = x
 
 addInstrumentNote
   ∷ AudioHandle
@@ -474,6 +564,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
     Just inst -> do
       let srF = fromIntegral (sampleRate h) ∷ Float
           freqHz = noteIdToHz nid
+          baseInc = hzToPhaseInc srF freqHz
           holdFrames = maxBound `div` 4
           now' = stNow st + 1
 
@@ -496,7 +587,6 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
               ampL' = vBaseAmpL v * iGain inst
               ampR' = vBaseAmpR v * iGain inst
               adsr' = iAdsrDefault inst
-
               envAmp' = if legRetrigAmp then envInit else vEnv v
 
               (mfilt', mfenv') =
@@ -528,6 +618,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
               v' = v
                 { vOsc = osc1
                 , vNoteHz = freqHz
+                , vBaseInc = baseInc            -- NEW
                 , vNoteId = Just nid
                 , vHoldRemain = holdFrames
                 , vAmpL = ampL'
@@ -572,91 +663,19 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                       Just spec ->
                         if needsFiltEnv spec then Just envInit else Nothing
 
-                  vNew = Voice osc0 filt0 filtEnv0 0 freqHz holdFrames baseL baseR ampL ampR adsr'
-                            env0 (Just nid) (Just iid) now'
+                  vNew = Voice osc0 filt0 filtEnv0 0 freqHz baseInc holdFrames baseL baseR ampL ampR adsr'
+                            env0 (Just nid) (Just iid) now' 0
 
               MV.write vec n vNew
               pure st { stActiveCount = n + 1, stNow = now' }
-
-lookupInstrument ∷ InstrumentId → AudioState → IO (Maybe Instrument)
-lookupInstrument (InstrumentId i) st = do
-  let vec = stInstruments st
-  if i < 0 || i >= MV.length vec
-    then pure Nothing
-    else MV.read vec i
-
-releaseInstrumentNote ∷ InstrumentId → NoteId → AudioState → IO AudioState
-releaseInstrumentNote iid nid st = do
-  let vec = stVoices st
-      n   = stActiveCount st
-      go i
-        | i >= n    = pure st
-        | otherwise = do
-            v <- MV.read vec i
-            if vInstrId v == Just iid && vNoteId v == Just nid
-              then do
-                let fe' = fmap envRelease (vFiltEnv v)
-                MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe' }
-              else pure ()
-            go (i+1)
-  go 0
-
-panGains ∷ Float → Float → (Float, Float)
-panGains amp pan =
-  let panClamped = max (-1) (min 1 pan)
-      ang = (realToFrac (panClamped + 1) ∷ Double) * (pi/4)
-      gL = realToFrac (cos ang) ∷ Float
-      gR = realToFrac (sin ang) ∷ Float
-  in (amp * gL, amp * gR)
-
---------------------------------------------------------------------------------
--- Helpers
---------------------------------------------------------------------------------
-
-softClipCubic ∷ CFloat → CFloat
-softClipCubic x =
-  let ax = abs x
-  in if ax <= 1
-       then x - (x*x*x)/3
-       else (signum x) * (2/3)
-
-softClipTanh ∷ Float → Float
-softClipTanh x = tanh x
-
-clamp01 ∷ Float → Float
-clamp01 x
-  | x < 0     = 0
-  | x > 1     = 1
-  | otherwise = x
-
-releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
-releaseInstrumentAllVoices iid st = do
-  let vec = stVoices st
-      n   = stActiveCount st
-      go i
-        | i >= n = pure st
-        | otherwise = do
-            v <- MV.read vec i
-            if vInstrId v == Just iid
-              then do
-                let fe' = fmap envRelease (vFiltEnv v)
-                MV.write vec i v
-                  { vEnv = envRelease (vEnv v)
-                  , vFiltEnv = fe'
-                  , vHoldRemain = 0
-                  }
-              else pure ()
-            go (i+1)
-  go 0
 
 --------------------------------------------------------------------------------
 -- Rendering
 --------------------------------------------------------------------------------
 
 renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
-renderIfNeeded h rb chunkFrames st0 = do
+renderIfNeeded _h rb chunkFrames st0 = do
   -- Keep a small, stable queue depth based on chunk size.
-  -- 4 chunks ~= 21ms at 48k with chunkFrames=256.
   let targetFrames = fromIntegral (chunkFrames * 4) ∷ Word32
       loop st = do
         availRead  <- rbAvailableRead rb
@@ -665,35 +684,38 @@ renderIfNeeded h rb chunkFrames st0 = do
           then pure st
           else do
             let framesNow = min chunkFrames (fromIntegral availWrite)
-            st' <- renderChunkFrames h rb framesNow st
+            st' <- renderChunkFrames rb framesNow st
             loop st'
   loop st0
 
-renderChunkFrames ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
-renderChunkFrames h rb framesNow st = do
+renderChunkFrames ∷ Ptr MaRB → Int → AudioState → IO AudioState
+renderChunkFrames rb framesNow st = do
   st' <- withForeignPtr (stMixBuf st) $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
         samples = framesNow * 2
         bytes = samples * sizeOf (undefined ∷ CFloat)
     fillBytes out 0 bytes
-    mixVoices (fromIntegral (sampleRate h)) framesNow out st
+    mixVoices (fromIntegral sr) framesNow out st
 
   withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
-    written <- rbWriteF32 rb out (fromIntegral framesNow)
-    when (written /= fromIntegral framesNow) $
-      pure ()
+    _written <- rbWriteF32 rb out (fromIntegral framesNow)
+    pure ()
 
   pure st'
 
 mixVoices ∷ Float → Int → Ptr CFloat → AudioState → IO AudioState
-mixVoices sr chunkFrames out st0 = do
+mixVoices srF chunkFrames out st0 = do
   let vec = stVoices st0
       loop i st
         | i >= stActiveCount st = pure st
         | otherwise = do
             v <- MV.read vec i
-            v' <- mixOneVoice sr chunkFrames out v
+            (rateHz, depthCents) <-
+              case vInstrId v of
+                Nothing  -> pure (0, 0)
+                Just iid -> lookupVibrato iid st
+            v' <- mixOneVoice srF chunkFrames out rateHz depthCents v
             if eStage (vEnv v') == EnvDone
               then do
                 let lastIx = stActiveCount st - 1
@@ -705,9 +727,23 @@ mixVoices sr chunkFrames out st0 = do
                 loop (i+1) st
   loop 0 st0
 
-mixOneVoice sr chunkFrames out v0 = do
+-- Unsafe but fast: no bounds checking; assumes InstrumentId is valid and present.
+lookupVibratoUnsafe :: AudioState -> Maybe InstrumentId -> (Float, Float)
+lookupVibratoUnsafe st miid =
+  case miid of
+    Nothing -> (0,0)
+    Just (InstrumentId i) ->
+      -- we stored them as MV.IOVector, but we can't read those purely;
+      -- so in this file we DO NOT use this function in the final version.
+      (0,0)
+
+
+mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → Voice → IO Voice
+mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
   let framesToDo = chunkFrames
       retuneEvery = 16 ∷ Int
+
+      centsToRatio c = 2 ** (c / 1200)
 
       go :: Int -> Ptr CFloat -> Voice -> IO Voice
       go i p v
@@ -719,9 +755,28 @@ mixOneVoice sr chunkFrames out v0 = do
 
             let hold = vHoldRemain v
                 env0 = if hold <= 0 then envRelease (vEnv v) else vEnv v
-                (env1, lvl) = envStep sr adsrSpec env0
+                (env1, lvl) = envStep srF adsrSpec env0
 
-                (osc1, x0) = oscStep (vOsc v)
+            -- vibrato (relative to base pitch)
+            let ph0 = vVibPhase v
+                vibOn = vibRateHz > 0 && vibDepthCents > 0
+                vibCents = if vibOn then vibDepthCents * sin (2*pi*ph0) else 0
+                vibRatio = if vibOn then centsToRatio vibCents else 1
+
+                ph1 =
+                  if vibOn
+                    then
+                      let x = ph0 + (vibRateHz / srF)
+                      in x - fromIntegral (floor x ∷ Int)
+                    else ph0
+
+                o0 = vOsc v
+                oVib =
+                  if vibOn
+                    then o0 { oTargetInc = vBaseInc v * vibRatio }
+                    else o0 { oTargetInc = vBaseInc v }
+
+                (osc1, x0) = oscStep oVib
 
                 (mfilt1, mfenv1, tick1, x1) =
                   case vFilter v of
@@ -736,7 +791,7 @@ mixOneVoice sr chunkFrames out v0 = do
                               else case vFiltEnv v of
                                      Nothing -> (Just envInit, 0)
                                      Just fe0 ->
-                                       let (fe1, e) = envStep sr (fEnvADSR spec) fe0
+                                       let (fe1, e) = envStep srF (fEnvADSR spec) fe0
                                        in (Just fe1, e)
 
                           baseCutoff = keyTrackedBaseCutoff (vNoteHz v) spec
@@ -745,10 +800,10 @@ mixOneVoice sr chunkFrames out v0 = do
 
                           fsRetuned =
                             if (fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0) && (tickN `mod` retuneEvery == 0)
-                              then filterRetune sr cutoffHz qEff fs0
+                              then filterRetune srF cutoffHz qEff fs0
                               else fs0
 
-                          (fs1, y0) = filterStep sr fsRetuned x0
+                          (fs1, y0) = filterStep srF fsRetuned x0
                       in (Just fs1, mfenvN, tickN, y0)
 
                 sL = realToFrac (x1 * (ampL * lvl)) :: CFloat
@@ -766,6 +821,7 @@ mixOneVoice sr chunkFrames out v0 = do
                   , vFiltTick = tick1
                   , vEnv = env1
                   , vHoldRemain = hold - 1
+                  , vVibPhase = ph1
                   }
 
             go (i+1) (p `advancePtr` 2) v'
