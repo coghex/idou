@@ -12,7 +12,6 @@ import System.IO
 import Audio.Thread
 import Audio.Types
 import Audio.Envelope
-
 import Audio.Filter.Types
 
 main ∷ IO ()
@@ -21,19 +20,25 @@ main =
   withRawStdin $ do
     putStrLn "Terminal synth test:"
     putStrLn "  c / d    : toggle notes"
-    putStrLn "  <tab>    : switch instrument used for NEW note-ons (0<->1)"
-    putStrLn "  1 / 2 / 3: select filter preset (updates instruments)"
+    putStrLn "  <tab>    : LIVE cycle waveform on instruments 0 and 1 (sine->saw->square->tri)"
+    putStrLn "  1 / 2 / 3: select filter preset (updates instruments 0 and 1)"
     putStrLn "  p        : play plucky sound (one-shot) on both notes"
     putStrLn "  q        : quit"
 
-    let envAmp = ADSR
+    let envAmpNormal = ADSR
           { aAttackSec  = 0.02
           , aDecaySec   = 0.10
           , aSustain    = 0.6
           , aReleaseSec = 0.50
           }
 
-        -- Filter presets (these will be applied to instruments via AudioSetInstrument)
+        envAmpPluck = ADSR
+          { aAttackSec  = 0.001
+          , aDecaySec   = 0.10
+          , aSustain    = 0.0
+          , aReleaseSec = 0.12
+          }
+
         presetFilter ∷ Char → Maybe FilterSpec
         presetFilter k =
           case k of
@@ -60,7 +65,6 @@ main =
                     }
             _   -> Nothing
 
-        -- Plucky filter (envelope opens cutoff then decays)
         pluckFilter ∷ FilterSpec
         pluckFilter =
           FilterSpec
@@ -79,24 +83,37 @@ main =
             , fQEnvAmount = 0.0
             }
 
-        mkInst wf gain mFilt =
+        mkInst wf gain env mFilt =
           Instrument
             { iWaveform = wf
-            , iAdsrDefault = envAmp
+            , iAdsrDefault = env
             , iGain = gain
             , iFilter = mFilt
             }
 
-        pushInstruments mFilt = do
-          let inst0 = mkInst WaveSine 1.0 mFilt
-              inst1 = mkInst WaveSaw  0.8 mFilt
-          sendAudio sys (AudioSetInstrument (InstrumentId 0) inst0)
-          sendAudio sys (AudioSetInstrument (InstrumentId 1) inst1)
+        nextWaveform ∷ Waveform → Waveform
+        nextWaveform wf =
+          case wf of
+            WaveSine     -> WaveSaw
+            WaveSaw      -> WaveSquare
+            WaveSquare   -> WaveTriangle
+            WaveTriangle -> WaveSine
 
-    -- start with preset 1 (off)
-    pushInstruments Nothing
+    -- Keep mutable instrument definitions so we can update them live and resend.
+    inst0Ref <- newIORef (mkInst WaveSine 1.0 envAmpNormal Nothing)
+    inst1Ref <- newIORef (mkInst WaveSaw  0.8 envAmpNormal Nothing)
 
-    currentInstrRef <- newIORef (InstrumentId 0)
+    let push0 = readIORef inst0Ref >>= sendAudio sys . AudioSetInstrument (InstrumentId 0)
+        push1 = readIORef inst1Ref >>= sendAudio sys . AudioSetInstrument (InstrumentId 1)
+        pushBoth = push0 >> push1
+
+        setFilters mFilt = do
+          modifyIORef' inst0Ref (\i -> i { iFilter = mFilt })
+          modifyIORef' inst1Ref (\i -> i { iFilter = mFilt })
+          pushBoth
+
+    -- initial instrument setup
+    pushBoth
 
     -- Track which instrument started each note so NoteOff always matches.
     cHeldRef <- newIORef (Nothing ∷ Maybe InstrumentId)
@@ -111,57 +128,41 @@ main =
         noteOff iid nid =
           sendAudio sys (AudioNoteOff iid nid)
 
-        -- One-shot "pluck": use current instrument, but with a short amp ADSR override.
-        -- Filter pluck comes from temporarily setting the instrument filter.
-        playPluck nid = do
-          iid <- readIORef currentInstrRef
-          let ampPluck = ADSR
-                { aAttackSec  = 0.001
-                , aDecaySec   = 0.10
-                , aSustain    = 0.0
-                , aReleaseSec = 0.12
-                }
-          -- Note: AudioNoteOn uses instrument filter state at note-on time.
-          sendAudio sys (AudioNoteOn iid 0.35 0.0 nid (Just ampPluck))
-          -- Schedule a NoteOff shortly after to force release even if sustain is 0.
-          -- (Without proper scheduling infra, we just approximate with a delay here.)
-          -- Since stdin is raw and we’re in main thread, keep it short.
-          -- If you dislike this blocking delay, we can fork a lightweight thread.
-          pure ()
+        playPluck iid nid =
+          sendAudio sys (AudioNoteOn iid 0.35 0.0 nid (Just envAmpPluck))
 
-        toggleNote heldRef nid = do
+        toggleNote heldRef iid nid = do
           held <- readIORef heldRef
           case held of
             Nothing -> do
-              iid <- readIORef currentInstrRef
               noteOn iid nid
               writeIORef heldRef (Just iid)
-            Just iid -> do
+            Just _ -> do
               noteOff iid nid
               writeIORef heldRef Nothing
 
-        -- Apply pluck filter to instruments, play notes, then restore current preset.
-        -- For now we restore to "off" after pluck. If you want it to restore to
-        -- whichever preset you last chose, we can store it in an IORef.
         doPluck = do
-          -- set pluck filter on both instruments
-          pushInstruments (Just pluckFilter)
-          playPluck middleC
-          playPluck dNext
-          -- trigger note-offs after a short time using forked threads to avoid blocking input
-          _ <- forkIO $ do
-            threadDelay 120000  -- 120ms
-            iid <- readIORef currentInstrRef
-            sendAudio sys (AudioNoteOff iid middleC)
+          setFilters (Just pluckFilter)
+          playPluck (InstrumentId 0) middleC
+          playPluck (InstrumentId 1) dNext
+
           _ <- forkIO $ do
             threadDelay 120000
-            iid <- readIORef currentInstrRef
-            sendAudio sys (AudioNoteOff iid dNext)
-          -- restore filter off
+            sendAudio sys (AudioNoteOff (InstrumentId 0) middleC)
+          _ <- forkIO $ do
+            threadDelay 120000
+            sendAudio sys (AudioNoteOff (InstrumentId 1) dNext)
           _ <- forkIO $ do
             threadDelay 200000
-            pushInstruments Nothing
+            setFilters Nothing
           pure ()
+
+        cycleWaveformsLive = do
+          modifyIORef' inst0Ref (\i -> i { iWaveform = nextWaveform (iWaveform i) })
+          modifyIORef' inst1Ref (\i -> i { iWaveform = nextWaveform (iWaveform i) })
+          pushBoth
+          i0 <- readIORef inst0Ref
+          putStrLn ("\nWaveform -> " <> show (iWaveform i0) <> " (applied live)\n")
 
     forever $ do
       ch <- hGetChar stdin
@@ -178,21 +179,22 @@ main =
           putStrLn "\nQuit."
           exitSuccess
 
-        '\t' -> do
-          iid <- readIORef currentInstrRef
-          let iid' = if iid == InstrumentId 0 then InstrumentId 1 else InstrumentId 0
-          writeIORef currentInstrRef iid'
-          putStrLn ("\nInstrument switched to " <> show iid' <> "\n")
+        '\t' ->
+          -- LIVE cycle across all 4 waveforms on both instruments;
+          -- since your audio thread applies AudioSetInstrument to active voices,
+          -- held notes will change timbre immediately.
+          cycleWaveformsLive
 
-        '1' -> pushInstruments (presetFilter '1') >> putStrLn "\nFilter preset 1 (off)\n"
-        '2' -> pushInstruments (presetFilter '2') >> putStrLn "\nFilter preset 2\n"
-        '3' -> pushInstruments (presetFilter '3') >> putStrLn "\nFilter preset 3\n"
+        '1' -> setFilters (presetFilter '1') >> putStrLn "\nFilter preset 1 (off)\n"
+        '2' -> setFilters (presetFilter '2') >> putStrLn "\nFilter preset 2\n"
+        '3' -> setFilters (presetFilter '3') >> putStrLn "\nFilter preset 3\n"
 
-        -- New: plucky one-shot on both notes
         'p' -> doPluck
 
-        'c' -> toggleNote cHeldRef middleC
-        'd' -> toggleNote dHeldRef dNext
+        -- Keep your original behavior: c uses instrument 0, d uses instrument 1.
+        -- That makes it easy to compare waveforms live.
+        'c' -> toggleNote cHeldRef (InstrumentId 0) middleC
+        'd' -> toggleNote dHeldRef (InstrumentId 1) dNext
 
         _ -> pure ()
 
