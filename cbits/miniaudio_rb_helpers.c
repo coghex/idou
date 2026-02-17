@@ -63,10 +63,9 @@ ma_uint32 hs_ma_rb_write_f32(hs_ma_rb* h, const float* frames, ma_uint32 frameCo
             break;
         }
 
-        if (bytesRequested == 0) {
-            /* No contiguous space right now. */
-            break;
-        }
+        size_t framesAcquired = bytesRequested / h->bytesPerFrame;
+        bytesRequested = framesAcquired * h->bytesPerFrame;
+        if (bytesRequested == 0) break;
 
         memcpy(pWrite,
                (const char*)frames + (size_t)totalWrittenFrames * h->bytesPerFrame,
@@ -96,9 +95,9 @@ ma_uint32 hs_ma_rb_read_f32(hs_ma_rb* h, float* outFrames, ma_uint32 frameCount)
             break;
         }
 
-        if (bytesRequested == 0) {
-            break;
-        }
+        size_t framesAcquired = bytesRequested / h->bytesPerFrame;
+        bytesRequested = framesAcquired * h->bytesPerFrame;
+        if (bytesRequested == 0) break;
 
         memcpy((char*)outFrames + (size_t)totalReadFrames * h->bytesPerFrame,
                pRead,
@@ -126,4 +125,11 @@ ma_uint32 hs_ma_rb_available_write(hs_ma_rb* h)
     if (!h) return 0;
     size_t bytesAvail = ma_rb_available_write(&h->rb);
     return (ma_uint32)(bytesAvail / h->bytesPerFrame);
+}
+
+/* Reset ring buffer (drop all queued audio). */
+void hs_ma_rb_reset(hs_ma_rb* h)
+{
+    if (!h) return;
+    ma_rb_reset(&h->rb);
 }

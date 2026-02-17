@@ -88,8 +88,9 @@ startAudioSystem = do
   let udPtr = castStablePtrToPtr udStable
 
   let cb ∷ MaDataCallback
-      cb _dev pOut _pIn frameCount = do
-        AudioUserData rb' ch' <- deRefStablePtr (castPtrToStablePtr udPtr)
+      cb dev pOut _pIn frameCount = do
+        ud <- hs_ma_device_get_user_data dev
+        AudioUserData rb' ch' <- deRefStablePtr (castPtrToStablePtr ud)
         let outF ∷ Ptr CFloat
             outF = castPtr pOut
         got <- rbReadF32 rb' outF frameCount
@@ -169,24 +170,30 @@ runAudioLoop h controlRef stRef rb chunkFrames = go
         ThreadPaused  -> threadDelay 10000 >> go
         ThreadRunning -> do
           st0 <- readIORef stRef
-          st1 <- processMsgs h st0
+          st1 <- processMsgs h rb st0
           st2 <- renderIfNeeded h rb chunkFrames st1
           writeIORef stRef st2
           threadDelay 1000
           go
 
-processMsgs ∷ AudioHandle → AudioState → IO AudioState
-processMsgs h st = do
+processMsgs ∷ AudioHandle → Ptr MaRB → AudioState → IO AudioState
+processMsgs h rb st = do
   m <- Q.tryReadQueue (audioQueue h)
   case m of
     Nothing -> pure st
     Just msg ->
       case msg of
-        AudioShutdown -> pure st { stActiveCount = 0 }
-        AudioStopAll  -> processMsgs h st { stActiveCount = 0 }
+        AudioShutdown -> do
+          rbReset rb
+          pure st { stActiveCount = 0 }
+
+        AudioStopAll  -> do
+          rbReset rb
+          processMsgs h rb st { stActiveCount = 0 }
+
         AudioPlayBeep a p f d e -> do
           st' <- addBeepVoice h st a p f d e
-          processMsgs h st'
+          processMsgs h rb st'
 
 addBeepVoice ∷ AudioHandle → AudioState → Float → Float → Float → Float → ADSR → IO AudioState
 addBeepVoice h st amp pan freqHz durSec adsrSpec = do
@@ -234,17 +241,17 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
 
 renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded h rb chunkFrames st0 = do
-  let targetFrames = (sampleRate h `div` 5)  -- keep ~200ms queued
+  let targetFrames = (sampleRate h `div` 5)  -- 200ms queued
 
       loop st = do
         availRead  <- rbAvailableRead rb
         availWrite <- rbAvailableWrite rb
 
+        -- Stop when we have enough queued, or no space to write more.
         if availRead >= targetFrames || availWrite == 0
           then pure st
           else do
-            -- render at most chunkFrames, but never more than available write space
-            let framesNow = min (fromIntegral availWrite) chunkFrames
+            let framesNow = min chunkFrames (fromIntegral availWrite)
             st' <- renderChunkFrames h rb framesNow st
             loop st'
 
@@ -262,9 +269,9 @@ renderChunkFrames h rb framesNow st = do
   withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
     written <- rbWriteF32 rb out (fromIntegral framesNow)
-    -- With rbAvailableWrite gating, this should always be a full write.
+    -- With looped C write + availWrite gating, this should be full.
     when (written /= fromIntegral framesNow) $
-      pure () -- or log/debug later
+      pure ()  -- optionally track a counter
 
   pure st'
 
