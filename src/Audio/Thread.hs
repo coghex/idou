@@ -64,13 +64,14 @@ data Voice = Voice
   }
 
 data AudioState = AudioState
-  { stVoices        ∷ !(MV.IOVector Voice)
-  , stActiveCount   ∷ !Int
-  , stMixBuf        ∷ !(ForeignPtr CFloat) -- interleaved stereo
-  , stInstruments   ∷ !(MV.IOVector (Maybe Instrument)) -- length 256
-  , stGlideSec      ∷ !(MV.IOVector Float) -- length 256
-  , stLegFiltRetrig ∷ !(MV.IOVector Bool)  -- length 256
-  , stNow           ∷ !Word64
+  { stVoices         ∷ !(MV.IOVector Voice)
+  , stActiveCount    ∷ !Int
+  , stMixBuf         ∷ !(ForeignPtr CFloat) -- interleaved stereo
+  , stInstruments    ∷ !(MV.IOVector (Maybe Instrument)) -- length 256
+  , stGlideSec       ∷ !(MV.IOVector Float) -- length 256
+  , stLegFiltRetrig  ∷ !(MV.IOVector Bool)  -- length 256
+  , stLegAmpRetrig   ∷ !(MV.IOVector Bool)  -- NEW length 256
+  , stNow            ∷ !Word64
   }
 
 data AudioSystem = AudioSystem
@@ -144,8 +145,9 @@ startAudioSystem = do
   instVec <- MV.replicate 256 Nothing
   glideVec <- MV.replicate 256 0
   legFiltRetrigVec <- MV.replicate 256 False
+  legAmpRetrigVec <- MV.replicate 256 False
   mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
-  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec 0)
+  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec legAmpRetrigVec 0)
 
   controlRef <- newIORef ThreadRunning
   tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames
@@ -232,6 +234,10 @@ processMsgs h rb st = do
           st' <- setLegatoFilterRetrig iid rf st
           processMsgs h rb st'
 
+        AudioSetLegatoAmpRetrig iid ra -> do
+          st' <- setLegatoAmpRetrig iid ra st
+          processMsgs h rb st'
+
         AudioNoteOffInstrument iid -> do
           st' <- releaseInstrumentAllVoices iid st
           processMsgs h rb st'
@@ -288,7 +294,20 @@ lookupLegatoFilterRetrig (InstrumentId i) st = do
     then pure False
     else MV.read vec i
 
--- | Release ALL active voices for an instrument (mono-friendly stop).
+setLegatoAmpRetrig ∷ InstrumentId → Bool → AudioState → IO AudioState
+setLegatoAmpRetrig (InstrumentId i) ra st = do
+  let vec = stLegAmpRetrig st
+  if i < 0 || i >= MV.length vec
+    then pure st
+    else MV.write vec i ra >> pure st
+
+lookupLegatoAmpRetrig ∷ InstrumentId → AudioState → IO Bool
+lookupLegatoAmpRetrig (InstrumentId i) st = do
+  let vec = stLegAmpRetrig st
+  if i < 0 || i >= MV.length vec
+    then pure False
+    else MV.read vec i
+
 releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
 releaseInstrumentAllVoices iid st = do
   let vec = stVoices st
@@ -453,6 +472,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
 
       glideSec <- lookupGlide iid st
       legRetrigFilt <- lookupLegatoFilterRetrig iid st
+      legRetrigAmp <- lookupLegatoAmpRetrig iid st
       mLegIx <- findLegatoVoiceIxNewest iid st
 
       case mLegIx of
@@ -467,6 +487,9 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
               ampL' = vBaseAmpL v * iGain inst
               ampR' = vBaseAmpR v * iGain inst
               adsr' = iAdsrDefault inst
+
+              -- AMP envelope legato retrigger option:
+              envAmp' = if legRetrigAmp then envInit else vEnv v
 
               (mfilt', mfenv') =
                 case iFilter inst of
@@ -502,6 +525,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                 , vAmpL = ampL'
                 , vAmpR = ampR'
                 , vADSR = adsr'
+                , vEnv = envAmp'
                 , vFilter = mfilt'
                 , vFiltEnv = mfenv'
                 , vFiltTick = 0

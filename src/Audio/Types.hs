@@ -52,6 +52,13 @@ data AudioMsg
       , retrigFilter ∷ !Bool
       }
 
+  -- NEW: per-instrument behavior on legato note changes:
+  -- if True, retrigger the AMP envelope; if False, keep it running (true legato).
+  | AudioSetLegatoAmpRetrig
+      { instrumentId ∷ !InstrumentId
+      , retrigAmp    ∷ !Bool
+      }
+
   | AudioPlayBeep
       { amp     ∷ !Float
       , pan     ∷ !Float
@@ -73,8 +80,6 @@ data AudioMsg
       , noteId       ∷ !NoteId
       }
 
-  -- NEW: release all currently active voices for an instrument,
-  -- without needing to know the current NoteId (useful for mono legato).
   | AudioNoteOffInstrument
       { instrumentId ∷ !InstrumentId
       }
