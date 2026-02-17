@@ -8,14 +8,6 @@ library
   build-depends:    base >=4.14 && <5
                   , stm
                   , vector
-  exposed-modules:  Sound.Miniaudio
-                    Sound.Miniaudio.RingBuffer
-                    Engine.Core.Thread
-                    Engine.Core.Queue
-                    Audio.Types
-                    Audio.Thread
-                    Audio.Envelope
-
   default-language: Haskell2010
   default-extensions:   ForeignFunctionInterface
                         Strict
@@ -29,21 +21,21 @@ library
                     cbits/miniaudio_userdata.c
   ghc-options:      -Wall
 
-executable miniaudio-hs-example
+executable idou
   hs-source-dirs:   app
                   , src
   main-is:          Main.hs
+  other-modules:  Sound.Miniaudio
+                  Sound.Miniaudio.RingBuffer
+                  Engine.Core.Thread
+                  Engine.Core.Queue
+                  Audio.Types
+                  Audio.Thread
+                  Audio.Envelope
   build-depends:    base >=4.14 && <5
                 ,   idou
                 ,   stm
                 ,   vector
-  exposed-modules:  Sound.Miniaudio
-                    Sound.Miniaudio.RingBuffer
-                    Engine.Core.Thread
-                    Engine.Core.Queue
-                    Audio.Types
-                    Audio.Thread
-                    Audio.Envelope
   default-language: GHC2024
   default-extensions:   ForeignFunctionInterface
                         Strict

@@ -233,12 +233,19 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
 --------------------------------------------------------------------------------
 
 renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
-renderIfNeeded h rb chunkFrames st = do
-  avail <- rbAvailableRead rb
-  let targetFrames = (sampleRate h `div` 10)  -- 100ms buffered
-  if avail >= targetFrames
-    then pure st
-    else renderChunk h rb chunkFrames st
+renderIfNeeded h rb chunkFrames st0 = do
+  -- Keep more queued audio to avoid underruns/crackle.
+  let targetFrames = (sampleRate h `div` 5)  -- 200ms buffered
+
+      loop st = do
+        avail <- rbAvailableRead rb
+        if avail >= targetFrames
+          then pure st
+          else do
+            st' <- renderChunk h rb chunkFrames st
+            loop st'
+
+  loop st0
 
 renderChunk ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
 renderChunk h rb chunkFrames st = do
@@ -251,7 +258,13 @@ renderChunk h rb chunkFrames st = do
 
   withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
-    void (rbWriteF32 rb out (fromIntegral chunkFrames))
+        total = fromIntegral chunkFrames
+    written <- rbWriteF32 rb out total
+    when (written < total) $ do
+      let remaining = total - written
+          -- advance pointer by written frames * 2 channels
+          out' = out `advancePtr` (fromIntegral written * 2)
+      void (rbWriteF32 rb out' remaining)
 
   pure st'
 
