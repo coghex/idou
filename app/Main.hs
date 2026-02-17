@@ -116,12 +116,18 @@ main =
                     [ OscLayer wf (detuneDown 7) 0.5 NoSync
                     , OscLayer wf (detuneUp 7)   0.5 (if syncOn then HardSyncTo 0 else NoSync)
                     ]
+              routes =
+                  [ ModRoute ModSrcLfo1 ModDstFilterCutoffOct 0.5
+                  , ModRoute ModSrcLfo1 ModDstAmpGain (-0.3)
+                  , ModRoute ModSrcEnvAmp (ModDstLayerPitchCents 0) (-8)
+                  ]
           in Instrument
               { iOscs = layers
               , iLayerSpread = 0.7
               , iAdsrDefault = env
               , iGain = gain
               , iFilter = mFilt
+              , iModRoutes = routes
               }
 
     wfRef       <- newIORef WaveSaw

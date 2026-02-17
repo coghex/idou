@@ -36,8 +36,6 @@ data Voice = Voice
   , vPitchRat   ∷ !(MV.IOVector Float)
   , vHzOffset   ∷ !(MV.IOVector Float)
   , vSyncMaster ∷ !(MV.IOVector Int)
-
-  -- NEW: per-layer stereo placement gains (constant-power), derived from Instrument.iLayerSpread
   , vLayerGainL ∷ !(MV.IOVector Float)
   , vLayerGainR ∷ !(MV.IOVector Float)
 
@@ -60,6 +58,9 @@ data Voice = Voice
 
   , vStartedAt  ∷ !Word64
   , vVibPhase   ∷ !Float
+
+  -- NEW: per-voice LFO1 phase for mod matrix (rate comes from AudioSetVibrato)
+  , vLfo1Phase  ∷ !Float
   }
 
 data AudioState = AudioState

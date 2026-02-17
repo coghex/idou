@@ -70,8 +70,6 @@ clamp01' x
   | x > 1 = 1
   | otherwise = x
 
--- | Base pan positions for layer index given active layer count.
--- Returns in [-1..1] where -1 = left, +1 = right.
 layerBasePan :: Int -> Int -> Float
 layerBasePan n i =
   case n of
@@ -87,7 +85,6 @@ layerBasePan n i =
            2 -> 0.33
            _ -> 1
 
--- | Constant-power pan gains for pan in [-1..1].
 panGainsCP :: Float -> (Float, Float)
 panGainsCP pan =
   let p = max (-1) (min 1 pan)
@@ -225,6 +222,7 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
                 , vInstrId = Nothing
                 , vStartedAt = stNow st
                 , vVibPhase = 0
+                , vLfo1Phase = 0
                 }
 
       MV.write vec n v
@@ -252,7 +250,6 @@ applyInstrumentToActiveVoices srW iid inst st = do
               else do
                 let baseHz = vNoteHz v
 
-                -- NEW: update layer spread gains live
                 writeLayerGains spread layerN (vLayerGainL v) (vLayerGainR v)
 
                 let updateLayer li
@@ -349,8 +346,6 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
       case mLegIx of
         Just ix -> do
           v <- MV.read (stVoices st) ix
-
-          -- NEW: update layer spread gains on legato pitch change too
           writeLayerGains spread layerN (vLayerGainL v) (vLayerGainR v)
 
           let updateLayer li
@@ -483,6 +478,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                     , vInstrId = Just iid
                     , vStartedAt = now'
                     , vVibPhase = 0
+                    , vLfo1Phase = 0
                     }
 
               MV.write vec n vNew
