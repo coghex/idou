@@ -7,6 +7,7 @@ library
   hs-source-dirs:   src
   build-depends:    base >=4.14 && <5
                   , stm
+                  , vector
   exposed-modules:  Sound.Miniaudio
                     Sound.Miniaudio.RingBuffer
                     Engine.Core.Thread
@@ -34,5 +35,9 @@ executable miniaudio-hs-example
   build-depends:    base >=4.14 && <5
                 ,   idou
                 ,   stm
+                ,   vector
   default-language: GHC2024
+  default-extensions:   ForeignFunctionInterface
+                        Strict
+                        UnicodeSyntax
   ghc-options:      -Wall -threaded -rtsopts

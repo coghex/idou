@@ -1,4 +1,3 @@
-{-# LANGUAGE Strict, UnicodeSyntax #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Audio.Thread
@@ -9,13 +8,16 @@ module Audio.Thread
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (bracket, bracketOnError, finally)
+import Control.Exception (bracket, finally)
 import Control.Monad (when, void)
 import Data.IORef
 import Data.Word (Word32)
 import Foreign hiding (void)
 import Foreign.C
+import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, withForeignPtr)
 import Foreign.Marshal.Utils (fillBytes)
+
+import qualified Data.Vector.Mutable as MV
 
 import Engine.Core.Thread
 import Engine.Core.Queue as Q
@@ -24,16 +26,26 @@ import Audio.Types
 import Sound.Miniaudio
 import Sound.Miniaudio.RingBuffer
 
-data Voice = Beep
-  { vPhase     ∷ !Double
-  , vStep      ∷ !Double
-  , vRemain    ∷ !Int        -- frames remaining
-  , vAmp       ∷ !Float
-  , vPan       ∷ !Float
+--------------------------------------------------------------------------------
+-- Voice representation (fast oscillator, no sin in render)
+--------------------------------------------------------------------------------
+
+-- Sine recurrence:
+-- y0 = 2*cos(w)*y1 - y2
+-- keep y1,y2 as state. Output y0 each step.
+data Voice = Voice
+  { vY1     ∷ !Float
+  , vY2     ∷ !Float
+  , vK      ∷ !Float    -- 2*cos(w)
+  , vRemain ∷ !Int      -- frames remaining
+  , vAmpL   ∷ !Float
+  , vAmpR   ∷ !Float
   }
 
 data AudioState = AudioState
-  { voices ∷ ![Voice]
+  { stVoices      ∷ !(MV.IOVector Voice)
+  , stActiveCount ∷ !Int
+  , stMixBuf      ∷ !(ForeignPtr CFloat) -- interleaved stereo
   }
 
 data AudioSystem = AudioSystem
@@ -51,6 +63,10 @@ data AudioUserData = AudioUserData
   , aud_channels ∷ !Word32
   }
 
+--------------------------------------------------------------------------------
+-- Public API
+--------------------------------------------------------------------------------
+
 sendAudio ∷ AudioSystem → AudioMsg → IO ()
 sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
 
@@ -59,6 +75,8 @@ startAudioSystem = do
   let sr  = 48000 ∷ Word32
       ch  = 2     ∷ Word32
       rbCapacityFrames = 24000 ∷ Word32  -- 0.5 seconds @ 48k
+      chunkFrames = 512 ∷ Int
+      maxVoices = 256 ∷ Int  -- supports >64 comfortably
 
   q <- Q.newQueue
   let h = AudioHandle q sr ch
@@ -66,24 +84,21 @@ startAudioSystem = do
   rb <- rbCreateF32 rbCapacityFrames ch
   when (rb == nullPtr) $ error "rbCreateF32 failed"
 
-  -- user data for callback
   udStable <- newStablePtr (AudioUserData rb ch)
-  let udPtr :: Ptr ()
-      udPtr = castStablePtrToPtr udStable
+  let udPtr = castStablePtrToPtr udStable
 
-  -- callback: drain ringbuffer -> output, else silence
-  let cb :: MaDataCallback
+  -- Callback: drain ringbuffer; silence on underrun.
+  let cb ∷ MaDataCallback
       cb _dev pOut _pIn frameCount = do
         AudioUserData rb' ch' <- deRefStablePtr (castPtrToStablePtr udPtr)
-        let outF :: Ptr CFloat
+        let outF ∷ Ptr CFloat
             outF = castPtr pOut
-
         got <- rbReadF32 rb' outF frameCount
         when (got < frameCount) $ do
           let samplesGot  = fromIntegral got * fromIntegral ch'
               samplesWant = fromIntegral frameCount * fromIntegral ch'
               remainingSamples = samplesWant - samplesGot
-              byteCount = remainingSamples * sizeOf (undefined :: CFloat)
+              byteCount = remainingSamples * sizeOf (undefined ∷ CFloat)
           fillBytes (outF `advancePtr` fromIntegral samplesGot) 0 byteCount
 
   cbFun <- mkMaDataCallback cb
@@ -100,10 +115,13 @@ startAudioSystem = do
   r2 <- ma_device_start dev
   when (r2 /= MA_SUCCESS) $ error ("ma_device_start failed: " <> show r2)
 
-  -- audio engine thread state
+  -- Engine state
+  voicesVec <- MV.new maxVoices
+  mixBuf <- mallocForeignPtrArray (chunkFrames * 2) -- stereo interleaved
+  stRef <- newIORef (AudioState voicesVec 0 mixBuf)
+
   controlRef <- newIORef ThreadRunning
-  stRef <- newIORef (AudioState [])
-  tid <- forkIO $ runAudioLoop h controlRef stRef rb
+  tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames
 
   let ts = ThreadState controlRef tid
   pure AudioSystem
@@ -118,13 +136,10 @@ startAudioSystem = do
 
 stopAudioSystem ∷ AudioSystem → IO ()
 stopAudioSystem sys = do
-  -- stop engine thread first (so it stops writing)
   writeIORef (tsRunning (asThread sys)) ThreadStopped
-  -- optionally ask it to shutdown too
   Q.writeQueue (audioQueue (asHandle sys)) AudioShutdown
   threadDelay 20000
 
-  -- stop device + cleanup
   void (ma_device_stop (asDevice sys))
   ma_device_uninit (asDevice sys)
 
@@ -136,8 +151,18 @@ stopAudioSystem sys = do
 
   rbDestroy (asRingBuffer sys)
 
-runAudioLoop ∷ AudioHandle → IORef ThreadControl → IORef AudioState → Ptr MaRB → IO ()
-runAudioLoop h controlRef stRef rb = go
+--------------------------------------------------------------------------------
+-- Audio thread loop
+--------------------------------------------------------------------------------
+
+runAudioLoop
+  ∷ AudioHandle
+  → IORef ThreadControl
+  → IORef AudioState
+  → Ptr MaRB
+  → Int          -- chunkFrames
+  → IO ()
+runAudioLoop h controlRef stRef rb chunkFrames = go
   where
     go = do
       control <- readIORef controlRef
@@ -147,7 +172,7 @@ runAudioLoop h controlRef stRef rb = go
         ThreadRunning -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h st0
-          st2 <- renderIfNeeded h rb st1
+          st2 <- renderIfNeeded h rb chunkFrames st1
           writeIORef stRef st2
           threadDelay 1000
           go
@@ -159,83 +184,116 @@ processMsgs h st = do
     Nothing -> pure st
     Just msg ->
       case msg of
-        AudioShutdown -> pure st { voices = [] }
-        AudioStopAll  -> processMsgs h st { voices = [] }
+        AudioShutdown -> pure st { stActiveCount = 0 }
+        AudioStopAll  -> processMsgs h st { stActiveCount = 0 }
         AudioPlayBeep a p f d -> do
-          let srD = fromIntegral (sampleRate h) :: Double
-              frames = max 0 (floor (realToFrac d * srD) :: Int)
-              step = 2*pi*(realToFrac f :: Double) / srD
-              v = Beep 0 step frames a p
-          processMsgs h st { voices = v : voices st }
+          st' <- addBeepVoice h st a p f d
+          processMsgs h st'
 
-renderIfNeeded ∷ AudioHandle → Ptr MaRB → AudioState → IO AudioState
-renderIfNeeded h rb st = do
-  -- maintain at least ~100ms buffered
+addBeepVoice ∷ AudioHandle → AudioState → Float → Float → Float → Float → IO AudioState
+addBeepVoice h st amp pan freqHz durSec = do
+  let n = stActiveCount st
+      vec = stVoices st
+      cap = MV.length vec
+  if n >= cap
+    then pure st  -- drop if full (later: voice stealing)
+    else do
+      let srD = fromIntegral (sampleRate h) ∷ Double
+          frames = max 0 (floor (realToFrac durSec * srD) ∷ Int)
+
+          -- pan constant power
+          panClamped = max (-1) (min 1 pan)
+          ang = (realToFrac (panClamped + 1) ∷ Double) * (pi/4)
+          gL = realToFrac (cos ang) ∷ Float
+          gR = realToFrac (sin ang) ∷ Float
+          ampL = amp * gL
+          ampR = amp * gR
+
+          w = 2*pi*(realToFrac freqHz ∷ Double) / srD
+          k = realToFrac (2 * cos w) ∷ Float
+
+          -- Initialize recurrence roughly as sin(0)=0, sin(-w)=-sin(w)
+          y1 = 0.0 ∷ Float
+          y2 = negate (realToFrac (sin w) ∷ Float)
+
+          v = Voice y1 y2 k frames ampL ampR
+
+      MV.write vec n v
+      pure st { stActiveCount = n + 1 }
+
+--------------------------------------------------------------------------------
+-- Rendering
+--------------------------------------------------------------------------------
+
+renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
+renderIfNeeded h rb chunkFrames st = do
   avail <- rbAvailableRead rb
-  let targetFrames = (sampleRate h `div` 10)  -- 0.1 sec
+  let targetFrames = (sampleRate h `div` 10)  -- 100ms buffered
   if avail >= targetFrames
     then pure st
-    else renderChunk h rb 512 st
+    else renderChunk h rb chunkFrames st
 
-renderChunk ∷ AudioHandle → Ptr MaRB → Word32 → AudioState → IO AudioState
-renderChunk h rb framesWanted st = do
-  let ch = channels h
-      nFrames = fromIntegral framesWanted :: Int
-      nSamples = nFrames * fromIntegral ch
+renderChunk ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
+renderChunk h rb chunkFrames st = do
+  -- mix into reusable buffer
+  st' <- withForeignPtr (stMixBuf st) $ \out0 -> do
+    let out = castPtr out0 ∷ Ptr CFloat
+        samples = chunkFrames * 2
+        bytes = samples * sizeOf (undefined ∷ CFloat)
+    fillBytes out 0 bytes
+    mixVoices chunkFrames out st
 
-  allocaArray nSamples $ \(tmp :: Ptr CFloat) -> do
-    -- mix into tmp
-    st' <- mixVoices h framesWanted tmp st
-    void (rbWriteF32 rb tmp framesWanted)
-    pure st'
+  -- write to ring buffer
+  withForeignPtr (stMixBuf st') $ \out0 -> do
+    let out = castPtr out0 ∷ Ptr CFloat
+    void (rbWriteF32 rb out (fromIntegral chunkFrames))
 
-mixVoices ∷ AudioHandle → Word32 → Ptr CFloat → AudioState → IO AudioState
-mixVoices h framesWanted out st0 = do
-  let chI = fromIntegral (channels h) :: Int
-      nFrames = fromIntegral framesWanted :: Int
-      nSamples = nFrames * chI
+  pure st'
 
-  -- clear output
-  fillBytes out 0 (nSamples * sizeOf (undefined :: CFloat))
+mixVoices ∷ Int → Ptr CFloat → AudioState → IO AudioState
+mixVoices chunkFrames out st0 = do
+  let vec = stVoices st0
+  -- iterate voices by index; swap-remove dead voices
+  let loop i st
+        | i >= stActiveCount st = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            v' <- mixOneVoice chunkFrames out v
+            if vRemain v' <= 0
+              then do
+                -- swap-remove
+                let lastIx = stActiveCount st - 1
+                if i /= lastIx
+                  then MV.read vec lastIx >>= MV.write vec i
+                  else pure ()
+                loop i st { stActiveCount = lastIx }
+              else do
+                MV.write vec i v'
+                loop (i+1) st
+  loop 0 st0
 
-  -- mix each voice
-  (vs', _) <- foldlM (mixOne chI nFrames out) ([], 0::Int) (voices st0)
-  pure st0 { voices = reverse vs' }
+mixOneVoice ∷ Int → Ptr CFloat → Voice → IO Voice
+mixOneVoice chunkFrames out v0 = do
+  let framesToDo = min chunkFrames (vRemain v0)
+      ampL = vAmpL v0
+      ampR = vAmpR v0
+      k    = vK v0
 
-mixOne
-  ∷ Int → Int → Ptr CFloat
-  → ([Voice], Int) → Voice → IO ([Voice], Int)
-mixOne chI nFrames out (acc, _) v = do
-  case v of
-    Beep ph step remain amp panVal -> do
-      let framesToDo = min nFrames remain
-          -- constant-power pan
-          panClamped = max (-1) (min 1 panVal)
-          ang = (realToFrac (panClamped + 1) :: Double) * (pi/4)
-          gL = realToFrac (cos ang) :: Float
-          gR = realToFrac (sin ang) :: Float
-          aL = amp * gL
-          aR = amp * gR
+  let go :: Int -> Ptr CFloat -> Float -> Float -> IO (Float, Float)
+      go i p y1 y2
+        | i >= framesToDo = pure (y1, y2)
+        | otherwise = do
+            let y0 = k*y1 - y2
+                l  = realToFrac (y0 * ampL) :: CFloat
+                r  = realToFrac (y0 * ampR) :: CFloat
 
-      let go i ph' = when (i < framesToDo) $ do
-            let s = realToFrac (sin ph') :: Float
-                l = realToFrac (s * aL) :: CFloat
-                r = realToFrac (s * aR) :: CFloat
-                ix = chI*i
-            curL <- peekElemOff out (ix + 0)
-            curR <- peekElemOff out (ix + 1)
-            pokeElemOff out (ix + 0) (curL + l)
-            pokeElemOff out (ix + 1) (curR + r)
-            go (i+1) (ph' + step)
+            -- p points at L, p+1 is R
+            curL <- peek p
+            curR <- peek (p `advancePtr` 1)
+            poke p (curL + l)
+            poke (p `advancePtr` 1) (curR + r)
 
-      go 0 ph
+            go (i+1) (p `advancePtr` 2) y0 y1
 
-      let remain' = remain - framesToDo
-          ph' = ph + fromIntegral framesToDo * step
-      if remain' > 0
-        then pure (Beep ph' step remain' amp panVal : acc, 0)
-        else pure (acc, 0)
-
-foldlM ∷ Monad m ⇒ (a → b → m a) → a → [b] → m a
-foldlM _ z [] = pure z
-foldlM f z (x:xs) = f z x >>= \z' -> foldlM f z' xs
+  (y1', y2') <- go 0 out (vY1 v0) (vY2 v0)
+  pure v0 { vY1 = y1', vY2 = y2', vRemain = vRemain v0 - framesToDo }
