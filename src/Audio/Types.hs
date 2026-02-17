@@ -4,6 +4,9 @@ module Audio.Types
   ( AudioMsg(..)
   , AudioHandle(..)
   , NoteId(..)
+  , Waveform(..)
+  , InstrumentId(..)
+  , Instrument(..)
   ) where
 
 import Data.Word (Word32)
@@ -15,8 +18,30 @@ data NoteId
   | NoteHz   !Float
   deriving (Eq, Show)
 
+data Waveform
+  = WaveSine
+  | WaveSaw
+  | WaveSquare
+  | WaveTriangle
+  deriving (Eq, Show)
+
+newtype InstrumentId = InstrumentId Int
+  deriving (Eq, Ord, Show)
+
+data Instrument = Instrument
+  { iWaveform    ∷ !Waveform
+  , iAdsrDefault ∷ !ADSR
+  , iGain        ∷ !Float
+  } deriving (Eq, Show)
+
 data AudioMsg
-  = AudioPlayBeep
+  = AudioSetInstrument
+      { instrumentId ∷ !InstrumentId
+      , instrument   ∷ !Instrument
+      }
+
+  -- Convenience one-shot (kept; does not use instruments)
+  | AudioPlayBeep
       { amp     ∷ !Float   -- 0..1
       , pan     ∷ !Float   -- -1..1
       , freqHz  ∷ !Float
@@ -24,17 +49,18 @@ data AudioMsg
       , adsr    ∷ !ADSR
       }
 
-  -- | Start a note (held until NoteOff).
+  -- Held note, uses an instrument.
   | AudioNoteOn
-      { amp    ∷ !Float    -- 0..1 (or velocity mapped later)
-      , pan    ∷ !Float    -- -1..1
-      , noteId ∷ !NoteId
-      , adsr   ∷ !ADSR
+      { instrumentId ∷ !InstrumentId
+      , amp          ∷ !Float          -- 0..1
+      , pan          ∷ !Float          -- -1..1
+      , noteId       ∷ !NoteId
+      , adsrOverride ∷ !(Maybe ADSR)   -- Nothing uses instrument default
       }
 
-  -- | Release a note. If multiple voices match, releases them all.
   | AudioNoteOff
-      { noteId ∷ !NoteId
+      { instrumentId ∷ !InstrumentId
+      , noteId       ∷ !NoteId
       }
 
   | AudioStopAll

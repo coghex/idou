@@ -23,6 +23,7 @@ import Engine.Core.Thread
 import Engine.Core.Queue as Q
 import Audio.Types
 import Audio.Envelope
+import Audio.Oscillator
 
 import Sound.Miniaudio
 import Sound.Miniaudio.RingBuffer
@@ -32,21 +33,21 @@ import Sound.Miniaudio.RingBuffer
 --------------------------------------------------------------------------------
 
 data Voice = Voice
-  { vY1         ∷ !Float
-  , vY2         ∷ !Float
-  , vK          ∷ !Float    -- 2*cos(w)
-  , vHoldRemain ∷ !Int      -- frames until we trigger release (or huge for held notes)
+  { vOsc        ∷ !Osc
+  , vHoldRemain ∷ !Int      -- frames until we trigger release
   , vAmpL       ∷ !Float
   , vAmpR       ∷ !Float
   , vADSR       ∷ !ADSR
   , vEnv        ∷ !EnvState
-  , vNoteId     ∷ !(Maybe NoteId)
+  , vNoteId     ∷ !(Maybe NoteId)         -- Nothing for one-shots
+  , vInstrId    ∷ !(Maybe InstrumentId)   -- Nothing for one-shots
   }
 
 data AudioState = AudioState
   { stVoices      ∷ !(MV.IOVector Voice)
   , stActiveCount ∷ !Int
   , stMixBuf      ∷ !(ForeignPtr CFloat) -- interleaved stereo
+  , stInstruments ∷ !(MV.IOVector (Maybe Instrument)) -- length 256
   }
 
 data AudioSystem = AudioSystem
@@ -117,8 +118,9 @@ startAudioSystem = do
   when (r2 /= MA_SUCCESS) $ error ("ma_device_start failed: " <> show r2)
 
   voicesVec <- MV.new maxVoices
+  instVec <- MV.replicate 256 Nothing
   mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
-  stRef <- newIORef (AudioState voicesVec 0 mixBuf)
+  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec)
 
   controlRef <- newIORef ThreadRunning
   tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames
@@ -188,21 +190,54 @@ processMsgs h rb st = do
           rbReset rb
           pure st { stActiveCount = 0 }
 
-        AudioStopAll  -> do
+        AudioStopAll -> do
           rbReset rb
           processMsgs h rb st { stActiveCount = 0 }
+
+        AudioSetInstrument iid inst -> do
+          st' <- setInstrument iid inst st
+          processMsgs h rb st'
 
         AudioPlayBeep a p f d e -> do
           st' <- addBeepVoice h st a p f d e
           processMsgs h rb st'
 
-        AudioNoteOn a p nid e -> do
-          st' <- addHeldNote h st a p nid e
+        AudioNoteOn iid a p nid eOverride -> do
+          st' <- addInstrumentNote h st iid a p nid eOverride
           processMsgs h rb st'
 
-        AudioNoteOff nid -> do
-          st' <- releaseMatchingNotes nid st
+        AudioNoteOff iid nid -> do
+          st' <- releaseInstrumentNote iid nid st
           processMsgs h rb st'
+
+setInstrument ∷ InstrumentId → Instrument → AudioState → IO AudioState
+setInstrument (InstrumentId i) inst st = do
+  let vec = stInstruments st
+  if i < 0 || i >= MV.length vec
+    then do
+      putStrLn ("[audio] warning: InstrumentId out of range: " <> show i)
+      pure st
+    else do
+      MV.write vec i (Just inst)
+      pure st
+
+--------------------------------------------------------------------------------
+-- NoteId conversion
+--------------------------------------------------------------------------------
+
+noteIdToHz ∷ NoteId → Float
+noteIdToHz nid =
+  case nid of
+    NoteHz hz     -> hz
+    NoteMidi midi -> midiToHz midi
+
+midiToHz ∷ Int → Float
+midiToHz n =
+  440 * (2 ** ((fromIntegral n - 69) / 12))
+
+--------------------------------------------------------------------------------
+-- Voice creation
+--------------------------------------------------------------------------------
 
 addBeepVoice ∷ AudioHandle → AudioState → Float → Float → Float → Float → ADSR → IO AudioState
 addBeepVoice h st amp pan freqHz durSec adsrSpec = do
@@ -212,91 +247,88 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
   if n >= cap
     then pure st
     else do
-      let srD = fromIntegral (sampleRate h) ∷ Double
-          srF = fromIntegral (sampleRate h) ∷ Float
-          holdFrames = max 0 (floor (realToFrac durSec * srD) ∷ Int)
-
-          panClamped = max (-1) (min 1 pan)
-          ang = (realToFrac (panClamped + 1) ∷ Double) * (pi/4)
-          gL = realToFrac (cos ang) ∷ Float
-          gR = realToFrac (sin ang) ∷ Float
-          ampL = amp * gL
-          ampR = amp * gR
-
-          w = 2*pi*(realToFrac freqHz ∷ Double) / srD
-          k = realToFrac (2 * cos w) ∷ Float
-
-          y1 = 0.0 ∷ Float
-          y2 = negate (realToFrac (sin w) ∷ Float)
-
-          -- Ensure sustain is clamped; other values handled in envStep.
-          adsr' = adsrSpec { aSustain = clamp (aSustain adsrSpec) }
-          clamp x | x < 0 = 0 | x > 1 = 1 | otherwise = x
-
-          -- Start in attack at 0
-          env0 = envInit
-
-          -- If attack is very slow and you play short sounds, you'll hear the attack ramp.
-          _ = srF  -- keep srF around if you later want to precompute per-voice increments
-
-          v = Voice y1 y2 k holdFrames ampL ampR adsr' env0 Nothing
-
-      MV.write vec n v
-      pure st { stActiveCount = n + 1 }
-
-addHeldNote ∷ AudioHandle → AudioState → Float → Float → NoteId → ADSR → IO AudioState
-addHeldNote h st amp pan nid adsrSpec = do
-  let n = stActiveCount st
-      vec = stVoices st
-      cap = MV.length vec
-  if n >= cap
-    then pure st
-    else do
-      let srD = fromIntegral (sampleRate h) ∷ Double
-          srF = fromIntegral (sampleRate h) ∷ Float
-          freqHz = noteIdToHz nid
-
-          -- “held” note: never auto-release
-          holdFrames = maxBound `div` 4  -- large, avoids overflow on decrement
-
-          panClamped = max (-1) (min 1 pan)
-          ang = (realToFrac (panClamped + 1) ∷ Double) * (pi/4)
-          gL = realToFrac (cos ang) ∷ Float
-          gR = realToFrac (sin ang) ∷ Float
-          ampL = amp * gL
-          ampR = amp * gR
-
-          w = 2*pi*(realToFrac freqHz ∷ Double) / srD
-          k = realToFrac (2 * cos w) ∷ Float
-
-          y1 = 0.0 ∷ Float
-          y2 = negate (realToFrac (sin w) ∷ Float)
-
+      let srF = fromIntegral (sampleRate h) ∷ Float
+          holdFrames = max 0 (floor (realToFrac durSec * srF) ∷ Int)
+          (ampL, ampR) = panGains amp pan
           adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
           env0 = envInit
-          _ = srF
-
-          v = Voice y1 y2 k holdFrames ampL ampR adsr' env0 (Just nid)
+          osc0 = oscInit WaveSine srF freqHz
+          v = Voice osc0 holdFrames ampL ampR adsr' env0 Nothing Nothing
 
       MV.write vec n v
       pure st { stActiveCount = n + 1 }
 
-clamp01 ∷ Float → Float
-clamp01 x | x < 0 = 0 | x > 1 = 1 | otherwise = x
+addInstrumentNote
+  ∷ AudioHandle
+  → AudioState
+  → InstrumentId
+  → Float
+  → Float
+  → NoteId
+  → Maybe ADSR
+  → IO AudioState
+addInstrumentNote h st iid amp pan nid adsrOverride = do
+  instM <- lookupInstrument iid st
+  case instM of
+    Nothing -> do
+      putStrLn ("[audio] warning: instrument not defined: " <> show iid)
+      pure st
+    Just inst -> do
+      let n = stActiveCount st
+          vec = stVoices st
+          cap = MV.length vec
+      if n >= cap
+        then pure st
+        else do
+          let srF = fromIntegral (sampleRate h) ∷ Float
+              holdFrames = maxBound `div` 4
+              (baseL, baseR) = panGains amp pan
+              ampL = baseL * iGain inst
+              ampR = baseR * iGain inst
+              adsrSpec = maybe (iAdsrDefault inst) id adsrOverride
+              adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
+              env0 = envInit
+              freqHz = noteIdToHz nid
+              osc0 = oscInit (iWaveform inst) srF freqHz
+              v = Voice osc0 holdFrames ampL ampR adsr' env0 (Just nid) (Just iid)
 
-releaseMatchingNotes ∷ NoteId → AudioState → IO AudioState
-releaseMatchingNotes nid st = do
+          MV.write vec n v
+          pure st { stActiveCount = n + 1 }
+
+lookupInstrument ∷ InstrumentId → AudioState → IO (Maybe Instrument)
+lookupInstrument (InstrumentId i) st = do
+  let vec = stInstruments st
+  if i < 0 || i >= MV.length vec
+    then pure Nothing
+    else MV.read vec i
+
+releaseInstrumentNote ∷ InstrumentId → NoteId → AudioState → IO AudioState
+releaseInstrumentNote iid nid st = do
   let vec = stVoices st
       n   = stActiveCount st
       go i
         | i >= n    = pure st
         | otherwise = do
             v <- MV.read vec i
-            case vNoteId v of
-              Just nid' | nid' == nid -> MV.write vec i v { vEnv = envRelease (vEnv v) }
-              _                       -> pure ()
+            if vInstrId v == Just iid && vNoteId v == Just nid
+              then MV.write vec i v { vEnv = envRelease (vEnv v) }
+              else pure ()
             go (i+1)
   go 0
+
+panGains ∷ Float → Float → (Float, Float)
+panGains amp pan =
+  let panClamped = max (-1) (min 1 pan)
+      ang = (realToFrac (panClamped + 1) ∷ Double) * (pi/4)
+      gL = realToFrac (cos ang) ∷ Float
+      gR = realToFrac (sin ang) ∷ Float
+  in (amp * gL, amp * gR)
+
+clamp01 ∷ Float → Float
+clamp01 x
+  | x < 0     = 0
+  | x > 1     = 1
+  | otherwise = x
 
 --------------------------------------------------------------------------------
 -- Rendering
@@ -305,19 +337,15 @@ releaseMatchingNotes nid st = do
 renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded h rb chunkFrames st0 = do
   let targetFrames = (sampleRate h `div` 5)  -- 200ms queued
-
       loop st = do
         availRead  <- rbAvailableRead rb
         availWrite <- rbAvailableWrite rb
-
-        -- Stop when we have enough queued, or no space to write more.
         if availRead >= targetFrames || availWrite == 0
           then pure st
           else do
             let framesNow = min chunkFrames (fromIntegral availWrite)
             st' <- renderChunkFrames h rb framesNow st
             loop st'
-
   loop st0
 
 renderChunkFrames ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
@@ -332,7 +360,6 @@ renderChunkFrames h rb framesNow st = do
   withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
     written <- rbWriteF32 rb out (fromIntegral framesNow)
-    -- With looped C write + availWrite gating, this should be full.
     when (written /= fromIntegral framesNow) $
       pure ()  -- optionally track a counter
 
@@ -357,10 +384,8 @@ mixVoices sr chunkFrames out st0 = do
                 loop (i+1) st
   loop 0 st0
 
-mixOneVoice ∷ Float → Int → Ptr CFloat → Voice → IO Voice
 mixOneVoice sr chunkFrames out v0 = do
   let framesToDo = chunkFrames
-      k    = vK v0
       ampL = vAmpL v0
       ampR = vAmpR v0
       adsrSpec = vADSR v0
@@ -369,16 +394,14 @@ mixOneVoice sr chunkFrames out v0 = do
       go i p v
         | i >= framesToDo = pure v
         | otherwise = do
-            -- Trigger release when hold time elapses
             let hold = vHoldRemain v
                 env0 = if hold <= 0 then envRelease (vEnv v) else vEnv v
                 (env1, lvl) = envStep sr adsrSpec env0
 
-                -- oscillator step
-                y0 = vK v * vY1 v - vY2 v
+                (osc1, s0) = oscStep (vOsc v)
 
-                sL = realToFrac (y0 * (ampL * lvl)) :: CFloat
-                sR = realToFrac (y0 * (ampR * lvl)) :: CFloat
+                sL = realToFrac (s0 * (ampL * lvl)) :: CFloat
+                sR = realToFrac (s0 * (ampR * lvl)) :: CFloat
 
             curL <- peek p
             curR <- peek (p `advancePtr` 1)
@@ -386,28 +409,10 @@ mixOneVoice sr chunkFrames out v0 = do
             poke (p `advancePtr` 1) (curR + sR)
 
             let v' = v
-                  { vY2 = vY1 v
-                  , vY1 = y0
+                  { vOsc = osc1
                   , vEnv = env1
                   , vHoldRemain = hold - 1
                   }
 
             go (i+1) (p `advancePtr` 2) v'
-
   go 0 out v0
-
---------------------------------------------------------------------------------
--- Helpers
---------------------------------------------------------------------------------
-
-noteIdToHz ∷ NoteId → Float
-noteIdToHz nid =
-  case nid of
-    NoteHz hz     -> hz
-    NoteMidi midi -> midiToHz midi
-
-midiToHz ∷ Int → Float
-midiToHz n =
-  -- A4 (MIDI 69) = 440Hz
-  440 * (2 ** ((fromIntegral n - 69) / 12))
-

@@ -3,7 +3,7 @@
 module Main where
 
 import Control.Exception (bracket)
-import Control.Monad (forever, when)
+import Control.Monad (forever)
 import Data.IORef
 import System.Exit (exitSuccess)
 import System.IO
@@ -16,48 +16,76 @@ main ∷ IO ()
 main =
   bracket startAudioSystem stopAudioSystem $ \sys ->
   withRawStdin $ do
-    putStrLn "Terminal input mode (toggle):"
-    putStrLn "  Press 'c' to toggle middle C on/off"
-    putStrLn "  Press 'd' to toggle D on/off"
+    putStrLn "Terminal input mode:"
+    putStrLn "  Press 'c' toggle middle C"
+    putStrLn "  Press 'd' toggle D"
+    putStrLn "  Press <tab> to switch instrument (0 <-> 1) used by NEW note-ons"
     putStrLn "  Press 'q' to quit"
 
-    let env = ADSR
+    let env0 = ADSR
           { aAttackSec  = 0.02
           , aDecaySec   = 0.10
           , aSustain    = 0.6
           , aReleaseSec = 0.50
           }
 
-        noteOn nid  = sendAudio sys (AudioNoteOn 0.25 0.0 nid env)
-        noteOff nid = sendAudio sys (AudioNoteOff nid)
+        inst0 = Instrument { iWaveform = WaveSine, iAdsrDefault = env0, iGain = 1.0 }
+        inst1 = Instrument { iWaveform = WaveSaw , iAdsrDefault = env0, iGain = 0.8 }
 
-        middleC = NoteMidi 60
+    sendAudio sys (AudioSetInstrument (InstrumentId 0) inst0)
+    sendAudio sys (AudioSetInstrument (InstrumentId 1) inst1)
+
+    currentInstrRef <- newIORef (InstrumentId 0)
+
+    -- Track whether the note is down, and if so, which instrument started it.
+    cHeldRef <- newIORef (Nothing ∷ Maybe InstrumentId)
+    dHeldRef <- newIORef (Nothing ∷ Maybe InstrumentId)
+
+    let middleC = NoteMidi 60
         dNext   = NoteMidi 62
 
-    cDownRef <- newIORef False
-    dDownRef <- newIORef False
+        noteOn iid nid =
+          sendAudio sys (AudioNoteOn iid 0.25 0.0 nid Nothing)
+
+        noteOff iid nid =
+          sendAudio sys (AudioNoteOff iid nid)
+
+        toggleNote heldRef nid = do
+          held <- readIORef heldRef
+          case held of
+            Nothing -> do
+              iid <- readIORef currentInstrRef
+              noteOn iid nid
+              writeIORef heldRef (Just iid)
+            Just iid -> do
+              noteOff iid nid
+              writeIORef heldRef Nothing
 
     forever $ do
       ch <- hGetChar stdin
       case ch of
         'q' -> do
-          -- ensure everything released
-          noteOff middleC
-          noteOff dNext
+          -- release whatever is currently held (using the instrument that started it)
+          mcHeld <- readIORef cHeldRef
+          dHeld  <- readIORef dHeldRef
+          case mcHeld of
+            Nothing  -> pure ()
+            Just iid -> noteOff iid middleC
+          case dHeld of
+            Nothing  -> pure ()
+            Just iid -> noteOff iid dNext
+
           putStrLn "\nQuit."
           exitSuccess
 
-        'c' -> do
-          down <- readIORef cDownRef
-          if down
-            then noteOff middleC >> writeIORef cDownRef False
-            else noteOn  middleC >> writeIORef cDownRef True
+        '\t' -> do
+          iid <- readIORef currentInstrRef
+          let iid' = if iid == InstrumentId 0 then InstrumentId 1 else InstrumentId 0
+          writeIORef currentInstrRef iid'
+          putStrLn ("\nInstrument switched to " <> show iid' <> "\n")
 
-        'd' -> do
-          down <- readIORef dDownRef
-          if down
-            then noteOff dNext >> writeIORef dDownRef False
-            else noteOn  dNext >> writeIORef dDownRef True
+        'c' -> toggleNote cHeldRef middleC
+        'd' -> toggleNote dHeldRef dNext
 
         _ -> pure ()
 
