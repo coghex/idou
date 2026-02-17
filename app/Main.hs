@@ -18,35 +18,25 @@ main ∷ IO ()
 main =
   bracket startAudioSystem stopAudioSystem $ \sys ->
   withRawStdin $ do
-    putStrLn "Terminal synth test (mono legato mode):"
-    putStrLn "  c / d    : set pitch to C / D (legato; will glide if enabled)"
-    putStrLn "  space    : release (NoteOffInstrument)"
-    putStrLn "  <tab>    : LIVE cycle waveform on instrument 0 (all layers)"
-    putStrLn "  s        : toggle hard-sync (layer 1 syncs to layer 0)"
-    putStrLn "  u        : toggle unison detune (2 layers) on/off"
-    putStrLn "  1 / 2 / 3: select filter preset (instrument 0)"
-    putStrLn "  g        : toggle glide (portamento) on instrument 0"
-    putStrLn "  r        : toggle legato filter env retrigger on instrument 0"
-    putStrLn "  a        : toggle legato amp env retrigger on instrument 0"
-    putStrLn "  v        : toggle vibrato on instrument 0 (pitch LFO)"
+    putStrLn "Terminal synth test:"
+    putStrLn "  c / d    : NoteOn C / D (legato)"
+    putStrLn "  space    : NoteOffInstrument"
+    putStrLn "  <tab>    : cycle waveform (live)"
+    putStrLn "  u        : toggle unison (2 layers)"
+    putStrLn "  s        : toggle hard-sync (layer1 -> layer0)"
+    putStrLn "  m        : toggle mod-matrix routes (LFO->filter/amp, Env->pitch)"
+    putStrLn "  1 / 2 / 3: filter preset"
+    putStrLn "  g        : toggle glide"
+    putStrLn "  r        : toggle legato filter env retrigger"
+    putStrLn "  a        : toggle legato amp env retrigger"
+    putStrLn "  v        : toggle vibrato (also sets LFO1 rate)"
     putStrLn "  [ / ]    : vibrato depth -/+ (cents)"
     putStrLn "  - / =    : vibrato rate  -/+ (Hz)"
-    putStrLn "  p        : play plucky sound (one-shot) on C"
+    putStrLn "  p        : pluck one-shot"
     putStrLn "  q        : quit"
 
-    let envAmpNormal = ADSR
-          { aAttackSec  = 0.02
-          , aDecaySec   = 0.10
-          , aSustain    = 0.6
-          , aReleaseSec = 0.50
-          }
-
-        envAmpPluck = ADSR
-          { aAttackSec  = 0.001
-          , aDecaySec   = 0.10
-          , aSustain    = 0.0
-          , aReleaseSec = 0.12
-          }
+    let envAmpNormal = ADSR 0.02 0.10 0.6 0.50
+        envAmpPluck  = ADSR 0.001 0.10 0.0 0.12
 
         presetFilter ∷ Char → Maybe FilterSpec
         presetFilter k =
@@ -83,12 +73,7 @@ main =
             , fSlope = S24
             , fKeyTrack = KeyTrack 0.5
             , fEnvAmountOct = 4.0
-            , fEnvADSR = ADSR
-                { aAttackSec = 0.001
-                , aDecaySec = 0.12
-                , aSustain = 0.0
-                , aReleaseSec = 0.10
-                }
+            , fEnvADSR = ADSR 0.001 0.12 0.0 0.10
             , fQEnvAmount = 0.0
             }
 
@@ -106,34 +91,38 @@ main =
         detuneUp c = PitchSpec 0 0 c 0
         detuneDown c = PitchSpec 0 0 (-c) 0
 
-        mkInst ∷ Waveform → Float → ADSR → Maybe FilterSpec → Bool → Bool → Instrument
-        mkInst wf gain env mFilt unisonOn syncOn =
+        mkRoutes enabled =
+          if not enabled
+            then []
+            else
+              [ ModRoute ModSrcLfo1 ModDstFilterCutoffOct 0.5
+              , ModRoute ModSrcLfo1 ModDstAmpGain (-0.3)
+              , ModRoute ModSrcEnvAmp (ModDstLayerPitchCents 0) (-8)
+              ]
+
+        mkInst ∷ Waveform → Float → ADSR → Maybe FilterSpec → Bool → Bool → Bool → Instrument
+        mkInst wf gain env mFilt unisonOn syncOn modsOn =
           let layers
                 | not unisonOn =
-                    [ OscLayer wf basePitch 1.0 NoSync
-                    ]
+                    [ OscLayer wf basePitch 1.0 NoSync ]
                 | otherwise =
                     [ OscLayer wf (detuneDown 7) 0.5 NoSync
                     , OscLayer wf (detuneUp 7)   0.5 (if syncOn then HardSyncTo 0 else NoSync)
                     ]
-              routes =
-                  [ ModRoute ModSrcLfo1 ModDstFilterCutoffOct 0.5
-                  , ModRoute ModSrcLfo1 ModDstAmpGain (-0.3)
-                  , ModRoute ModSrcEnvAmp (ModDstLayerPitchCents 0) (-8)
-                  ]
           in Instrument
               { iOscs = layers
               , iLayerSpread = 0.7
               , iAdsrDefault = env
               , iGain = gain
               , iFilter = mFilt
-              , iModRoutes = routes
+              , iModRoutes = mkRoutes modsOn
               }
 
     wfRef       <- newIORef WaveSaw
     filtRef     <- newIORef (Nothing ∷ Maybe FilterSpec)
     unisonRef   <- newIORef False
     syncRef     <- newIORef False
+    modsRef     <- newIORef True
     instGainRef <- newIORef 1.0
 
     let pushInst0 = do
@@ -141,8 +130,9 @@ main =
           mf <- readIORef filtRef
           uni <- readIORef unisonRef
           sy <- readIORef syncRef
+          mo <- readIORef modsRef
           g0 <- readIORef instGainRef
-          let inst0 = mkInst wf g0 envAmpNormal mf uni sy
+          let inst0 = mkInst wf g0 envAmpNormal mf uni sy mo
           sendAudio sys (AudioSetInstrument iid0 inst0)
 
     pushInst0
@@ -181,29 +171,25 @@ main =
           modifyIORef' wfRef nextWaveform
           pushInst0
           wf <- readIORef wfRef
-          putStrLn ("\nWaveform -> " <> show wf <> " (applied live)\n")
+          putStrLn ("\nWaveform -> " <> show wf <> "\n")
 
         toggleUnison = do
           modifyIORef' unisonRef not
           pushInst0
-          on <- readIORef unisonRef
-          putStrLn $ if on then "\nUnison ON (2 layers)\n" else "\nUnison OFF\n"
 
         toggleSync = do
           modifyIORef' syncRef not
           pushInst0
-          on <- readIORef syncRef
-          putStrLn $ if on then "\nHard-sync ON (layer1 -> layer0)\n" else "\nHard-sync OFF\n"
+
+        toggleMods = do
+          modifyIORef' modsRef not
+          pushInst0
+          on <- readIORef modsRef
+          putStrLn $ if on then "\nMod matrix: ON\n" else "\nMod matrix: OFF\n"
 
         setFilterPreset k = do
           writeIORef filtRef (presetFilter k)
           pushInst0
-          putStrLn $
-            case k of
-              '1' -> "\nFilter preset 1 (off)\n"
-              '2' -> "\nFilter preset 2\n"
-              '3' -> "\nFilter preset 3\n"
-              _   -> ""
 
         toggleGlide = do
           on <- readIORef glideOnRef
@@ -211,27 +197,18 @@ main =
               glideSec = if on' then 0.12 else 0.0
           writeIORef glideOnRef on'
           sendAudio sys (AudioSetGlideSec iid0 glideSec)
-          putStrLn $ if on' then "\nGlide ON (0.12s)\n" else "\nGlide OFF\n"
 
         toggleFilterRetrig = do
           on <- readIORef fRetrigRef
           let on' = not on
           writeIORef fRetrigRef on'
           sendAudio sys (AudioSetLegatoFilterRetrig iid0 on')
-          putStrLn $
-            if on'
-              then "\nLegato filter env retrigger: ON\n"
-              else "\nLegato filter env retrigger: OFF\n"
 
         toggleAmpRetrig = do
           on <- readIORef aRetrigRef
           let on' = not on
           writeIORef aRetrigRef on'
           sendAudio sys (AudioSetLegatoAmpRetrig iid0 on')
-          putStrLn $
-            if on'
-              then "\nLegato amp env retrigger: ON\n"
-              else "\nLegato amp env retrigger: OFF\n"
 
         applyVibrato0 = do
           on <- readIORef vibOnRef
@@ -240,43 +217,24 @@ main =
           let (r,d) = if on then (rate, depth) else (0, 0)
           sendAudio sys (AudioSetVibrato iid0 r d)
 
-        printVib = do
-          on <- readIORef vibOnRef
-          rate <- readIORef vibRateRef
-          depth <- readIORef vibDepthRef
-          putStrLn $
-            "\nVibrato " <> (if on then "ON" else "OFF")
-              <> "  rate=" <> show rate <> "Hz"
-              <> "  depth=" <> show depth <> "c\n"
-
         toggleVibrato = do
           modifyIORef' vibOnRef not
           applyVibrato0
-          printVib
 
-        vibDepthDelta d = do
-          modifyIORef' vibDepthRef (\x -> max 0 (x + d))
-          applyVibrato0
-          printVib
-
-        vibRateDelta d = do
-          modifyIORef' vibRateRef (\x -> max 0 (x + d))
-          applyVibrato0
-          printVib
+        vibDepthDelta d = modifyIORef' vibDepthRef (\x -> max 0 (x + d)) >> applyVibrato0
+        vibRateDelta  d = modifyIORef' vibRateRef  (\x -> max 0 (x + d)) >> applyVibrato0
 
     applyVibrato0
 
     forever $ do
       ch <- hGetChar stdin
       case ch of
-        'q' -> do
-          noteOffLegato
-          putStrLn "\nQuit."
-          exitSuccess
+        'q' -> noteOffLegato >> putStrLn "\nQuit." >> exitSuccess
 
         '\t' -> cycleWaveformsLive
         'u'  -> toggleUnison
         's'  -> toggleSync
+        'm'  -> toggleMods
 
         '1' -> setFilterPreset '1'
         '2' -> setFilterPreset '2'
