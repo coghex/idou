@@ -3,6 +3,7 @@
 module Audio.Filter.Types
   ( FilterType(..)
   , FilterSlope(..)
+  , slopeStages
   , KeyTrack(..)
   , FilterSpec(..)
   , FilterProfile(..)
@@ -38,8 +39,7 @@ data FilterSpec = FilterSpec
   , fKeyTrack  ∷ !KeyTrack
   } deriving (Eq, Show)
 
--- | Future-proof profile type: can express series/parallel graphs.
---   We'll initially implement only 'FPNode' and 'FPSeries'.
+-- | Future-proof profile type; you can ignore for now.
 data FilterProfile
   = FPNode !FilterSpec
   | FPSeries ![FilterProfile]

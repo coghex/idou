@@ -1,10 +1,5 @@
 {-# LANGUAGE Strict, UnicodeSyntax #-}
 
--- | Filter processing facade.
---
--- Current scope:
---   - Implements only cascaded biquads for a single 'FilterSpec' (slope stages).
---   - Designed so you can later extend to 'FilterProfile' graphs (series/parallel).
 module Audio.Filter
   ( FilterType(..)
   , FilterSlope(..)
@@ -19,33 +14,35 @@ module Audio.Filter
 
 import Audio.Filter.Types
 import Audio.Filter.Biquad
-  ( BiquadCoeffs, BiquadState, biquadCoeffs, biquadStateInit, biquadStep )
+  ( BiquadCoeffs
+  , BiquadState
+  , biquadCoeffs
+  , biquadStateInit
+  , biquadStep
+  )
 
 --------------------------------------------------------------------------------
 -- State (per voice)
 --------------------------------------------------------------------------------
 
--- | Per-voice filter state for a cascaded biquad filter.
--- We store:
---   - coefficients per stage (all stages identical for now)
---   - biquad state per stage
---
--- This is intentionally simple for v1; later you can:
---   - compute different coeffs per stage (for more accurate slopes)
---   - add parallel routing
+-- | Up to 4 cascaded biquad stages, with a single coefficient set shared by all stages.
+-- Stages beyond fsStages are ignored.
 data FilterState = FilterState
   { fsSpec   ∷ !FilterSpec
-  , fsCoeffs ∷ ![BiquadCoeffs]
-  , fsStates ∷ ![BiquadState]
+  , fsStages ∷ !Int            -- 1..4
+  , fsCoeffs ∷ !BiquadCoeffs
+
+  , fsS1 ∷ !BiquadState
+  , fsS2 ∷ !BiquadState
+  , fsS3 ∷ !BiquadState
+  , fsS4 ∷ !BiquadState
   } deriving (Eq, Show)
 
-stagesFor ∷ FilterSlope → Int
-stagesFor s =
-  case s of
-    S12 -> 1
-    S24 -> 2
-    S36 -> 3
-    S48 -> 4
+clampStages ∷ Int → Int
+clampStages n
+  | n < 1 = 1
+  | n > 4 = 4
+  | otherwise = n
 
 filterStateInit
   ∷ Float       -- ^ sampleRate
@@ -54,12 +51,16 @@ filterStateInit
   → FilterState
 filterStateInit sampleRate noteHz spec =
   let cutoff = keyTrackedCutoff noteHz spec
-      stages = stagesFor (fSlope spec)
-      c      = biquadCoeffs (fType spec) sampleRate cutoff (fQ spec)
+      nStages = clampStages (slopeStages (fSlope spec))
+      c = biquadCoeffs (fType spec) sampleRate cutoff (fQ spec)
   in FilterState
-      { fsSpec   = spec
-      , fsCoeffs = replicate stages c
-      , fsStates = replicate stages biquadStateInit
+      { fsSpec = spec
+      , fsStages = nStages
+      , fsCoeffs = c
+      , fsS1 = biquadStateInit
+      , fsS2 = biquadStateInit
+      , fsS3 = biquadStateInit
+      , fsS4 = biquadStateInit
       }
 
 --------------------------------------------------------------------------------
@@ -67,15 +68,7 @@ filterStateInit sampleRate noteHz spec =
 --------------------------------------------------------------------------------
 
 -- | Apply key tracking to the base cutoff.
---
--- We treat tracking as:
---   cutoff = baseCutoff * (noteHz/440)^keyTrack
---
--- This has a nice property:
---   - keyTrack=0 => cutoff = baseCutoff
---   - keyTrack=1 => cutoff scales proportionally with pitch
---
--- You can later change the reference (440) or use MIDI note math; this is continuous in Hz.
+-- cutoff = baseCutoff * (noteHz/440)^keyTrack
 keyTrackedCutoff ∷ Float → FilterSpec → Float
 keyTrackedCutoff noteHz spec =
   let KeyTrack kt = fKeyTrack spec
@@ -87,14 +80,25 @@ keyTrackedCutoff noteHz spec =
 -- Processing
 --------------------------------------------------------------------------------
 
--- | Process one sample through the filter chain.
+-- | Process one sample through N cascaded stages.
 filterStep ∷ Float → FilterState → Float → (FilterState, Float)
 filterStep _sampleRate fs0 x0 =
-  let go [] [] x = ([], [], x)
-      go (c:cs) (s:ss) x =
-        let (s', y) = biquadStep c s x
-            (cs', ss', z) = go cs ss y
-        in (c:cs', s':ss', z)
-      go _ _ x = (fsCoeffs fs0, fsStates fs0, x) -- should not happen
-      (cs', ss', y) = go (fsCoeffs fs0) (fsStates fs0) x0
-  in (fs0 { fsStates = ss' }, y)
+  let c = fsCoeffs fs0
+      n = fsStages fs0
+
+      (s1', y1) = biquadStep c (fsS1 fs0) x0
+      (s2', y2) =
+        if n >= 2
+          then biquadStep c (fsS2 fs0) y1
+          else (fsS2 fs0, y1)
+      (s3', y3) =
+        if n >= 3
+          then biquadStep c (fsS3 fs0) y2
+          else (fsS3 fs0, y2)
+      (s4', y4) =
+        if n >= 4
+          then biquadStep c (fsS4 fs0) y3
+          else (fsS4 fs0, y3)
+
+      fs1 = fs0 { fsS1 = s1', fsS2 = s2', fsS3 = s3', fsS4 = s4' }
+  in (fs1, y4)
