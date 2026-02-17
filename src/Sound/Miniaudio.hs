@@ -17,6 +17,7 @@ module Sound.Miniaudio
   , hs_ma_device_free
   , hs_ma_device_config_init_playback
   , hs_ma_device_config_free
+  , hs_ma_device_get_user_data
 
     -- * Device lifecycle
   , ma_device_init
@@ -90,6 +91,9 @@ hs_ma_device_config_init_playback fmt ch sr cb userData =
 
 foreign import ccall "hs_ma_device_config_free"
   hs_ma_device_config_free :: Ptr MaDeviceConfig -> IO ()
+
+foreign import ccall "hs_ma_device_get_user_data"
+  hs_ma_device_get_user_data :: Ptr MaDevice -> IO (Ptr ())
 
 -- miniaudio API
 foreign import capi "miniaudio.h ma_device_init"

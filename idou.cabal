@@ -13,13 +13,18 @@ library
   include-dirs:     cbits
   c-sources:        cbits/miniaudio.c
                     cbits/miniaudio_helpers.c
+                    cbits/miniaudio_rb_helpers.c
+                    cbits/miniaudio_userdata.c
 
   -- Helpful for callback/FFI programs; not strictly required for library.
   ghc-options:      -Wall
 
 executable miniaudio-hs-example
   hs-source-dirs:   app
+                  , src
   main-is:          Main.hs
+  exposed-modules:  Sound.Miniaudio
+                    Sound.Miniaudio.RingBuffer
   build-depends:    base >=4.14 && <5
                 ,   miniaudio-hs
   default-language: Haskell2010
