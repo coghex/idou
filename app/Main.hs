@@ -18,10 +18,13 @@ main ∷ IO ()
 main =
   bracket startAudioSystem stopAudioSystem $ \sys ->
   withRawStdin $ do
-    putStrLn "Terminal synth test:"
-    putStrLn "  c / d    : toggle notes"
+    putStrLn "Terminal synth test (mono legato mode):"
+    putStrLn "  c / d    : set pitch to C / D (legato; will glide if enabled)"
+    putStrLn "  space    : release (NoteOff for last pitch)"
     putStrLn "  <tab>    : LIVE cycle waveform on instruments 0 and 1 (sine->saw->square->tri)"
     putStrLn "  1 / 2 / 3: select filter preset (updates instruments 0 and 1)"
+    putStrLn "  g        : toggle glide (portamento) on instruments 0 and 1"
+    putStrLn "  r        : toggle legato filter env retrigger on instruments 0 and 1"
     putStrLn "  p        : play plucky sound (one-shot) on both notes"
     putStrLn "  q        : quit"
 
@@ -99,12 +102,15 @@ main =
             WaveSquare   -> WaveTriangle
             WaveTriangle -> WaveSine
 
-    -- Keep mutable instrument definitions so we can update them live and resend.
+        iid0 = InstrumentId 0
+        iid1 = InstrumentId 1
+
+    -- Mutable instrument definitions
     inst0Ref <- newIORef (mkInst WaveSine 1.0 envAmpNormal Nothing)
     inst1Ref <- newIORef (mkInst WaveSaw  0.8 envAmpNormal Nothing)
 
-    let push0 = readIORef inst0Ref >>= sendAudio sys . AudioSetInstrument (InstrumentId 0)
-        push1 = readIORef inst1Ref >>= sendAudio sys . AudioSetInstrument (InstrumentId 1)
+    let push0 = readIORef inst0Ref >>= sendAudio sys . AudioSetInstrument iid0
+        push1 = readIORef inst1Ref >>= sendAudio sys . AudioSetInstrument iid1
         pushBoth = push0 >> push1
 
         setFilters mFilt = do
@@ -112,46 +118,48 @@ main =
           modifyIORef' inst1Ref (\i -> i { iFilter = mFilt })
           pushBoth
 
-    -- initial instrument setup
     pushBoth
 
-    -- Track which instrument started each note so NoteOff always matches.
-    cHeldRef <- newIORef (Nothing ∷ Maybe InstrumentId)
-    dHeldRef <- newIORef (Nothing ∷ Maybe InstrumentId)
+    glideOnRef <- newIORef False
+    retrigOnRef <- newIORef False
+
+    -- Mono legato test state: track whether instrument 0 voice is "down" and last pitch used,
+    -- so <space> can release the correct NoteId.
+    voiceDownRef <- newIORef False
+    lastNoteRef  <- newIORef (NoteMidi 60)
 
     let middleC = NoteMidi 60
         dNext   = NoteMidi 62
 
-        noteOn iid nid =
-          sendAudio sys (AudioNoteOn iid 0.25 0.0 nid Nothing)
+        noteOnLegato nid = do
+          writeIORef lastNoteRef nid
+          down <- readIORef voiceDownRef
+          -- Always send NoteOn; audio thread will reuse voice for iid0 if already active (legato).
+          -- Use a stronger amp so the legato pitch change is obvious.
+          sendAudio sys (AudioNoteOn iid0 0.25 0.0 nid Nothing)
+          whenNot down (writeIORef voiceDownRef True)
 
-        noteOff iid nid =
-          sendAudio sys (AudioNoteOff iid nid)
+        noteOffLegato = do
+          down <- readIORef voiceDownRef
+          when down $ do
+            nid <- readIORef lastNoteRef
+            sendAudio sys (AudioNoteOff iid0 nid)
+            writeIORef voiceDownRef False
 
         playPluck iid nid =
           sendAudio sys (AudioNoteOn iid 0.35 0.0 nid (Just envAmpPluck))
 
-        toggleNote heldRef iid nid = do
-          held <- readIORef heldRef
-          case held of
-            Nothing -> do
-              noteOn iid nid
-              writeIORef heldRef (Just iid)
-            Just _ -> do
-              noteOff iid nid
-              writeIORef heldRef Nothing
-
         doPluck = do
           setFilters (Just pluckFilter)
-          playPluck (InstrumentId 0) middleC
-          playPluck (InstrumentId 1) dNext
+          playPluck iid0 middleC
+          playPluck iid1 dNext
 
           _ <- forkIO $ do
             threadDelay 120000
-            sendAudio sys (AudioNoteOff (InstrumentId 0) middleC)
+            sendAudio sys (AudioNoteOff iid0 middleC)
           _ <- forkIO $ do
             threadDelay 120000
-            sendAudio sys (AudioNoteOff (InstrumentId 1) dNext)
+            sendAudio sys (AudioNoteOff iid1 dNext)
           _ <- forkIO $ do
             threadDelay 200000
             setFilters Nothing
@@ -164,37 +172,51 @@ main =
           i0 <- readIORef inst0Ref
           putStrLn ("\nWaveform -> " <> show (iWaveform i0) <> " (applied live)\n")
 
+        toggleGlide = do
+          on <- readIORef glideOnRef
+          let on' = not on
+              glideSec = if on' then 0.12 else 0.0
+          writeIORef glideOnRef on'
+          sendAudio sys (AudioSetGlideSec iid0 glideSec)
+          sendAudio sys (AudioSetGlideSec iid1 glideSec)
+          putStrLn $ if on' then "\nGlide ON (0.12s)\n" else "\nGlide OFF\n"
+
+        toggleRetrig = do
+          on <- readIORef retrigOnRef
+          let on' = not on
+          writeIORef retrigOnRef on'
+          sendAudio sys (AudioSetLegatoFilterRetrig iid0 on')
+          sendAudio sys (AudioSetLegatoFilterRetrig iid1 on')
+          putStrLn $
+            if on'
+              then "\nLegato filter env retrigger: ON\n"
+              else "\nLegato filter env retrigger: OFF\n"
+
     forever $ do
       ch <- hGetChar stdin
       case ch of
         'q' -> do
-          mcHeld <- readIORef cHeldRef
-          dHeld  <- readIORef dHeldRef
-          case mcHeld of
-            Nothing  -> pure ()
-            Just iid -> noteOff iid middleC
-          case dHeld of
-            Nothing  -> pure ()
-            Just iid -> noteOff iid dNext
+          noteOffLegato
           putStrLn "\nQuit."
           exitSuccess
 
-        '\t' ->
-          -- LIVE cycle across all 4 waveforms on both instruments;
-          -- since your audio thread applies AudioSetInstrument to active voices,
-          -- held notes will change timbre immediately.
-          cycleWaveformsLive
+        '\t' -> cycleWaveformsLive
 
         '1' -> setFilters (presetFilter '1') >> putStrLn "\nFilter preset 1 (off)\n"
         '2' -> setFilters (presetFilter '2') >> putStrLn "\nFilter preset 2\n"
         '3' -> setFilters (presetFilter '3') >> putStrLn "\nFilter preset 3\n"
 
+        'g' -> toggleGlide
+        'r' -> toggleRetrig
+
         'p' -> doPluck
 
-        -- Keep your original behavior: c uses instrument 0, d uses instrument 1.
-        -- That makes it easy to compare waveforms live.
-        'c' -> toggleNote cHeldRef (InstrumentId 0) middleC
-        'd' -> toggleNote dHeldRef (InstrumentId 1) dNext
+        -- Mono legato pitch set
+        'c' -> noteOnLegato middleC
+        'd' -> noteOnLegato dNext
+
+        -- release
+        ' ' -> noteOffLegato
 
         _ -> pure ()
 
@@ -210,3 +232,9 @@ withRawStdin action = do
         hSetEcho stdin e
         hSetBuffering stdin b)
     (\_ -> action)
+
+when ∷ Bool → IO () → IO ()
+when b action = if b then action else pure ()
+
+whenNot ∷ Bool → IO () → IO ()
+whenNot b action = if b then pure () else action

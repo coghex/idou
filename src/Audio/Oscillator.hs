@@ -5,41 +5,76 @@ module Audio.Oscillator
   , oscInit
   , oscStep
   , hzToPhaseInc
+  , oscSetHz
+  , oscSetGlideSec
   ) where
 
 import Audio.Types (Waveform(..))
 
 data Osc = Osc
-  { oWaveform ∷ !Waveform
-  , oPhase    ∷ !Float   -- 0..1
-  , oPhaseInc ∷ !Float   -- cycles per sample (Hz / sampleRate)
+  { oWaveform    ∷ !Waveform
+  , oPhase       ∷ !Float   -- 0..1
+
+  -- current + target phase increment for portamento
+  , oPhaseInc    ∷ !Float   -- current cycles/sample
+  , oTargetInc   ∷ !Float   -- target cycles/sample
+
+  -- smoothing coefficient in [0,1]; 0 = no change, 1 = jump immediately
+  , oGlideCoeff  ∷ !Float
   } deriving (Eq, Show)
 
 oscInit ∷ Waveform → Float → Float → Osc
 oscInit wf sampleRate hz =
-  Osc
-    { oWaveform = wf
-    , oPhase = 0
-    , oPhaseInc = hzToPhaseInc sampleRate hz
-    }
+  let inc = hzToPhaseInc sampleRate hz
+  in Osc
+      { oWaveform = wf
+      , oPhase = 0
+      , oPhaseInc = inc
+      , oTargetInc = inc
+      , oGlideCoeff = 1  -- default: no glide unless configured
+      }
 
 hzToPhaseInc ∷ Float → Float → Float
 hzToPhaseInc sampleRate hz =
   if sampleRate <= 0 then 0 else hz / sampleRate
 
+-- | Set target frequency (for legato glide).
+oscSetHz ∷ Float → Float → Osc → Osc
+oscSetHz sampleRate hz o =
+  o { oTargetInc = hzToPhaseInc sampleRate hz }
+
+-- | Configure glide time (seconds). 0 disables glide.
+-- We compute a per-sample smoothing coefficient:
+--   inc += coeff * (target - inc)
+-- with:
+--   coeff = 1 - exp(-1/(glideSec*sampleRate))
+oscSetGlideSec ∷ Float → Float → Osc → Osc
+oscSetGlideSec sampleRate glideSec o =
+  let coeff
+        | glideSec <= 0 = 1
+        | sampleRate <= 0 = 1
+        | otherwise =
+            let a = exp (-(1 / (glideSec * sampleRate)))
+            in 1 - realToFrac a
+  in o { oGlideCoeff = coeff }
+
 -- | Step oscillator by one sample, returning (newOsc, sample in [-1,1]).
 oscStep ∷ Osc → (Osc, Float)
 oscStep o0 =
-  let dt = oPhaseInc o0
-      ph = oPhase o0
-      s  = oscSample (oWaveform o0) ph dt
-      p1 = ph + dt
-      p' = p1 - fromIntegral (floor p1 ∷ Int)  -- wrap for any increment
-      o1 = o0 { oPhase = p' }
+  let coeff = oGlideCoeff o0
+      inc0  = oPhaseInc o0
+      incT  = oTargetInc o0
+      inc1  = inc0 + coeff * (incT - inc0)
+
+      ph0 = oPhase o0
+      s   = oscSample (oWaveform o0) ph0 inc1
+
+      p1 = ph0 + inc1
+      p' = p1 - fromIntegral (floor p1 ∷ Int)
+      o1 = o0 { oPhase = p', oPhaseInc = inc1 }
   in (o1, s)
 
--- | PolyBLEP function for band-limiting waveform discontinuities.
--- t in [0,1), dt = phase increment (frequency / sampleRate).
+-- PolyBLEP as you already have
 polyBlep ∷ Float → Float → Float
 polyBlep t dt
   | dt <= 0   = 0
@@ -55,27 +90,18 @@ oscSample ∷ Waveform → Float → Float → Float
 oscSample wf ph dt =
   case wf of
     WaveSine ->
-      let x = 2*pi*ph
-      in sin x
+      sin (2*pi*ph)
 
     WaveSaw ->
-      -- Naive saw: 2*ph - 1, discontinuity at phase wrap (ph=0).
-      -- PolyBLEP cancels that discontinuity.
       let naive = 2*ph - 1
       in naive - polyBlep ph dt
 
     WaveSquare ->
-      -- Naive square has 2 discontinuities per cycle: at ph=0 and ph=0.5.
-      -- We add BLEP at rising edge and subtract at falling edge (or vice versa).
       let naive = if ph < 0.5 then 1 else -1
-          -- discontinuity at wrap (ph=0)
           blep0  = polyBlep ph dt
-          -- discontinuity at ph=0.5: shift phase by 0.5 and wrap into [0,1)
           ph2    = let x = ph + 0.5 in if x >= 1 then x - 1 else x
           blep05 = polyBlep ph2 dt
       in naive + blep0 - blep05
 
     WaveTriangle ->
-      -- Keep naive triangle for now (already band-limited-ish compared to saw/square).
-      -- Next step (optional): integrate band-limited square for a true BLEP triangle.
       1 - 4 * abs (ph - 0.5)

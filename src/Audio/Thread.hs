@@ -11,7 +11,7 @@ module Audio.Thread
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Monad (when, void)
 import Data.IORef
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Foreign hiding (void)
 import Foreign.C
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, withForeignPtr)
@@ -59,13 +59,23 @@ data Voice = Voice
   , vEnv        ∷ !EnvState
   , vNoteId     ∷ !(Maybe NoteId)         -- Nothing for one-shots
   , vInstrId    ∷ !(Maybe InstrumentId)   -- Nothing for one-shots
+
+  -- Monotonic stamp: used to pick "most recently used" voice for legato.
+  , vStartedAt  ∷ !Word64
   }
 
 data AudioState = AudioState
-  { stVoices      ∷ !(MV.IOVector Voice)
-  , stActiveCount ∷ !Int
-  , stMixBuf      ∷ !(ForeignPtr CFloat) -- interleaved stereo
-  , stInstruments ∷ !(MV.IOVector (Maybe Instrument)) -- length 256
+  { stVoices        ∷ !(MV.IOVector Voice)
+  , stActiveCount   ∷ !Int
+  , stMixBuf        ∷ !(ForeignPtr CFloat) -- interleaved stereo
+  , stInstruments   ∷ !(MV.IOVector (Maybe Instrument)) -- length 256
+
+  -- Per-instrument mono legato options:
+  , stGlideSec      ∷ !(MV.IOVector Float) -- length 256
+  , stLegFiltRetrig ∷ !(MV.IOVector Bool)  -- length 256
+
+  -- Global monotonic stamp counter.
+  , stNow           ∷ !Word64
   }
 
 data AudioSystem = AudioSystem
@@ -137,8 +147,10 @@ startAudioSystem = do
 
   voicesVec <- MV.new maxVoices
   instVec <- MV.replicate 256 Nothing
+  glideVec <- MV.replicate 256 0
+  legFiltRetrigVec <- MV.replicate 256 False
   mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
-  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec)
+  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec 0)
 
   controlRef <- newIORef ThreadRunning
   tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames
@@ -217,6 +229,14 @@ processMsgs h rb st = do
           st'' <- applyInstrumentToActiveVoices (sampleRate h) iid inst st'
           processMsgs h rb st''
 
+        AudioSetGlideSec iid gs -> do
+          st' <- setGlide iid gs st
+          processMsgs h rb st'
+
+        AudioSetLegatoFilterRetrig iid rf -> do
+          st' <- setLegatoFilterRetrig iid rf st
+          processMsgs h rb st'
+
         AudioPlayBeep a p f d e -> do
           st' <- addBeepVoice h st a p f d e
           processMsgs h rb st'
@@ -240,6 +260,35 @@ setInstrument (InstrumentId i) inst st = do
       MV.write vec i (Just inst)
       pure st
 
+setGlide ∷ InstrumentId → Float → AudioState → IO AudioState
+setGlide (InstrumentId i) gs st = do
+  let vec = stGlideSec st
+      gs' = max 0 gs
+  if i < 0 || i >= MV.length vec
+    then pure st
+    else MV.write vec i gs' >> pure st
+
+lookupGlide ∷ InstrumentId → AudioState → IO Float
+lookupGlide (InstrumentId i) st = do
+  let vec = stGlideSec st
+  if i < 0 || i >= MV.length vec
+    then pure 0
+    else MV.read vec i
+
+setLegatoFilterRetrig ∷ InstrumentId → Bool → AudioState → IO AudioState
+setLegatoFilterRetrig (InstrumentId i) rf st = do
+  let vec = stLegFiltRetrig st
+  if i < 0 || i >= MV.length vec
+    then pure st
+    else MV.write vec i rf >> pure st
+
+lookupLegatoFilterRetrig ∷ InstrumentId → AudioState → IO Bool
+lookupLegatoFilterRetrig (InstrumentId i) st = do
+  let vec = stLegFiltRetrig st
+  if i < 0 || i >= MV.length vec
+    then pure False
+    else MV.read vec i
+
 applyInstrumentToActiveVoices ∷ Word32 → InstrumentId → Instrument → AudioState → IO AudioState
 applyInstrumentToActiveVoices srW iid inst st = do
   let vec = stVoices st
@@ -256,17 +305,13 @@ applyInstrumentToActiveVoices srW iid inst st = do
             if vInstrId v /= Just iid
               then go (i+1)
               else do
-                -- Apply waveform live (phase/phaseInc preserved)
                 let osc1 = (vOsc v) { oWaveform = iWaveform inst }
 
-                -- Apply gain live (preserve note amp+pan)
                 let ampL' = vBaseAmpL v * iGain inst
                     ampR' = vBaseAmpR v * iGain inst
 
-                -- Apply ADSR live (envelope state preserved)
                 let adsr' = iAdsrDefault inst
 
-                -- Apply filter live (keep z1/z2 if already present)
                 let (mfilt', mfenv') =
                       case iFilter inst of
                         Nothing ->
@@ -322,8 +367,27 @@ midiToHz n =
   440 * (2 ** ((fromIntegral n - 69) / 12))
 
 --------------------------------------------------------------------------------
--- Voice creation
+-- Voice creation + robust legato portamento (most-recent voice wins)
 --------------------------------------------------------------------------------
+
+-- | Find the most recently started non-releasing voice for this instrument.
+-- This avoids "wrong voice" selection when multiple voices exist for an instrument,
+-- and enables "last note wins" during glides.
+findLegatoVoiceIxNewest ∷ InstrumentId → AudioState → IO (Maybe Int)
+findLegatoVoiceIxNewest iid st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      go i bestIx bestStamp
+        | i >= n = pure bestIx
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid && eStage (vEnv v) /= EnvRelease && eStage (vEnv v) /= EnvDone
+              then
+                if vStartedAt v >= bestStamp
+                  then go (i+1) (Just i) (vStartedAt v)
+                  else go (i+1) bestIx bestStamp
+              else go (i+1) bestIx bestStamp
+  go 0 Nothing 0
 
 addBeepVoice ∷ AudioHandle → AudioState → Float → Float → Float → Float → ADSR → IO AudioState
 addBeepVoice h st amp pan freqHz durSec adsrSpec = do
@@ -342,10 +406,10 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
           env0 = envInit
           osc0 = oscInit WaveSine srF freqHz
           v = Voice osc0 Nothing Nothing 0 freqHz holdFrames baseL baseR ampL ampR
-                    adsr' env0 Nothing Nothing
+                    adsr' env0 Nothing Nothing (stNow st)
 
       MV.write vec n v
-      pure st { stActiveCount = n + 1 }
+      pure st { stActiveCount = n + 1, stNow = stNow st + 1 }
 
 addInstrumentNote
   ∷ AudioHandle
@@ -363,40 +427,111 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
       putStrLn ("[audio] warning: instrument not defined: " <> show iid)
       pure st
     Just inst -> do
-      let n = stActiveCount st
-          vec = stVoices st
-          cap = MV.length vec
-      if n >= cap
-        then pure st
-        else do
-          let srF = fromIntegral (sampleRate h) ∷ Float
-              holdFrames = maxBound `div` 4
-              (baseL, baseR) = panGains amp pan
-              ampL = baseL * iGain inst
-              ampR = baseR * iGain inst
-              adsrSpec = maybe (iAdsrDefault inst) id adsrOverride
-              adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
-              env0 = envInit
-              freqHz = noteIdToHz nid
-              osc0 = oscInit (iWaveform inst) srF freqHz
-              filt0 =
-                case iFilter inst of
-                  Nothing   -> Nothing
-                  Just spec -> Just (filterStateInit srF freqHz spec)
+      let srF = fromIntegral (sampleRate h) ∷ Float
+          freqHz = noteIdToHz nid
+          holdFrames = maxBound `div` 4
+          now' = stNow st + 1
 
-              filtEnv0 =
+          needsFiltEnv spec = fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0
+
+      glideSec <- lookupGlide iid st
+      legRetrigFilt <- lookupLegatoFilterRetrig iid st
+      mLegIx <- findLegatoVoiceIxNewest iid st
+
+      case mLegIx of
+        -- Legato: reuse most-recent voice for this instrument
+        Just ix -> do
+          v <- MV.read (stVoices st) ix
+
+          let osc1 =
+                oscSetGlideSec srF glideSec $
+                oscSetHz srF freqHz $
+                (vOsc v)
+
+              ampL' = vBaseAmpL v * iGain inst
+              ampR' = vBaseAmpR v * iGain inst
+              adsr' = iAdsrDefault inst
+
+              (mfilt', mfenv') =
                 case iFilter inst of
-                  Nothing   -> Nothing
+                  Nothing ->
+                    (Nothing, Nothing)
                   Just spec ->
-                    if fEnvAmountOct spec == 0 && fQEnvAmount spec == 0
-                      then Nothing
-                      else Just envInit
+                    let fs' =
+                          case vFilter v of
+                            Nothing -> filterStateInit srF freqHz spec
+                            Just fs0 ->
+                              let baseCutoff = keyTrackedBaseCutoff freqHz spec
+                                  qEff = fQ spec
+                                  fs1 = fs0 { fsSpec = spec }
+                                  fs2 = filterRetune srF baseCutoff qEff fs1
+                              in fs2
 
-              v = Voice osc0 filt0 filtEnv0 0 freqHz holdFrames baseL baseR ampL ampR adsr'
-                        env0 (Just nid) (Just iid)
+                        env' =
+                          if needsFiltEnv spec
+                            then
+                              if legRetrigFilt
+                                then Just envInit
+                                else case vFiltEnv v of
+                                       Nothing -> Just envInit
+                                       Just fe -> Just fe
+                            else Nothing
+                    in (Just fs', env')
 
-          MV.write vec n v
-          pure st { stActiveCount = n + 1 }
+              v' = v
+                { vOsc = osc1
+                , vNoteHz = freqHz
+                , vNoteId = Just nid
+                , vHoldRemain = holdFrames
+                , vAmpL = ampL'
+                , vAmpR = ampR'
+                , vADSR = adsr'
+                , vFilter = mfilt'
+                , vFiltEnv = mfenv'
+                , vFiltTick = 0
+                , vStartedAt = now'
+                }
+
+          MV.write (stVoices st) ix v'
+          pure st { stNow = now' }
+
+        -- No legato candidate: allocate new voice
+        Nothing -> do
+          let n = stActiveCount st
+              vec = stVoices st
+              cap = MV.length vec
+          if n >= cap
+            then pure st { stNow = now' }
+            else do
+              let (baseL, baseR) = panGains amp pan
+                  ampL = baseL * iGain inst
+                  ampR = baseR * iGain inst
+                  adsrSpec = maybe (iAdsrDefault inst) id adsrOverride
+                  adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
+                  env0 = envInit
+
+                  osc0 =
+                    oscSetGlideSec srF glideSec $
+                    oscInit (iWaveform inst) srF freqHz
+
+                  filt0 =
+                    case iFilter inst of
+                      Nothing   -> Nothing
+                      Just spec -> Just (filterStateInit srF freqHz spec)
+
+                  filtEnv0 =
+                    case iFilter inst of
+                      Nothing   -> Nothing
+                      Just spec ->
+                        if needsFiltEnv spec
+                          then Just envInit
+                          else Nothing
+
+                  vNew = Voice osc0 filt0 filtEnv0 0 freqHz holdFrames baseL baseR ampL ampR adsr'
+                            env0 (Just nid) (Just iid) now'
+
+              MV.write vec n vNew
+              pure st { stActiveCount = n + 1, stNow = now' }
 
 lookupInstrument ∷ InstrumentId → AudioState → IO (Maybe Instrument)
 lookupInstrument (InstrumentId i) st = do
@@ -433,12 +568,6 @@ panGains amp pan =
 -- Helpers
 --------------------------------------------------------------------------------
 
--- | Cheap soft clipper that limits smoothly into [-1,1].
---   For |x| <= 1: y = x - x^3/3 (soft saturation)
---   For |x| > 1 : y = sign(x) * 2/3
---
--- This is a classic "cubic soft clip". It prevents extreme resonance spikes
--- from producing painful digital clipping.
 softClipCubic ∷ CFloat → CFloat
 softClipCubic x =
   let ax = abs x
@@ -446,7 +575,6 @@ softClipCubic x =
        then x - (x*x*x)/3
        else (signum x) * (2/3)
 
--- | A gentler soft clipper that limits smoothly into [-1,1] using tanh.
 softClipTanh ∷ Float → Float
 softClipTanh x = tanh x
 
@@ -462,7 +590,7 @@ clamp01 x
 
 renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded h rb chunkFrames st0 = do
-  let targetFrames = (sampleRate h `div` 5)  -- 200ms queued
+  let targetFrames = (sampleRate h `div` 20) -- ~50ms queued
       loop st = do
         availRead  <- rbAvailableRead rb
         availWrite <- rbAvailableWrite rb
@@ -487,7 +615,7 @@ renderChunkFrames h rb framesNow st = do
     let out = castPtr out0 ∷ Ptr CFloat
     written <- rbWriteF32 rb out (fromIntegral framesNow)
     when (written /= fromIntegral framesNow) $
-      pure ()  -- optionally track a counter
+      pure ()
 
   pure st'
 
@@ -512,15 +640,12 @@ mixVoices sr chunkFrames out st0 = do
 
 mixOneVoice sr chunkFrames out v0 = do
   let framesToDo = chunkFrames
-
-      -- coefficient retune rate (in samples). 16 is a good start.
       retuneEvery = 16 ∷ Int
 
       go :: Int -> Ptr CFloat -> Voice -> IO Voice
       go i p v
         | i >= framesToDo = pure v
         | otherwise = do
-            -- IMPORTANT: read live params from v (not v0)
             let ampL = vAmpL v
                 ampR = vAmpR v
                 adsrSpec = vADSR v
