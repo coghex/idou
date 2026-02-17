@@ -12,9 +12,10 @@ module Audio.Types
 import Data.Word (Word32)
 import Engine.Core.Queue (Queue)
 import Audio.Envelope (ADSR)
+import Audio.Filter.Types (FilterSpec)
 
 data NoteId
-  = NoteMidi !Int      -- 0..127 typically
+  = NoteMidi !Int
   | NoteHz   !Float
   deriving (Eq, Show)
 
@@ -32,6 +33,7 @@ data Instrument = Instrument
   { iWaveform    ∷ !Waveform
   , iAdsrDefault ∷ !ADSR
   , iGain        ∷ !Float
+  , iFilter      ∷ !(Maybe FilterSpec)
   } deriving (Eq, Show)
 
 data AudioMsg
@@ -40,22 +42,20 @@ data AudioMsg
       , instrument   ∷ !Instrument
       }
 
-  -- Convenience one-shot (kept; does not use instruments)
   | AudioPlayBeep
-      { amp     ∷ !Float   -- 0..1
-      , pan     ∷ !Float   -- -1..1
+      { amp     ∷ !Float
+      , pan     ∷ !Float
       , freqHz  ∷ !Float
-      , durSec  ∷ !Float   -- hold time before release
+      , durSec  ∷ !Float
       , adsr    ∷ !ADSR
       }
 
-  -- Held note, uses an instrument.
   | AudioNoteOn
       { instrumentId ∷ !InstrumentId
-      , amp          ∷ !Float          -- 0..1
-      , pan          ∷ !Float          -- -1..1
+      , amp          ∷ !Float
+      , pan          ∷ !Float
       , noteId       ∷ !NoteId
-      , adsrOverride ∷ !(Maybe ADSR)   -- Nothing uses instrument default
+      , adsrOverride ∷ !(Maybe ADSR)
       }
 
   | AudioNoteOff

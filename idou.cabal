@@ -33,6 +33,9 @@ executable idou
                   Audio.Thread
                   Audio.Envelope
                   Audio.Oscillator
+                  Audio.Filter
+                  Audio.Filter.Types
+                  Audio.Filter.Biquad
   build-depends:    base >=4.14 && <5
                 ,   idou
                 ,   stm

@@ -24,6 +24,7 @@ import Engine.Core.Queue as Q
 import Audio.Types
 import Audio.Envelope
 import Audio.Oscillator
+import Audio.Filter (FilterState, filterStep, filterStateInit)
 
 import Sound.Miniaudio
 import Sound.Miniaudio.RingBuffer
@@ -34,6 +35,7 @@ import Sound.Miniaudio.RingBuffer
 
 data Voice = Voice
   { vOsc        ∷ !Osc
+  , vFilter     ∷ !(Maybe FilterState)
   , vHoldRemain ∷ !Int      -- frames until we trigger release
   , vAmpL       ∷ !Float
   , vAmpR       ∷ !Float
@@ -253,7 +255,7 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
           adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
           env0 = envInit
           osc0 = oscInit WaveSine srF freqHz
-          v = Voice osc0 holdFrames ampL ampR adsr' env0 Nothing Nothing
+          v = Voice osc0 Nothing holdFrames ampL ampR adsr' env0 Nothing Nothing
 
       MV.write vec n v
       pure st { stActiveCount = n + 1 }
@@ -290,7 +292,11 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
               env0 = envInit
               freqHz = noteIdToHz nid
               osc0 = oscInit (iWaveform inst) srF freqHz
-              v = Voice osc0 holdFrames ampL ampR adsr' env0 (Just nid) (Just iid)
+              filt0 = case iFilter inst of
+                Nothing -> Nothing
+                Just spec -> Just (filterStateInit srF freqHz spec)
+              v = Voice osc0 filt0 holdFrames ampL ampR adsr'
+                        env0 (Just nid) (Just iid)
 
           MV.write vec n v
           pure st { stActiveCount = n + 1 }
@@ -398,10 +404,17 @@ mixOneVoice sr chunkFrames out v0 = do
                 env0 = if hold <= 0 then envRelease (vEnv v) else vEnv v
                 (env1, lvl) = envStep sr adsrSpec env0
 
-                (osc1, s0) = oscStep (vOsc v)
-
-                sL = realToFrac (s0 * (ampL * lvl)) :: CFloat
-                sR = realToFrac (s0 * (ampR * lvl)) :: CFloat
+                (osc1, x0) = oscStep (vOsc v)
+            
+                (mfilt1, x1) =
+                  case vFilter v of
+                    Nothing    -> (Nothing, x0)
+                    Just filt0 ->
+                      let (filt1, y0) = filterStep sr filt0 x0
+                      in (Just filt1, y0)
+            
+                sL = realToFrac (x1 * (ampL * lvl)) :: CFloat
+                sR = realToFrac (x1 * (ampR * lvl)) :: CFloat
 
             curL <- peek p
             curR <- peek (p `advancePtr` 1)
@@ -410,6 +423,7 @@ mixOneVoice sr chunkFrames out v0 = do
 
             let v' = v
                   { vOsc = osc1
+                  , vFilter = mfilt1
                   , vEnv = env1
                   , vHoldRemain = hold - 1
                   }

@@ -12,15 +12,18 @@ import Audio.Thread
 import Audio.Types
 import Audio.Envelope
 
+import Audio.Filter.Types
+import Audio.Filter.Biquad (FilterType(..))
+
 main ∷ IO ()
 main =
   bracket startAudioSystem stopAudioSystem $ \sys ->
   withRawStdin $ do
-    putStrLn "Terminal input mode:"
-    putStrLn "  Press 'c' toggle middle C"
-    putStrLn "  Press 'd' toggle D"
-    putStrLn "  Press <tab> to switch instrument (0 <-> 1) used by NEW note-ons"
-    putStrLn "  Press 'q' to quit"
+    putStrLn "Keys:"
+    putStrLn "  c / d   : toggle notes"
+    putStrLn "  <tab>   : switch instrument used for NEW note-ons (0<->1)"
+    putStrLn "  1 / 2 / 3: select filter preset (updates instruments)"
+    putStrLn "  q       : quit"
 
     let env0 = ADSR
           { aAttackSec  = 0.02
@@ -29,23 +32,53 @@ main =
           , aReleaseSec = 0.50
           }
 
-        inst0 = Instrument { iWaveform = WaveSine
-                           , iAdsrDefault = env0, iGain = 1.0 }
-        inst1 = Instrument { iWaveform = WaveSaw
-                           , iAdsrDefault = env0, iGain = 0.8 }
-        inst2 = Instrument { iWaveform = WaveSquare
-                           , iAdsrDefault = env0, iGain = 0.8 }
-        inst3 = Instrument { iWaveform = WaveTriangle
-                           , iAdsrDefault = env0, iGain = 0.8 }
+        -- Filter presets
+        presetFilter ∷ Char → Maybe FilterSpec
+        presetFilter k =
+          case k of
+            '1' -> Nothing
+            '2' -> Just FilterSpec
+                    { fType     = FLP
+                    , fCutoffHz = 1200
+                    , fQ        = 0.707
+                    , fSlope    = S24
+                    , fKeyTrack = KeyTrack 0.30
+                    }
+            '3' -> Just FilterSpec
+                    { fType     = FHP
+                    , fCutoffHz = 200
+                    , fQ        = 0.707
+                    , fSlope    = S12
+                    , fKeyTrack = KeyTrack 0.0
+                    }
+            _   -> Nothing
 
-    sendAudio sys (AudioSetInstrument (InstrumentId 0) inst0)
-    sendAudio sys (AudioSetInstrument (InstrumentId 1) inst1)
-    sendAudio sys (AudioSetInstrument (InstrumentId 2) inst2)
-    sendAudio sys (AudioSetInstrument (InstrumentId 3) inst3)
+    filterRef <- newIORef (Nothing ∷ Maybe FilterSpec)
+
+    let mkInst wf gain mFilt =
+          Instrument
+            { iWaveform = wf
+            , iAdsrDefault = env0
+            , iGain = gain
+            , iFilter = mFilt
+            }
+
+        pushInstruments mFilt = do
+          let inst0 = mkInst WaveSine     1.0 mFilt
+              inst1 = mkInst WaveSaw      0.8 mFilt
+              inst2 = mkInst WaveSquare   0.8 mFilt
+              inst3 = mkInst WaveTriangle 1.0 mFilt
+          sendAudio sys (AudioSetInstrument (InstrumentId 0) inst0)
+          sendAudio sys (AudioSetInstrument (InstrumentId 1) inst1)
+          sendAudio sys (AudioSetInstrument (InstrumentId 2) inst2)
+          sendAudio sys (AudioSetInstrument (InstrumentId 3) inst3)
+
+    -- initial instrument setup: no filter
+    pushInstruments Nothing
 
     currentInstrRef <- newIORef (InstrumentId 0)
 
-    -- Track whether the note is down, and if so, which instrument started it.
+    -- Track which instrument started each note so NoteOff always matches.
     cHeldRef <- newIORef (Nothing ∷ Maybe InstrumentId)
     dHeldRef <- newIORef (Nothing ∷ Maybe InstrumentId)
 
@@ -73,7 +106,6 @@ main =
       ch <- hGetChar stdin
       case ch of
         'q' -> do
-          -- release whatever is currently held (using the instrument that started it)
           mcHeld <- readIORef cHeldRef
           dHeld  <- readIORef dHeldRef
           case mcHeld of
@@ -82,15 +114,32 @@ main =
           case dHeld of
             Nothing  -> pure ()
             Just iid -> noteOff iid dNext
-
           putStrLn "\nQuit."
           exitSuccess
 
         '\t' -> do
           InstrumentId iid <- readIORef currentInstrRef
-          let iid' = InstrumentId ((iid + 1) `mod` 4)
+          let iid' = InstrumentId $ (iid + 1) `mod` 4
           writeIORef currentInstrRef iid'
           putStrLn ("\nInstrument switched to " <> show iid' <> "\n")
+
+        '1' -> do
+          let m = presetFilter '1'
+          writeIORef filterRef m
+          pushInstruments m
+          putStrLn "\nFilter preset 1 (off)\n"
+
+        '2' -> do
+          let m = presetFilter '2'
+          writeIORef filterRef m
+          pushInstruments m
+          putStrLn "\nFilter preset 2 (LP 1200Hz Q0.707 S24 KT0.3)\n"
+
+        '3' -> do
+          let m = presetFilter '3'
+          writeIORef filterRef m
+          pushInstruments m
+          putStrLn "\nFilter preset 3 (HP 200Hz Q0.707 S12)\n"
 
         'c' -> toggleNote cHeldRef middleC
         'd' -> toggleNote dHeldRef dNext
