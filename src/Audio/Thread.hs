@@ -70,7 +70,7 @@ data AudioState = AudioState
   , stInstruments    ∷ !(MV.IOVector (Maybe Instrument)) -- length 256
   , stGlideSec       ∷ !(MV.IOVector Float) -- length 256
   , stLegFiltRetrig  ∷ !(MV.IOVector Bool)  -- length 256
-  , stLegAmpRetrig   ∷ !(MV.IOVector Bool)  -- NEW length 256
+  , stLegAmpRetrig   ∷ !(MV.IOVector Bool)  -- length 256
   , stNow            ∷ !Word64
   }
 
@@ -85,8 +85,9 @@ data AudioSystem = AudioSystem
   }
 
 data AudioUserData = AudioUserData
-  { aud_rb       ∷ !(Ptr MaRB)
-  , aud_channels ∷ !Word32
+  { aud_rb            ∷ !(Ptr MaRB)
+  , aud_channels      ∷ !Word32
+  , aud_underruns     ∷ !(IORef Word64) -- NEW: callback increments on short reads
   }
 
 --------------------------------------------------------------------------------
@@ -98,10 +99,14 @@ sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
 
 startAudioSystem ∷ IO AudioSystem
 startAudioSystem = do
+  -- Reasonable low-latency defaults that still perform well:
+  -- - chunkFrames 256 => ~5.3ms of synthesis work per chunk @ 48k
+  -- - ring buffer capacity 8192 => ~170ms max, but we'll keep target much lower
+  -- - target queue ~= 4 chunks => ~21ms of queued audio
   let sr  = 48000 ∷ Word32
       ch  = 2     ∷ Word32
-      rbCapacityFrames = 24000 ∷ Word32
-      chunkFrames = 512 ∷ Int
+      chunkFrames = 256 ∷ Int
+      rbCapacityFrames = 8192 ∷ Word32
       maxVoices = 256 ∷ Int
 
   q <- Q.newQueue
@@ -110,17 +115,21 @@ startAudioSystem = do
   rb <- rbCreateF32 rbCapacityFrames ch
   when (rb == nullPtr) $ error "rbCreateF32 failed"
 
-  udStable <- newStablePtr (AudioUserData rb ch)
+  underrunRef <- newIORef 0
+  udStable <- newStablePtr (AudioUserData rb ch underrunRef)
   let udPtr = castStablePtrToPtr udStable
 
   let cb ∷ MaDataCallback
       cb dev pOut _pIn frameCount = do
         ud <- hs_ma_device_get_user_data dev
-        AudioUserData rb' ch' <- deRefStablePtr (castPtrToStablePtr ud)
+        AudioUserData rb' ch' uref <- deRefStablePtr (castPtrToStablePtr ud)
         let outF ∷ Ptr CFloat
             outF = castPtr pOut
         got <- rbReadF32 rb' outF frameCount
         when (got < frameCount) $ do
+          -- track underrun and zero-fill remainder
+          modifyIORef' uref (+1)
+
           let samplesGot  = fromIntegral got * fromIntegral ch'
               samplesWant = fromIntegral frameCount * fromIntegral ch'
               remainingSamples = samplesWant - samplesGot
@@ -150,7 +159,7 @@ startAudioSystem = do
   stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec legAmpRetrigVec 0)
 
   controlRef <- newIORef ThreadRunning
-  tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames
+  tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames underrunRef
 
   let ts = ThreadState controlRef tid
   pure AudioSystem
@@ -190,21 +199,33 @@ runAudioLoop
   → IORef AudioState
   → Ptr MaRB
   → Int
+  → IORef Word64
   → IO ()
-runAudioLoop h controlRef stRef rb chunkFrames = go
+runAudioLoop h controlRef stRef rb chunkFrames underrunRef = go 0
   where
-    go = do
+    -- print at most once per second, only if underruns increased
+    go ∷ Word64 → IO ()
+    go lastPrintedCount = do
       control <- readIORef controlRef
       case control of
         ThreadStopped -> pure ()
-        ThreadPaused  -> threadDelay 10000 >> go
+        ThreadPaused  -> threadDelay 10000 >> go lastPrintedCount
         ThreadRunning -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
           st2 <- renderIfNeeded h rb chunkFrames st1
           writeIORef stRef st2
+
+          -- check underruns and print only on change (rate-limited)
+          u <- readIORef underrunRef
+          when (u /= lastPrintedCount) $ do
+            putStrLn ("[audio] underruns: " <> show u)
+            -- sleep a bit so we don't spam if underruns happen every callback
+            threadDelay 1000000
+            go u
+
           threadDelay 1000
-          go
+          go lastPrintedCount
 
 processMsgs ∷ AudioHandle → Ptr MaRB → AudioState → IO AudioState
 processMsgs h rb st = do
@@ -253,6 +274,10 @@ processMsgs h rb st = do
         AudioNoteOff iid nid -> do
           st' <- releaseInstrumentNote iid nid st
           processMsgs h rb st'
+
+--------------------------------------------------------------------------------
+-- Instrument tables / config
+--------------------------------------------------------------------------------
 
 setInstrument ∷ InstrumentId → Instrument → AudioState → IO AudioState
 setInstrument (InstrumentId i) inst st = do
@@ -308,25 +333,9 @@ lookupLegatoAmpRetrig (InstrumentId i) st = do
     then pure False
     else MV.read vec i
 
-releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
-releaseInstrumentAllVoices iid st = do
-  let vec = stVoices st
-      n   = stActiveCount st
-      go i
-        | i >= n = pure st
-        | otherwise = do
-            v <- MV.read vec i
-            if vInstrId v == Just iid
-              then do
-                let fe' = fmap envRelease (vFiltEnv v)
-                MV.write vec i v
-                  { vEnv = envRelease (vEnv v)
-                  , vFiltEnv = fe'
-                  , vHoldRemain = 0
-                  }
-              else pure ()
-            go (i+1)
-  go 0
+--------------------------------------------------------------------------------
+-- Live instrument updates
+--------------------------------------------------------------------------------
 
 applyInstrumentToActiveVoices ∷ Word32 → InstrumentId → Instrument → AudioState → IO AudioState
 applyInstrumentToActiveVoices srW iid inst st = do
@@ -488,7 +497,6 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
               ampR' = vBaseAmpR v * iGain inst
               adsr' = iAdsrDefault inst
 
-              -- AMP envelope legato retrigger option:
               envAmp' = if legRetrigAmp then envInit else vEnv v
 
               (mfilt', mfenv') =
@@ -621,13 +629,35 @@ clamp01 x
   | x > 1     = 1
   | otherwise = x
 
+releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
+releaseInstrumentAllVoices iid st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      go i
+        | i >= n = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid
+              then do
+                let fe' = fmap envRelease (vFiltEnv v)
+                MV.write vec i v
+                  { vEnv = envRelease (vEnv v)
+                  , vFiltEnv = fe'
+                  , vHoldRemain = 0
+                  }
+              else pure ()
+            go (i+1)
+  go 0
+
 --------------------------------------------------------------------------------
 -- Rendering
 --------------------------------------------------------------------------------
 
 renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded h rb chunkFrames st0 = do
-  let targetFrames = (sampleRate h `div` 20) -- ~50ms queued
+  -- Keep a small, stable queue depth based on chunk size.
+  -- 4 chunks ~= 21ms at 48k with chunkFrames=256.
+  let targetFrames = fromIntegral (chunkFrames * 4) ∷ Word32
       loop st = do
         availRead  <- rbAvailableRead rb
         availWrite <- rbAvailableWrite rb
