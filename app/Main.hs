@@ -29,11 +29,19 @@ main =
           , aReleaseSec = 0.50
           }
 
-        inst0 = Instrument { iWaveform = WaveSine, iAdsrDefault = env0, iGain = 1.0 }
-        inst1 = Instrument { iWaveform = WaveSaw , iAdsrDefault = env0, iGain = 0.8 }
+        inst0 = Instrument { iWaveform = WaveSine
+                           , iAdsrDefault = env0, iGain = 1.0 }
+        inst1 = Instrument { iWaveform = WaveSaw
+                           , iAdsrDefault = env0, iGain = 0.8 }
+        inst2 = Instrument { iWaveform = WaveSquare
+                           , iAdsrDefault = env0, iGain = 0.8 }
+        inst3 = Instrument { iWaveform = WaveTriangle
+                           , iAdsrDefault = env0, iGain = 0.8 }
 
     sendAudio sys (AudioSetInstrument (InstrumentId 0) inst0)
     sendAudio sys (AudioSetInstrument (InstrumentId 1) inst1)
+    sendAudio sys (AudioSetInstrument (InstrumentId 2) inst2)
+    sendAudio sys (AudioSetInstrument (InstrumentId 3) inst3)
 
     currentInstrRef <- newIORef (InstrumentId 0)
 
@@ -79,8 +87,8 @@ main =
           exitSuccess
 
         '\t' -> do
-          iid <- readIORef currentInstrRef
-          let iid' = if iid == InstrumentId 0 then InstrumentId 1 else InstrumentId 0
+          InstrumentId iid <- readIORef currentInstrRef
+          let iid' = InstrumentId ((iid + 1) `mod` 4)
           writeIORef currentInstrRef iid'
           putStrLn ("\nInstrument switched to " <> show iid' <> "\n")
 
