@@ -64,8 +64,59 @@ layerMasterIx layerIx s =
     HardSyncTo m ->
       if m >= 0 && m < layerIx then m else -1
 
+clamp01' :: Float -> Float
+clamp01' x
+  | x < 0 = 0
+  | x > 1 = 1
+  | otherwise = x
+
+-- | Base pan positions for layer index given active layer count.
+-- Returns in [-1..1] where -1 = left, +1 = right.
+layerBasePan :: Int -> Int -> Float
+layerBasePan n i =
+  case n of
+    1 -> 0
+    2 -> if i == 0 then (-1) else 1
+    3 -> case i of
+           0 -> (-1)
+           1 -> 0
+           _ -> 1
+    _ -> case i of
+           0 -> (-1)
+           1 -> (-0.33)
+           2 -> 0.33
+           _ -> 1
+
+-- | Constant-power pan gains for pan in [-1..1].
+panGainsCP :: Float -> (Float, Float)
+panGainsCP pan =
+  let p = max (-1) (min 1 pan)
+      ang = (realToFrac (p + 1) ∷ Double) * (pi/4)
+      gL = realToFrac (cos ang) ∷ Float
+      gR = realToFrac (sin ang) ∷ Float
+  in (gL, gR)
+
+writeLayerGains :: Float -> Int -> MV.IOVector Float -> MV.IOVector Float -> IO ()
+writeLayerGains spread n gL gR = do
+  let s = clamp01' spread
+      go i
+        | i >= maxLayers = pure ()
+        | i < n = do
+            let base = layerBasePan n i
+                pan  = base * s
+                (l,r) = panGainsCP pan
+            MV.write gL i l
+            MV.write gR i r
+            go (i+1)
+        | otherwise = do
+            MV.write gL i 0
+            MV.write gR i 0
+            go (i+1)
+  go 0
+
 mkVoiceLayers
   ∷ Float
+  → Float
   → Float
   → [OscLayer]
   → IO ( MV.IOVector Osc
@@ -73,20 +124,27 @@ mkVoiceLayers
        , MV.IOVector Float
        , MV.IOVector Float
        , MV.IOVector Int
+       , MV.IOVector Float
+       , MV.IOVector Float
        , Int
        )
-mkVoiceLayers srF baseHz layers = do
+mkVoiceLayers srF baseHz spread layers = do
   oscs   <- MV.new maxLayers
   levels <- MV.new maxLayers
   rats   <- MV.new maxLayers
   hzOff  <- MV.new maxLayers
   syncM  <- MV.new maxLayers
+  gL     <- MV.new maxLayers
+  gR     <- MV.new maxLayers
 
-  let n = length layers
+  let n0 = length layers
+      n  = max 1 n0
+
+  writeLayerGains spread n gL gR
 
   let go i
         | i >= maxLayers = pure ()
-        | i < n =
+        | i < n0 =
             case layers !! i of
               OscLayer wf ps lvl syncSpec -> do
                 let ratio = pitchSpecRatio ps
@@ -107,7 +165,7 @@ mkVoiceLayers srF baseHz layers = do
             go (i+1)
 
   go 0
-  pure (oscs, levels, rats, hzOff, syncM, max 1 n)
+  pure (oscs, levels, rats, hzOff, syncM, gL, gR, n)
 
 findLegatoVoiceIxNewest ∷ InstrumentId → AudioState → IO (Maybe Int)
 findLegatoVoiceIxNewest iid st = do
@@ -140,8 +198,8 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
           adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
           env0 = envInit
 
-      (oscs, levels, rats, hzOff, syncM, oscCount) <-
-        mkVoiceLayers srF freqHz [OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync]
+      (oscs, levels, rats, hzOff, syncM, gL, gR, oscCount) <-
+        mkVoiceLayers srF freqHz 0 [OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync]
 
       let v = Voice
                 { vOscs = oscs
@@ -150,6 +208,8 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
                 , vPitchRat = rats
                 , vHzOffset = hzOff
                 , vSyncMaster = syncM
+                , vLayerGainL = gL
+                , vLayerGainR = gR
                 , vFilter = Nothing
                 , vFiltEnv = Nothing
                 , vFiltTick = 0
@@ -177,7 +237,9 @@ applyInstrumentToActiveVoices srW iid inst st = do
       srF = fromIntegral srW ∷ Float
 
       layers = normalizeLayers inst
-      layerN = length layers
+      layerN0 = length layers
+      layerN  = max 1 layerN0
+      spread  = clamp01' (iLayerSpread inst)
 
       needsFiltEnv spec = fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0
 
@@ -189,9 +251,13 @@ applyInstrumentToActiveVoices srW iid inst st = do
               then go (i+1)
               else do
                 let baseHz = vNoteHz v
+
+                -- NEW: update layer spread gains live
+                writeLayerGains spread layerN (vLayerGainL v) (vLayerGainR v)
+
                 let updateLayer li
                       | li >= maxLayers = pure ()
-                      | li < layerN =
+                      | li < layerN0 =
                           case layers !! li of
                             OscLayer wf ps lvl syncSpec -> do
                               osc0 <- MV.read (vOscs v) li
@@ -235,7 +301,7 @@ applyInstrumentToActiveVoices srW iid inst st = do
                           in (Just fs', env')
 
                 MV.write vec i v
-                  { vOscCount = max 1 layerN
+                  { vOscCount = layerN
                   , vAmpL = ampL'
                   , vAmpR = ampR'
                   , vADSR = adsr'
@@ -276,15 +342,20 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
       mLegIx <- findLegatoVoiceIxNewest iid st
 
       let layers = normalizeLayers inst
-          layerN = length layers
+          layerN0 = length layers
+          layerN  = max 1 layerN0
+          spread  = clamp01' (iLayerSpread inst)
 
       case mLegIx of
         Just ix -> do
           v <- MV.read (stVoices st) ix
 
+          -- NEW: update layer spread gains on legato pitch change too
+          writeLayerGains spread layerN (vLayerGainL v) (vLayerGainR v)
+
           let updateLayer li
                 | li >= maxLayers = pure ()
-                | li < layerN =
+                | li < layerN0 =
                     case layers !! li of
                       OscLayer wf ps lvl syncSpec -> do
                         let ratio = pitchSpecRatio ps
@@ -337,7 +408,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                     in (Just fs', env')
 
           MV.write (stVoices st) ix v
-            { vOscCount = max 1 layerN
+            { vOscCount = layerN
             , vNoteHz = baseHz
             , vNoteId = Just nid
             , vHoldRemain = holdFrames
@@ -367,8 +438,8 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                   adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
                   env0 = envInit
 
-              (oscs, levels, rats, hzOff, syncM, oscCount) <-
-                mkVoiceLayers srF baseHz layers
+              (oscs, levels, rats, hzOff, syncM, gL, gR, oscCount) <-
+                mkVoiceLayers srF baseHz spread layers
 
               let initLayer li
                     | li >= oscCount = pure ()
@@ -395,6 +466,8 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                     , vPitchRat = rats
                     , vHzOffset = hzOff
                     , vSyncMaster = syncM
+                    , vLayerGainL = gL
+                    , vLayerGainR = gR
                     , vFilter = filt0
                     , vFiltEnv = filtEnv0
                     , vFiltTick = 0

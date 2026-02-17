@@ -11,7 +11,7 @@ module Audio.Thread.Types
 
 import Data.IORef (IORef)
 import Data.Word (Word32, Word64)
-import Foreign.Ptr (Ptr)
+import Foreign (Ptr)
 import Foreign.C (CFloat)
 import Foreign.ForeignPtr (ForeignPtr)
 
@@ -30,13 +30,17 @@ maxLayers ∷ Int
 maxLayers = 4
 
 data Voice = Voice
-  { -- NEW: up to 4 osc layers inline (no lists/allocations).
-    vOscs       ∷ !(MV.IOVector Osc)     -- length maxLayers, always allocated per voice
-  , vOscCount   ∷ !Int                   -- number of active layers (1..maxLayers)
-  , vLevels     ∷ !(MV.IOVector Float)   -- per-layer level (0..1), length maxLayers
-  , vPitchRat   ∷ !(MV.IOVector Float)   -- per-layer multiplicative ratio vs baseHz, length maxLayers
-  , vHzOffset   ∷ !(MV.IOVector Float)   -- per-layer additive Hz offset, length maxLayers
+  { vOscs       ∷ !(MV.IOVector Osc)
+  , vOscCount   ∷ !Int
+  , vLevels     ∷ !(MV.IOVector Float)
+  , vPitchRat   ∷ !(MV.IOVector Float)
+  , vHzOffset   ∷ !(MV.IOVector Float)
   , vSyncMaster ∷ !(MV.IOVector Int)
+
+  -- NEW: per-layer stereo placement gains (constant-power), derived from Instrument.iLayerSpread
+  , vLayerGainL ∷ !(MV.IOVector Float)
+  , vLayerGainR ∷ !(MV.IOVector Float)
+
   , vFilter     ∷ !(Maybe FilterState)
   , vFiltEnv    ∷ !(Maybe EnvState)
   , vFiltTick   ∷ !Int

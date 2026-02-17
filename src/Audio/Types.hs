@@ -32,7 +32,6 @@ data Waveform
 newtype InstrumentId = InstrumentId Int
   deriving (Eq, Ord, Show)
 
--- pitch transform relative to the voice base note.
 data PitchSpec = PitchSpec
   { psOctaves   ∷ !Int
   , psSemitones ∷ !Float
@@ -40,84 +39,38 @@ data PitchSpec = PitchSpec
   , psHzOffset  ∷ !Float
   } deriving (Eq, Show)
 
--- hard sync routing for an oscillator layer.
 data SyncSpec
   = NoSync
   | HardSyncTo
-      { masterLayerIx ∷ !Int   -- 0..3; must be < slave index
+      { masterLayerIx ∷ !Int
       }
   deriving (Eq, Show)
 
--- one oscillator "layer" inside an instrument voice.
 data OscLayer = OscLayer
   { olWaveform ∷ !Waveform
   , olPitch    ∷ !PitchSpec
   , olLevel    ∷ !Float
-  , olSync     ∷ !SyncSpec   -- NEW
+  , olSync     ∷ !SyncSpec
   } deriving (Eq, Show)
 
 data Instrument = Instrument
-  { -- NEW: up to 4 layers; interpret [] as “default single layer” (WaveSine, unity).
-    -- For Step A we’ll enforce non-empty in your code that constructs instruments.
-    iOscs        ∷ ![OscLayer]
-
+  { iOscs        ∷ ![OscLayer]
+  , iLayerSpread ∷ !Float          -- NEW: 0..1 stereo spread across layers
   , iAdsrDefault ∷ !ADSR
   , iGain        ∷ !Float
   , iFilter      ∷ !(Maybe FilterSpec)
   } deriving (Eq, Show)
 
 data AudioMsg
-  = AudioSetInstrument
-      { instrumentId ∷ !InstrumentId
-      , instrument   ∷ !Instrument
-      }
-
-  | AudioSetGlideSec
-      { instrumentId ∷ !InstrumentId
-      , glideSec     ∷ !Float
-      }
-
-  | AudioSetLegatoFilterRetrig
-      { instrumentId ∷ !InstrumentId
-      , retrigFilter ∷ !Bool
-      }
-
-  | AudioSetLegatoAmpRetrig
-      { instrumentId ∷ !InstrumentId
-      , retrigAmp    ∷ !Bool
-      }
-
-  | AudioSetVibrato
-      { instrumentId  ∷ !InstrumentId
-      , vibRateHz     ∷ !Float
-      , vibDepthCents ∷ !Float
-      }
-
-  | AudioPlayBeep
-      { amp     ∷ !Float
-      , pan     ∷ !Float
-      , freqHz  ∷ !Float
-      , durSec  ∷ !Float
-      , adsr    ∷ !ADSR
-      }
-
-  | AudioNoteOn
-      { instrumentId ∷ !InstrumentId
-      , amp          ∷ !Float
-      , pan          ∷ !Float
-      , noteId       ∷ !NoteId
-      , adsrOverride ∷ !(Maybe ADSR)
-      }
-
-  | AudioNoteOff
-      { instrumentId ∷ !InstrumentId
-      , noteId       ∷ !NoteId
-      }
-
-  | AudioNoteOffInstrument
-      { instrumentId ∷ !InstrumentId
-      }
-
+  = AudioSetInstrument { instrumentId ∷ !InstrumentId, instrument ∷ !Instrument }
+  | AudioSetGlideSec { instrumentId ∷ !InstrumentId, glideSec ∷ !Float }
+  | AudioSetLegatoFilterRetrig { instrumentId ∷ !InstrumentId, retrigFilter ∷ !Bool }
+  | AudioSetLegatoAmpRetrig { instrumentId ∷ !InstrumentId, retrigAmp ∷ !Bool }
+  | AudioSetVibrato { instrumentId ∷ !InstrumentId, vibRateHz ∷ !Float, vibDepthCents ∷ !Float }
+  | AudioPlayBeep { amp ∷ !Float, pan ∷ !Float, freqHz ∷ !Float, durSec ∷ !Float, adsr ∷ !ADSR }
+  | AudioNoteOn { instrumentId ∷ !InstrumentId, amp ∷ !Float, pan ∷ !Float, noteId ∷ !NoteId, adsrOverride ∷ !(Maybe ADSR) }
+  | AudioNoteOff { instrumentId ∷ !InstrumentId, noteId ∷ !NoteId }
+  | AudioNoteOffInstrument { instrumentId ∷ !InstrumentId }
   | AudioStopAll
   | AudioShutdown
   deriving (Eq, Show)

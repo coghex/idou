@@ -118,6 +118,7 @@ main =
                     ]
           in Instrument
               { iOscs = layers
+              , iLayerSpread = 0.7
               , iAdsrDefault = env
               , iGain = gain
               , iFilter = mFilt

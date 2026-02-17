@@ -99,14 +99,15 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
                          in x - fromIntegral (floor x ∷ Int)
                     else ph0
 
-            -- Step osc layers with hard-sync (Step B)
+            -- Step osc layers with hard-sync + spread => stereo
             let nOsc = vOscCount v
-            xSum <- stepOscsSync4 srF nOsc vibRatio v
+            (xL0, xR0) <- stepOscsSync4Stereo srF nOsc vibRatio v
+            let xMono = 0.5 * (xL0 + xR0)
 
-            -- filter
+            -- filter (mono)
             let (mfilt1, mfenv1, tick1, x1) =
                   case vFilter v of
-                    Nothing -> (Nothing, vFiltEnv v, vFiltTick v, xSum)
+                    Nothing -> (Nothing, vFiltEnv v, vFiltTick v, xMono)
                     Just fs0 ->
                       let spec = fsSpec fs0
                           tick0 = vFiltTick v
@@ -130,7 +131,7 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
                               then filterRetune srF cutoffHz qEff fs0
                               else fs0
 
-                          (fs1, y0) = filterStep srF fsRetuned xSum
+                          (fs1, y0) = filterStep srF fsRetuned xMono
                       in (Just fs1, mfenvN, tickN, y0)
 
             let sL = realToFrac (x1 * (vAmpL v * lvl)) :: CFloat
@@ -154,13 +155,10 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents v0 = do
 
   go 0 out v0
 
--- | Step up to 4 oscillator layers, applying hard sync:
--- if layer i has vSyncMaster[i] = m >= 0, and master m wrapped this sample,
--- reset layer i phase to 0 before stepping.
---
--- No allocations; uses fixed locals for wrapped flags.
-stepOscsSync4 ∷ Float → Int → Float → Voice → IO Float
-stepOscsSync4 srF n vibRatio v = do
+-- | Step up to 4 oscillator layers, applying hard sync AND per-layer stereo gains.
+-- Returns (leftSum, rightSum) before voice amp/env/filter.
+stepOscsSync4Stereo ∷ Float → Int → Float → Voice → IO (Float, Float)
+stepOscsSync4Stereo srF n vibRatio v = do
   let baseHz = vNoteHz v
 
   let stepOne li wm0 wm1 wm2 wm3 = do
@@ -169,6 +167,8 @@ stepOscsSync4 srF n vibRatio v = do
         rat  <- MV.read (vPitchRat v) li
         off  <- MV.read (vHzOffset v) li
         m    <- MV.read (vSyncMaster v) li
+        gL   <- MV.read (vLayerGainL v) li
+        gR   <- MV.read (vLayerGainR v) li
 
         let masterWrapped =
               case m of
@@ -177,29 +177,26 @@ stepOscsSync4 srF n vibRatio v = do
                 2 -> wm2
                 3 -> wm3
                 _ -> False
-            oscR = if m >= 0 && masterWrapped then oscResetPhase0 osc0 else osc0
+            oscRst = if m >= 0 && masterWrapped then oscResetPhase0 osc0 else osc0
 
         let hz = max 0 (baseHz * rat * vibRatio + off)
-            oscT = oscSetHz srF hz oscR
+            oscT = oscSetHz srF hz oscRst
             (osc1, x, wrapped) = oscStepWrap oscT
 
         MV.write (vOscs v) li osc1
-        pure (lvl * x, wrapped)
+        let xScaled = lvl * x
+        pure ((xScaled * gL, xScaled * gR), wrapped)
 
-  -- layer 0
-  (x0, w0) <-
-    if n > 0 then stepOne 0 False False False False else pure (0, False)
+  ((x0L, x0R), w0) <-
+    if n > 0 then stepOne 0 False False False False else pure ((0,0), False)
 
-  -- layer 1
-  (x1, w1) <-
-    if n > 1 then stepOne 1 w0 False False False else pure (0, False)
+  ((x1L, x1R), w1) <-
+    if n > 1 then stepOne 1 w0 False False False else pure ((0,0), False)
 
-  -- layer 2
-  (x2, w2) <-
-    if n > 2 then stepOne 2 w0 w1 False False else pure (0, False)
+  ((x2L, x2R), w2) <-
+    if n > 2 then stepOne 2 w0 w1 False False else pure ((0,0), False)
 
-  -- layer 3
-  (x3, _w3) <-
-    if n > 3 then stepOne 3 w0 w1 w2 False else pure (0, False)
+  ((x3L, x3R), _w3) <-
+    if n > 3 then stepOne 3 w0 w1 w2 False else pure ((0,0), False)
 
-  pure (x0 + x1 + x2 + x3)
+  pure (x0L + x1L + x2L + x3L, x0R + x1R + x2R + x3R)
