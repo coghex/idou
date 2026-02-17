@@ -60,7 +60,6 @@ data Voice = Voice
   , vNoteId     ∷ !(Maybe NoteId)         -- Nothing for one-shots
   , vInstrId    ∷ !(Maybe InstrumentId)   -- Nothing for one-shots
 
-  -- Monotonic stamp: used to pick "most recently used" voice for legato.
   , vStartedAt  ∷ !Word64
   }
 
@@ -69,12 +68,8 @@ data AudioState = AudioState
   , stActiveCount   ∷ !Int
   , stMixBuf        ∷ !(ForeignPtr CFloat) -- interleaved stereo
   , stInstruments   ∷ !(MV.IOVector (Maybe Instrument)) -- length 256
-
-  -- Per-instrument mono legato options:
   , stGlideSec      ∷ !(MV.IOVector Float) -- length 256
   , stLegFiltRetrig ∷ !(MV.IOVector Bool)  -- length 256
-
-  -- Global monotonic stamp counter.
   , stNow           ∷ !Word64
   }
 
@@ -104,7 +99,7 @@ startAudioSystem ∷ IO AudioSystem
 startAudioSystem = do
   let sr  = 48000 ∷ Word32
       ch  = 2     ∷ Word32
-      rbCapacityFrames = 24000 ∷ Word32  -- 0.5 seconds @ 48k
+      rbCapacityFrames = 24000 ∷ Word32
       chunkFrames = 512 ∷ Int
       maxVoices = 256 ∷ Int
 
@@ -237,6 +232,10 @@ processMsgs h rb st = do
           st' <- setLegatoFilterRetrig iid rf st
           processMsgs h rb st'
 
+        AudioNoteOffInstrument iid -> do
+          st' <- releaseInstrumentAllVoices iid st
+          processMsgs h rb st'
+
         AudioPlayBeep a p f d e -> do
           st' <- addBeepVoice h st a p f d e
           processMsgs h rb st'
@@ -288,6 +287,27 @@ lookupLegatoFilterRetrig (InstrumentId i) st = do
   if i < 0 || i >= MV.length vec
     then pure False
     else MV.read vec i
+
+-- | Release ALL active voices for an instrument (mono-friendly stop).
+releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
+releaseInstrumentAllVoices iid st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      go i
+        | i >= n = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid
+              then do
+                let fe' = fmap envRelease (vFiltEnv v)
+                MV.write vec i v
+                  { vEnv = envRelease (vEnv v)
+                  , vFiltEnv = fe'
+                  , vHoldRemain = 0
+                  }
+              else pure ()
+            go (i+1)
+  go 0
 
 applyInstrumentToActiveVoices ∷ Word32 → InstrumentId → Instrument → AudioState → IO AudioState
 applyInstrumentToActiveVoices srW iid inst st = do
@@ -370,9 +390,6 @@ midiToHz n =
 -- Voice creation + robust legato portamento (most-recent voice wins)
 --------------------------------------------------------------------------------
 
--- | Find the most recently started non-releasing voice for this instrument.
--- This avoids "wrong voice" selection when multiple voices exist for an instrument,
--- and enables "last note wins" during glides.
 findLegatoVoiceIxNewest ∷ InstrumentId → AudioState → IO (Maybe Int)
 findLegatoVoiceIxNewest iid st = do
   let vec = stVoices st
@@ -439,7 +456,6 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
       mLegIx <- findLegatoVoiceIxNewest iid st
 
       case mLegIx of
-        -- Legato: reuse most-recent voice for this instrument
         Just ix -> do
           v <- MV.read (stVoices st) ix
 
@@ -495,7 +511,6 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
           MV.write (stVoices st) ix v'
           pure st { stNow = now' }
 
-        -- No legato candidate: allocate new voice
         Nothing -> do
           let n = stActiveCount st
               vec = stVoices st
@@ -523,9 +538,7 @@ addInstrumentNote h st iid amp pan nid adsrOverride = do
                     case iFilter inst of
                       Nothing   -> Nothing
                       Just spec ->
-                        if needsFiltEnv spec
-                          then Just envInit
-                          else Nothing
+                        if needsFiltEnv spec then Just envInit else Nothing
 
                   vNew = Voice osc0 filt0 filtEnv0 0 freqHz holdFrames baseL baseR ampL ampR adsr'
                             env0 (Just nid) (Just iid) now'

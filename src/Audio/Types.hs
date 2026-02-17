@@ -42,14 +42,11 @@ data AudioMsg
       , instrument   ∷ !Instrument
       }
 
-  -- NEW: per-instrument legato portamento time in seconds (0 disables).
   | AudioSetGlideSec
       { instrumentId ∷ !InstrumentId
       , glideSec     ∷ !Float
       }
 
-  -- NEW: per-instrument behavior on legato note changes:
-  -- if True, retrigger filter envelope; if False, keep it running.
   | AudioSetLegatoFilterRetrig
       { instrumentId ∷ !InstrumentId
       , retrigFilter ∷ !Bool
@@ -74,6 +71,12 @@ data AudioMsg
   | AudioNoteOff
       { instrumentId ∷ !InstrumentId
       , noteId       ∷ !NoteId
+      }
+
+  -- NEW: release all currently active voices for an instrument,
+  -- without needing to know the current NoteId (useful for mono legato).
+  | AudioNoteOffInstrument
+      { instrumentId ∷ !InstrumentId
       }
 
   | AudioStopAll
