@@ -19,17 +19,18 @@ main =
   bracket startAudioSystem stopAudioSystem $ \sys ->
   withRawStdin $ do
     putStrLn "Terminal synth test:"
-    putStrLn "  c / d    : NoteOn C / D (legato)"
-    putStrLn "  space    : NoteOffInstrument"
+    putStrLn "  c / d    : NoteOn C / D"
+    putStrLn "  space    : NoteOffInstrument (panic / release all voices for inst 0)"
     putStrLn "  <tab>    : cycle waveform (live)"
     putStrLn "  u        : toggle unison (2 layers)"
     putStrLn "  s        : toggle hard-sync (layer1 -> layer0)"
-    putStrLn "  m        : toggle mod-matrix routes (LFO->filter/amp, Env->pitch)"
+    putStrLn "  m        : toggle mod-matrix routes"
+    putStrLn "  l        : toggle play mode (MonoLegato <-> Poly)"
     putStrLn "  1 / 2 / 3: filter preset"
     putStrLn "  g        : toggle glide"
     putStrLn "  r        : toggle legato filter env retrigger"
     putStrLn "  a        : toggle legato amp env retrigger"
-    putStrLn "  v        : toggle vibrato (also sets LFO1 rate)"
+    putStrLn "  v        : toggle vibrato (also sets LFO1 rate for mod matrix)"
     putStrLn "  [ / ]    : vibrato depth -/+ (cents)"
     putStrLn "  - / =    : vibrato rate  -/+ (Hz)"
     putStrLn "  p        : pluck one-shot"
@@ -100,8 +101,12 @@ main =
               , ModRoute ModSrcEnvAmp (ModDstLayerPitchCents 0) (-8)
               ]
 
-        mkInst ∷ Waveform → Float → ADSR → Maybe FilterSpec → Bool → Bool → Bool → Instrument
-        mkInst wf gain env mFilt unisonOn syncOn modsOn =
+        mkInst
+          ∷ Waveform → Float → ADSR → Maybe FilterSpec
+          → Bool → Bool → Bool
+          → PlayMode
+          → Instrument
+        mkInst wf gain env mFilt unisonOn syncOn modsOn playMode =
           let layers
                 | not unisonOn =
                     [ OscLayer wf basePitch 1.0 NoSync ]
@@ -116,6 +121,11 @@ main =
               , iGain = gain
               , iFilter = mFilt
               , iModRoutes = mkRoutes modsOn
+
+              -- NEW poly config
+              , iPlayMode = playMode
+              , iPolyMax = 8
+              , iVoiceSteal = StealQuietest
               }
 
     wfRef       <- newIORef WaveSaw
@@ -123,6 +133,7 @@ main =
     unisonRef   <- newIORef False
     syncRef     <- newIORef False
     modsRef     <- newIORef True
+    playModeRef <- newIORef Poly
     instGainRef <- newIORef 1.0
 
     let pushInst0 = do
@@ -131,8 +142,9 @@ main =
           uni <- readIORef unisonRef
           sy <- readIORef syncRef
           mo <- readIORef modsRef
+          pm <- readIORef playModeRef
           g0 <- readIORef instGainRef
-          let inst0 = mkInst wf g0 envAmpNormal mf uni sy mo
+          let inst0 = mkInst wf g0 envAmpNormal mf uni sy mo pm
           sendAudio sys (AudioSetInstrument iid0 inst0)
 
     pushInst0
@@ -148,10 +160,10 @@ main =
     let middleC = NoteMidi 60
         dNext   = NoteMidi 62
 
-        noteOnLegato nid =
+        noteOn nid =
           sendAudio sys (AudioNoteOn iid0 0.25 0.0 nid Nothing)
 
-        noteOffLegato =
+        noteOffAll =
           sendAudio sys (AudioNoteOffInstrument iid0)
 
         doPluck = do
@@ -167,19 +179,10 @@ main =
             pushInst0
           pure ()
 
-        cycleWaveformsLive = do
-          modifyIORef' wfRef nextWaveform
-          pushInst0
-          wf <- readIORef wfRef
-          putStrLn ("\nWaveform -> " <> show wf <> "\n")
+        cycleWaveformsLive = modifyIORef' wfRef nextWaveform >> pushInst0
 
-        toggleUnison = do
-          modifyIORef' unisonRef not
-          pushInst0
-
-        toggleSync = do
-          modifyIORef' syncRef not
-          pushInst0
+        toggleUnison = modifyIORef' unisonRef not >> pushInst0
+        toggleSync   = modifyIORef' syncRef not >> pushInst0
 
         toggleMods = do
           modifyIORef' modsRef not
@@ -187,9 +190,13 @@ main =
           on <- readIORef modsRef
           putStrLn $ if on then "\nMod matrix: ON\n" else "\nMod matrix: OFF\n"
 
-        setFilterPreset k = do
-          writeIORef filtRef (presetFilter k)
+        togglePlayMode = do
+          modifyIORef' playModeRef (\pm -> case pm of MonoLegato -> Poly; Poly -> MonoLegato)
           pushInst0
+          pm <- readIORef playModeRef
+          putStrLn $ "\nPlayMode: " <> show pm <> "\n"
+
+        setFilterPreset k = writeIORef filtRef (presetFilter k) >> pushInst0
 
         toggleGlide = do
           on <- readIORef glideOnRef
@@ -217,10 +224,7 @@ main =
           let (r,d) = if on then (rate, depth) else (0, 0)
           sendAudio sys (AudioSetVibrato iid0 r d)
 
-        toggleVibrato = do
-          modifyIORef' vibOnRef not
-          applyVibrato0
-
+        toggleVibrato = modifyIORef' vibOnRef not >> applyVibrato0
         vibDepthDelta d = modifyIORef' vibDepthRef (\x -> max 0 (x + d)) >> applyVibrato0
         vibRateDelta  d = modifyIORef' vibRateRef  (\x -> max 0 (x + d)) >> applyVibrato0
 
@@ -229,12 +233,13 @@ main =
     forever $ do
       ch <- hGetChar stdin
       case ch of
-        'q' -> noteOffLegato >> putStrLn "\nQuit." >> exitSuccess
+        'q' -> noteOffAll >> putStrLn "\nQuit." >> exitSuccess
 
         '\t' -> cycleWaveformsLive
         'u'  -> toggleUnison
         's'  -> toggleSync
         'm'  -> toggleMods
+        'l'  -> togglePlayMode
 
         '1' -> setFilterPreset '1'
         '2' -> setFilterPreset '2'
@@ -252,9 +257,9 @@ main =
 
         'p' -> doPluck
 
-        'c' -> noteOnLegato middleC
-        'd' -> noteOnLegato dNext
-        ' ' -> noteOffLegato
+        'c' -> noteOn middleC
+        'd' -> noteOn dNext
+        ' ' -> noteOffAll
 
         _ -> pure ()
 
