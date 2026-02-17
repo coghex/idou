@@ -14,6 +14,7 @@ library
                     Engine.Core.Queue
                     Audio.Types
                     Audio.Thread
+                    Audio.Envelope
 
   default-language: Haskell2010
   default-extensions:   ForeignFunctionInterface
@@ -36,6 +37,13 @@ executable miniaudio-hs-example
                 ,   idou
                 ,   stm
                 ,   vector
+  exposed-modules:  Sound.Miniaudio
+                    Sound.Miniaudio.RingBuffer
+                    Engine.Core.Thread
+                    Engine.Core.Queue
+                    Audio.Types
+                    Audio.Thread
+                    Audio.Envelope
   default-language: GHC2024
   default-extensions:   ForeignFunctionInterface
                         Strict
