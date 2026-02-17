@@ -52,17 +52,32 @@ ma_uint32 hs_ma_rb_write_f32(hs_ma_rb* h, const float* frames, ma_uint32 frameCo
 {
     if (!h) return 0;
 
-    size_t bytesRequested = (size_t)frameCount * h->bytesPerFrame;
-    void* pWrite = NULL;
+    ma_uint32 totalWrittenFrames = 0;
 
-    if (ma_rb_acquire_write(&h->rb, &bytesRequested, &pWrite) != MA_SUCCESS) {
-        return 0;
+    while (totalWrittenFrames < frameCount) {
+        ma_uint32 framesRemaining = frameCount - totalWrittenFrames;
+        size_t bytesRequested = (size_t)framesRemaining * h->bytesPerFrame;
+
+        void* pWrite = NULL;
+        if (ma_rb_acquire_write(&h->rb, &bytesRequested, &pWrite) != MA_SUCCESS) {
+            break;
+        }
+
+        if (bytesRequested == 0) {
+            /* No contiguous space right now. */
+            break;
+        }
+
+        memcpy(pWrite,
+               (const char*)frames + (size_t)totalWrittenFrames * h->bytesPerFrame,
+               bytesRequested);
+
+        ma_rb_commit_write(&h->rb, bytesRequested);
+
+        totalWrittenFrames += (ma_uint32)(bytesRequested / h->bytesPerFrame);
     }
 
-    memcpy(pWrite, frames, bytesRequested);
-    ma_rb_commit_write(&h->rb, bytesRequested);
-
-    return (ma_uint32)(bytesRequested / h->bytesPerFrame);
+    return totalWrittenFrames;
 }
 
 /* Read frames into interleaved float array. Returns frames actually read. */
@@ -70,17 +85,31 @@ ma_uint32 hs_ma_rb_read_f32(hs_ma_rb* h, float* outFrames, ma_uint32 frameCount)
 {
     if (!h) return 0;
 
-    size_t bytesRequested = (size_t)frameCount * h->bytesPerFrame;
-    void* pRead = NULL;
+    ma_uint32 totalReadFrames = 0;
 
-    if (ma_rb_acquire_read(&h->rb, &bytesRequested, &pRead) != MA_SUCCESS) {
-        return 0;
+    while (totalReadFrames < frameCount) {
+        ma_uint32 framesRemaining = frameCount - totalReadFrames;
+        size_t bytesRequested = (size_t)framesRemaining * h->bytesPerFrame;
+
+        void* pRead = NULL;
+        if (ma_rb_acquire_read(&h->rb, &bytesRequested, &pRead) != MA_SUCCESS) {
+            break;
+        }
+
+        if (bytesRequested == 0) {
+            break;
+        }
+
+        memcpy((char*)outFrames + (size_t)totalReadFrames * h->bytesPerFrame,
+               pRead,
+               bytesRequested);
+
+        ma_rb_commit_read(&h->rb, bytesRequested);
+
+        totalReadFrames += (ma_uint32)(bytesRequested / h->bytesPerFrame);
     }
 
-    memcpy(outFrames, pRead, bytesRequested);
-    ma_rb_commit_read(&h->rb, bytesRequested);
-
-    return (ma_uint32)(bytesRequested / h->bytesPerFrame);
+    return totalReadFrames;
 }
 
 /* Available bytes -> available frames. */
@@ -88,5 +117,13 @@ ma_uint32 hs_ma_rb_available_read(hs_ma_rb* h)
 {
     if (!h) return 0;
     size_t bytesAvail = ma_rb_available_read(&h->rb);
+    return (ma_uint32)(bytesAvail / h->bytesPerFrame);
+}
+
+/* Available bytes -> available frames (write side). */
+ma_uint32 hs_ma_rb_available_write(hs_ma_rb* h)
+{
+    if (!h) return 0;
+    size_t bytesAvail = ma_rb_available_write(&h->rb);
     return (ma_uint32)(bytesAvail / h->bytesPerFrame);
 }

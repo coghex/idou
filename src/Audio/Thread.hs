@@ -234,37 +234,37 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
 
 renderIfNeeded ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded h rb chunkFrames st0 = do
-  -- Keep more queued audio to avoid underruns/crackle.
-  let targetFrames = (sampleRate h `div` 5)  -- 200ms buffered
+  let targetFrames = (sampleRate h `div` 5)  -- keep ~200ms queued
 
       loop st = do
-        avail <- rbAvailableRead rb
-        if avail >= targetFrames
+        availRead  <- rbAvailableRead rb
+        availWrite <- rbAvailableWrite rb
+
+        if availRead >= targetFrames || availWrite == 0
           then pure st
           else do
-            st' <- renderChunk h rb chunkFrames st
+            -- render at most chunkFrames, but never more than available write space
+            let framesNow = min (fromIntegral availWrite) chunkFrames
+            st' <- renderChunkFrames h rb framesNow st
             loop st'
 
   loop st0
 
-renderChunk ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
-renderChunk h rb chunkFrames st = do
+renderChunkFrames ∷ AudioHandle → Ptr MaRB → Int → AudioState → IO AudioState
+renderChunkFrames h rb framesNow st = do
   st' <- withForeignPtr (stMixBuf st) $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
-        samples = chunkFrames * 2
+        samples = framesNow * 2
         bytes = samples * sizeOf (undefined ∷ CFloat)
     fillBytes out 0 bytes
-    mixVoices (fromIntegral (sampleRate h)) chunkFrames out st
+    mixVoices (fromIntegral (sampleRate h)) framesNow out st
 
   withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
-        total = fromIntegral chunkFrames
-    written <- rbWriteF32 rb out total
-    when (written < total) $ do
-      let remaining = total - written
-          -- advance pointer by written frames * 2 channels
-          out' = out `advancePtr` (fromIntegral written * 2)
-      void (rbWriteF32 rb out' remaining)
+    written <- rbWriteF32 rb out (fromIntegral framesNow)
+    -- With rbAvailableWrite gating, this should always be a full write.
+    when (written /= fromIntegral framesNow) $
+      pure () -- or log/debug later
 
   pure st'
 

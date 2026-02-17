@@ -5,6 +5,7 @@ module Sound.Miniaudio.RingBuffer
   , rbWriteF32
   , rbReadF32
   , rbAvailableRead
+  , rbAvailableWrite
   ) where
 
 import Foreign
@@ -27,6 +28,9 @@ foreign import ccall "hs_ma_rb_read_f32"
 
 foreign import ccall "hs_ma_rb_available_read"
   rbAvailableRead :: Ptr MaRB -> IO Word32
+
+foreign import ccall "hs_ma_rb_available_write"
+  rbAvailableWrite :: Ptr MaRB -> IO Word32
 
 rbCreateF32 :: Word32 -> Word32 -> IO (Ptr MaRB)
 rbCreateF32 capacityFrames channels = c_rbCreateF32 capacityFrames channels
