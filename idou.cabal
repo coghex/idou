@@ -6,8 +6,10 @@ build-type:         Simple
 library
   hs-source-dirs:   src
   build-depends:    base >=4.14 && <5
+                  , bytestring
                   , stm
                   , vector
+                  , containers
   default-language: Haskell2010
   default-extensions:   ForeignFunctionInterface
                         Strict
@@ -40,10 +42,17 @@ executable idou
                   Audio.Filter
                   Audio.Filter.Types
                   Audio.Filter.Biquad
+                  Midi.Play
+                  Midi.ZMidi.Core.Datatypes
+                  Midi.ZMidi.Core.ReadFile
+                  Midi.ZMidi.Core.Internal.ExtraTypes
+                  Midi.ZMidi.Core.Internal.ParserMonad
   build-depends:    base >=4.14 && <5
+                ,   bytestring
                 ,   idou
                 ,   stm
                 ,   vector
+                ,   containers
   default-language: GHC2024
   default-extensions:   ForeignFunctionInterface
                         Strict
