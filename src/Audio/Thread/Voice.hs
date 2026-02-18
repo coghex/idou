@@ -35,6 +35,7 @@ import Audio.Thread.InstrumentTable
   , lookupLegatoAmpRetrig
   )
 
+-- Keep for beeps only
 noteIdToHz ∷ NoteId → Float
 noteIdToHz nid =
   case nid of
@@ -43,6 +44,9 @@ noteIdToHz nid =
 
 midiToHz ∷ Int → Float
 midiToHz n = 440 * (2 ** ((fromIntegral n - 69) / 12))
+
+noteKeyToHz ∷ NoteKey → Float
+noteKeyToHz (NoteKey k) = midiToHz k
 
 pitchSpecRatio ∷ PitchSpec → Float
 pitchSpecRatio ps =
@@ -221,7 +225,6 @@ findStealVoiceIxQuietest iid st = do
                       then go (i+1) (Just i) l onlyRelease
                       else go (i+1) bestIx bestVal onlyRelease
 
-  -- prefer stealing voices already in release
   r1 <- go 0 Nothing 1e30 True
   case r1 of
     Just _ -> pure r1
@@ -268,7 +271,9 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
                 , vAmpR = ampR
                 , vADSR = adsr'
                 , vEnv = env0
-                , vNoteId = Nothing
+                , vNoteKey = Nothing
+                , vNoteInstanceId = Nothing
+                , vVelocity = 1
                 , vInstrId = Nothing
                 , vStartedAt = stNow st
                 , vVibPhase = 0
@@ -323,6 +328,7 @@ applyInstrumentToActiveVoices srW iid inst st = do
 
                 updateLayer 0
 
+                -- apply iGain live; keep velocity baked into vBaseAmp* already
                 let ampL' = vBaseAmpL v * iGain inst
                     ampR' = vBaseAmpR v * iGain inst
                     adsr' = iAdsrDefault inst
@@ -370,27 +376,32 @@ addInstrumentNote
   → InstrumentId
   → Float
   → Float
-  → NoteId
+  → NoteKey
+  → NoteInstanceId
+  → Float
   → Maybe ADSR
   → IO AudioState
-addInstrumentNote h st iid amp pan nid adsrOverride = do
+addInstrumentNote h st iid amp pan key instId vel adsrOverride = do
   instM <- lookupInstrument iid st
   case instM of
     Nothing -> pure st
     Just inst ->
       case iPlayMode inst of
-        MonoLegato -> addInstrumentNoteMonoLegato h st iid inst amp pan nid adsrOverride
-        Poly       -> addInstrumentNotePoly       h st iid inst amp pan nid adsrOverride
+        MonoLegato -> addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride
+        Poly       -> addInstrumentNotePoly       h st iid inst amp pan key instId vel adsrOverride
 
--- Mono-legato path (your original behavior) ----------------------------------
+-- Mono-legato path ------------------------------------------------------------
 
 addInstrumentNoteMonoLegato
-  ∷ AudioHandle → AudioState → InstrumentId → Instrument → Float → Float → NoteId → Maybe ADSR → IO AudioState
-addInstrumentNoteMonoLegato h st iid inst amp pan nid _adsrOverride = do
+  ∷ AudioHandle → AudioState → InstrumentId → Instrument
+  → Float → Float → NoteKey → NoteInstanceId → Float → Maybe ADSR
+  → IO AudioState
+addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel _adsrOverride = do
   let srF = fromIntegral (sampleRate h) ∷ Float
-      baseHz = noteIdToHz nid
+      baseHz = noteKeyToHz key
       holdFrames = maxBound `div` 4
       now' = stNow st + 1
+      vel' = clamp01' vel
 
       needsFiltEnv spec = fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0
 
@@ -435,8 +446,11 @@ addInstrumentNoteMonoLegato h st iid inst amp pan nid _adsrOverride = do
 
       updateLayer 0
 
-      let ampL' = vBaseAmpL v * iGain inst
-          ampR' = vBaseAmpR v * iGain inst
+      let (baseL, baseR) = panGains amp pan
+          baseL' = baseL * vel'
+          baseR' = baseR * vel'
+          ampL' = baseL' * iGain inst
+          ampR' = baseR' * iGain inst
           adsr' = iAdsrDefault inst
           envAmp' = if legRetrigAmp then envInit else vEnv v
 
@@ -466,8 +480,9 @@ addInstrumentNoteMonoLegato h st iid inst amp pan nid _adsrOverride = do
       MV.write (stVoices st) ix v
         { vOscCount = layerN
         , vNoteHz = baseHz
-        , vNoteId = Just nid
         , vHoldRemain = holdFrames
+        , vBaseAmpL = baseL'
+        , vBaseAmpR = baseR'
         , vAmpL = ampL'
         , vAmpR = ampR'
         , vADSR = adsr'
@@ -475,6 +490,9 @@ addInstrumentNoteMonoLegato h st iid inst amp pan nid _adsrOverride = do
         , vFilter = mfilt'
         , vFiltEnv = mfenv'
         , vFiltTick = 0
+        , vNoteKey = Just key
+        , vNoteInstanceId = Just instId
+        , vVelocity = vel'
         , vStartedAt = now'
         }
 
@@ -488,8 +506,10 @@ addInstrumentNoteMonoLegato h st iid inst amp pan nid _adsrOverride = do
         then pure st { stNow = now' }
         else do
           let (baseL, baseR) = panGains amp pan
-              ampL = baseL * iGain inst
-              ampR = baseR * iGain inst
+              baseL' = baseL * vel'
+              baseR' = baseR * vel'
+              ampL = baseL' * iGain inst
+              ampR = baseR' * iGain inst
               adsr' = (iAdsrDefault inst) { aSustain = clamp01 (aSustain (iAdsrDefault inst)) }
               env0 = envInit
 
@@ -528,13 +548,15 @@ addInstrumentNoteMonoLegato h st iid inst amp pan nid _adsrOverride = do
                 , vFiltTick = 0
                 , vNoteHz = baseHz
                 , vHoldRemain = holdFrames
-                , vBaseAmpL = baseL
-                , vBaseAmpR = baseR
+                , vBaseAmpL = baseL'
+                , vBaseAmpR = baseR'
                 , vAmpL = ampL
                 , vAmpR = ampR
                 , vADSR = adsr'
                 , vEnv = env0
-                , vNoteId = Just nid
+                , vNoteKey = Just key
+                , vNoteInstanceId = Just instId
+                , vVelocity = vel'
                 , vInstrId = Just iid
                 , vStartedAt = now'
                 , vVibPhase = 0
@@ -547,12 +569,15 @@ addInstrumentNoteMonoLegato h st iid inst amp pan nid _adsrOverride = do
 -- Poly path -------------------------------------------------------------------
 
 addInstrumentNotePoly
-  ∷ AudioHandle → AudioState → InstrumentId → Instrument → Float → Float → NoteId → Maybe ADSR → IO AudioState
-addInstrumentNotePoly h st iid inst amp pan nid adsrOverride = do
+  ∷ AudioHandle → AudioState → InstrumentId → Instrument
+  → Float → Float → NoteKey → NoteInstanceId → Float → Maybe ADSR
+  → IO AudioState
+addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
   let srF = fromIntegral (sampleRate h) ∷ Float
-      baseHz = noteIdToHz nid
+      baseHz = noteKeyToHz key
       holdFrames = maxBound `div` 4
       now' = stNow st + 1
+      vel' = clamp01' vel
       layers = normalizeLayers inst
       layerN0 = length layers
       layerN  = max 1 layerN0
@@ -561,7 +586,6 @@ addInstrumentNotePoly h st iid inst amp pan nid adsrOverride = do
       needsFiltEnv spec = fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0
 
   glideSec <- lookupGlide iid st
-
   let polyMax = max 1 (iPolyMax inst)
 
   activeForInst <- countInstrumentVoices iid st
@@ -572,8 +596,10 @@ addInstrumentNotePoly h st iid inst amp pan nid adsrOverride = do
 
   let mkNewVoice = do
         let (baseL, baseR) = panGains amp pan
-            ampL = baseL * iGain inst
-            ampR = baseR * iGain inst
+            baseL' = baseL * vel'
+            baseR' = baseR * vel'
+            ampL = baseL' * iGain inst
+            ampR = baseR' * iGain inst
             adsrSpec = maybe (iAdsrDefault inst) id adsrOverride
             adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
             env0 = envInit
@@ -613,13 +639,15 @@ addInstrumentNotePoly h st iid inst amp pan nid adsrOverride = do
           , vFiltTick = 0
           , vNoteHz = baseHz
           , vHoldRemain = holdFrames
-          , vBaseAmpL = baseL
-          , vBaseAmpR = baseR
+          , vBaseAmpL = baseL'
+          , vBaseAmpR = baseR'
           , vAmpL = ampL
           , vAmpR = ampR
           , vADSR = adsr'
           , vEnv = env0
-          , vNoteId = Just nid
+          , vNoteKey = Just key
+          , vNoteInstanceId = Just instId
+          , vVelocity = vel'
           , vInstrId = Just iid
           , vStartedAt = now'
           , vVibPhase = 0
@@ -632,7 +660,6 @@ addInstrumentNotePoly h st iid inst amp pan nid adsrOverride = do
       MV.write vec nActive vNew
       pure st { stActiveCount = nActive + 1, stNow = now' }
     else do
-      -- voice stealing: StealQuietest (the only policy right now)
       mIx <- findStealVoiceIxQuietest iid st
       case mIx of
         Nothing ->
@@ -644,15 +671,15 @@ addInstrumentNotePoly h st iid inst amp pan nid adsrOverride = do
 
 -- Releases --------------------------------------------------------------------
 
-releaseInstrumentNote ∷ InstrumentId → NoteId → AudioState → IO AudioState
-releaseInstrumentNote iid nid st = do
+releaseInstrumentNote ∷ InstrumentId → NoteInstanceId → AudioState → IO AudioState
+releaseInstrumentNote iid instId st = do
   let vec = stVoices st
       n   = stActiveCount st
       go i
         | i >= n    = pure st
         | otherwise = do
             v <- MV.read vec i
-            if vInstrId v == Just iid && vNoteId v == Just nid
+            if vInstrId v == Just iid && vNoteInstanceId v == Just instId
               then do
                 let fe' = fmap envRelease (vFiltEnv v)
                 MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe' }

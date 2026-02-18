@@ -3,7 +3,11 @@
 module Audio.Types
   ( AudioMsg(..)
   , AudioHandle(..)
+
   , NoteId(..)
+  , NoteKey(..)
+  , NoteInstanceId(..)
+
   , Waveform(..)
   , InstrumentId(..)
   , Instrument(..)
@@ -16,20 +20,27 @@ module Audio.Types
   , ModDst(..)
   , ModRoute(..)
 
-  -- NEW: poly / play mode
+  -- poly
   , PlayMode(..)
   , VoiceSteal(..)
   ) where
 
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Engine.Core.Queue (Queue)
 import Audio.Envelope (ADSR)
 import Audio.Filter.Types (FilterSpec)
 
+-- Keep NoteId for AudioPlayBeep only (optional)
 data NoteId
   = NoteMidi !Int
   | NoteHz   !Float
   deriving (Eq, Show)
+
+newtype NoteKey = NoteKey Int
+  deriving (Eq, Ord, Show)
+
+newtype NoteInstanceId = NoteInstanceId Word64
+  deriving (Eq, Ord, Show)
 
 data Waveform
   = WaveSine
@@ -60,7 +71,6 @@ data OscLayer = OscLayer
   , olSync     ∷ !SyncSpec
   } deriving (Eq, Show)
 
--- Mod matrix
 data ModSrc
   = ModSrcLfo1
   | ModSrcEnvAmp
@@ -80,13 +90,11 @@ data ModRoute = ModRoute
   , mrAmount ∷ !Float
   } deriving (Eq, Show)
 
--- NEW: instrument play mode
 data PlayMode
   = MonoLegato
   | Poly
   deriving (Eq, Show)
 
--- NEW: voice stealing policy
 data VoiceSteal
   = StealQuietest
   deriving (Eq, Show)
@@ -98,23 +106,65 @@ data Instrument = Instrument
   , iGain        ∷ !Float
   , iFilter      ∷ !(Maybe FilterSpec)
   , iModRoutes   ∷ ![ModRoute]
-
-  -- NEW: poly config
   , iPlayMode    ∷ !PlayMode
-  , iPolyMax     ∷ !Int          -- e.g. 8
-  , iVoiceSteal  ∷ !VoiceSteal   -- StealQuietest
+  , iPolyMax     ∷ !Int
+  , iVoiceSteal  ∷ !VoiceSteal
   } deriving (Eq, Show)
 
 data AudioMsg
-  = AudioSetInstrument { instrumentId ∷ !InstrumentId, instrument ∷ !Instrument }
-  | AudioSetGlideSec { instrumentId ∷ !InstrumentId, glideSec ∷ !Float }
-  | AudioSetLegatoFilterRetrig { instrumentId ∷ !InstrumentId, retrigFilter ∷ !Bool }
-  | AudioSetLegatoAmpRetrig { instrumentId ∷ !InstrumentId, retrigAmp ∷ !Bool }
-  | AudioSetVibrato { instrumentId  ∷ !InstrumentId, vibRateHz ∷ !Float, vibDepthCents ∷ !Float }
-  | AudioPlayBeep { amp ∷ !Float, pan ∷ !Float, freqHz ∷ !Float, durSec ∷ !Float, adsr ∷ !ADSR }
-  | AudioNoteOn { instrumentId ∷ !InstrumentId, amp ∷ !Float, pan ∷ !Float, noteId ∷ !NoteId, adsrOverride ∷ !(Maybe ADSR) }
-  | AudioNoteOff { instrumentId ∷ !InstrumentId, noteId ∷ !NoteId }
-  | AudioNoteOffInstrument { instrumentId ∷ !InstrumentId }
+  = AudioSetInstrument
+      { instrumentId ∷ !InstrumentId
+      , instrument   ∷ !Instrument
+      }
+
+  | AudioSetGlideSec
+      { instrumentId ∷ !InstrumentId
+      , glideSec     ∷ !Float
+      }
+
+  | AudioSetLegatoFilterRetrig
+      { instrumentId ∷ !InstrumentId
+      , retrigFilter ∷ !Bool
+      }
+
+  | AudioSetLegatoAmpRetrig
+      { instrumentId ∷ !InstrumentId
+      , retrigAmp    ∷ !Bool
+      }
+
+  | AudioSetVibrato
+      { instrumentId  ∷ !InstrumentId
+      , vibRateHz     ∷ !Float
+      , vibDepthCents ∷ !Float
+      }
+
+  | AudioPlayBeep
+      { amp     ∷ !Float
+      , pan     ∷ !Float
+      , freqHz  ∷ !Float
+      , durSec  ∷ !Float
+      , adsr    ∷ !ADSR
+      }
+
+  | AudioNoteOn
+      { instrumentId   ∷ !InstrumentId
+      , amp            ∷ !Float
+      , pan            ∷ !Float
+      , noteKey        ∷ !NoteKey
+      , noteInstanceId ∷ !NoteInstanceId
+      , velocity       ∷ !Float      -- 0..1, required
+      , adsrOverride   ∷ !(Maybe ADSR)
+      }
+
+  | AudioNoteOff
+      { instrumentId   ∷ !InstrumentId
+      , noteInstanceId ∷ !NoteInstanceId
+      }
+
+  | AudioNoteOffInstrument
+      { instrumentId ∷ !InstrumentId
+      }
+
   | AudioStopAll
   | AudioShutdown
   deriving (Eq, Show)

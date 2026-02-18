@@ -6,6 +6,7 @@ import Control.Concurrent (threadDelay, forkIO)
 import Control.Exception (bracket)
 import Control.Monad (forever)
 import Data.IORef
+import Data.Word (Word64)
 import System.Exit (exitSuccess)
 import System.IO
 
@@ -18,8 +19,8 @@ main ∷ IO ()
 main =
   bracket startAudioSystem stopAudioSystem $ \sys ->
   withRawStdin $ do
-    putStrLn "Terminal synth test:"
-    putStrLn "  c / d    : NoteOn C / D"
+    putStrLn "Terminal synth test (MIDI-native NoteOn/NoteOff):"
+    putStrLn "  c / d    : NoteOn C4 / D4"
     putStrLn "  space    : NoteOffInstrument (panic / release all voices for inst 0)"
     putStrLn "  <tab>    : cycle waveform (live)"
     putStrLn "  u        : toggle unison (2 layers)"
@@ -121,8 +122,6 @@ main =
               , iGain = gain
               , iFilter = mFilt
               , iModRoutes = mkRoutes modsOn
-
-              -- NEW poly config
               , iPlayMode = playMode
               , iPolyMax = 8
               , iVoiceSteal = StealQuietest
@@ -157,11 +156,29 @@ main =
     vibRateRef  <- newIORef 5.0
     vibDepthRef <- newIORef 20.0
 
-    let middleC = NoteMidi 60
-        dNext   = NoteMidi 62
+    -- NEW: instance-id generator for terminal key presses
+    instIdRef <- newIORef (0 ∷ Word64)
+    lastCRef  <- newIORef (Nothing ∷ Maybe NoteInstanceId)
+    lastDRef  <- newIORef (Nothing ∷ Maybe NoteInstanceId)
 
-        noteOn nid =
-          sendAudio sys (AudioNoteOn iid0 0.25 0.0 nid Nothing)
+    let nextInstId = do
+          n <- readIORef instIdRef
+          let n' = n + 1
+          writeIORef instIdRef n'
+          pure (NoteInstanceId n')
+
+        noteOnKey keyRef (NoteKey k) vel = do
+          instId <- nextInstId
+          writeIORef keyRef (Just instId)
+          sendAudio sys (AudioNoteOn iid0 0.25 0.0 (NoteKey k) instId vel Nothing)
+
+        noteOffKey keyRef = do
+          m <- readIORef keyRef
+          case m of
+            Nothing -> pure ()
+            Just instId -> do
+              sendAudio sys (AudioNoteOff iid0 instId)
+              writeIORef keyRef Nothing
 
         noteOffAll =
           sendAudio sys (AudioNoteOffInstrument iid0)
@@ -169,10 +186,14 @@ main =
         doPluck = do
           writeIORef filtRef (Just pluckFilter)
           pushInst0
-          sendAudio sys (AudioNoteOn iid0 0.35 0.0 middleC (Just envAmpPluck))
+
+          instId <- nextInstId
+          sendAudio sys (AudioNoteOn iid0 0.35 0.0 (NoteKey 60) instId 1.0 (Just envAmpPluck))
+
           _ <- forkIO $ do
             threadDelay 120000
-            sendAudio sys (AudioNoteOffInstrument iid0)
+            sendAudio sys (AudioNoteOff iid0 instId)
+
           _ <- forkIO $ do
             threadDelay 200000
             writeIORef filtRef Nothing
@@ -257,8 +278,12 @@ main =
 
         'p' -> doPluck
 
-        'c' -> noteOn middleC
-        'd' -> noteOn dNext
+        -- Keyed notes with instance IDs + explicit NoteOff
+        'c' -> noteOnKey lastCRef (NoteKey 60) 1.0
+        'd' -> noteOnKey lastDRef (NoteKey 62) 1.0
+        'C' -> noteOffKey lastCRef
+        'D' -> noteOffKey lastDRef
+
         ' ' -> noteOffAll
 
         _ -> pure ()

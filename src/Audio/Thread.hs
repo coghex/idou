@@ -184,5 +184,10 @@ processMsgs h rb st = do
 
         AudioNoteOffInstrument iid -> releaseInstrumentAllVoices iid st >>= processMsgs h rb
         AudioPlayBeep a p f d e -> addBeepVoice h st a p f d e >>= processMsgs h rb
-        AudioNoteOn iid a p nid eOverride -> addInstrumentNote h st iid a p nid eOverride >>= processMsgs h rb
-        AudioNoteOff iid nid -> releaseInstrumentNote iid nid st >>= processMsgs h rb
+
+        -- UPDATED: MIDI-native NoteOn/NoteOff
+        AudioNoteOn iid a p key instId vel eOverride ->
+          addInstrumentNote h st iid a p key instId vel eOverride >>= processMsgs h rb
+
+        AudioNoteOff iid instId ->
+          releaseInstrumentNote iid instId st >>= processMsgs h rb

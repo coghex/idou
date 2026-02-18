@@ -17,7 +17,7 @@ import Foreign.ForeignPtr (ForeignPtr)
 
 import qualified Data.Vector.Mutable as MV
 
-import Audio.Types (NoteId, InstrumentId, Instrument)
+import Audio.Types (InstrumentId, Instrument, NoteKey, NoteInstanceId)
 import Audio.Envelope (ADSR, EnvState)
 import Audio.Oscillator (Osc)
 import Audio.Filter (FilterState)
@@ -53,13 +53,16 @@ data Voice = Voice
 
   , vADSR       ∷ !ADSR
   , vEnv        ∷ !EnvState
-  , vNoteId     ∷ !(Maybe NoteId)
+
+  -- NEW: MIDI-native identity + velocity
+  , vNoteKey        ∷ !(Maybe NoteKey)
+  , vNoteInstanceId ∷ !(Maybe NoteInstanceId)
+  , vVelocity       ∷ !Float
+
   , vInstrId    ∷ !(Maybe InstrumentId)
 
   , vStartedAt  ∷ !Word64
   , vVibPhase   ∷ !Float
-
-  -- NEW: per-voice LFO1 phase for mod matrix (rate comes from AudioSetVibrato)
   , vLfo1Phase  ∷ !Float
   }
 
