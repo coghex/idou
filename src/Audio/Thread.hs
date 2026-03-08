@@ -99,11 +99,37 @@ startAudioSystem audioCfg = do
     legAmpRetrigVec <- MV.replicate 256 False
     vibRateVec <- MV.replicate 256 0
     vibDepthVec <- MV.replicate 256 0
+    channelVolumeVec <- MV.replicate 256 1
+    channelExpressionVec <- MV.replicate 256 1
+    channelPanVec <- MV.replicate 256 0
+    modWheelVec <- MV.replicate 256 0
+    pitchBendVec <- MV.replicate 256 0
     pitchModScratch <- MV.replicate maxLayers 1
     pitchCentsScratch <- MV.replicate maxLayers 0
 
     mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
-    let st0 = AudioState voicesVec 0 mixBuf sampleRate targetBufferFrames pitchModScratch pitchCentsScratch instVec glideVec legFiltRetrigVec legAmpRetrigVec vibRateVec vibDepthVec 0
+    let st0 =
+          AudioState
+            { stVoices = voicesVec
+            , stActiveCount = 0
+            , stMixBuf = mixBuf
+            , stSampleRate = sampleRate
+            , stTargetBufferFrames = targetBufferFrames
+            , stPitchModScratch = pitchModScratch
+            , stPitchCentsScratch = pitchCentsScratch
+            , stInstruments = instVec
+            , stGlideSec = glideVec
+            , stLegFiltRetrig = legFiltRetrigVec
+            , stLegAmpRetrig = legAmpRetrigVec
+            , stVibRateHz = vibRateVec
+            , stVibDepthCents = vibDepthVec
+            , stChannelVolume = channelVolumeVec
+            , stChannelExpression = channelExpressionVec
+            , stChannelPan = channelPanVec
+            , stModWheel = modWheelVec
+            , stPitchBendSemis = pitchBendVec
+            , stNow = 0
+            }
     st1 <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st0
     stRef <- newIORef st1
 
@@ -228,6 +254,12 @@ processMsgs h rb st = do
         AudioSetLegatoFilterRetrig iid rf -> setLegatoFilterRetrig iid rf st >>= processMsgs h rb
         AudioSetLegatoAmpRetrig iid ra -> setLegatoAmpRetrig iid ra st >>= processMsgs h rb
         AudioSetVibrato iid rate depth -> setVibrato iid rate depth st >>= processMsgs h rb
+        AudioSetChannelVolume iid vol -> setChannelVolume iid vol st >>= processMsgs h rb
+        AudioSetChannelPan iid pan -> setChannelPan iid pan st >>= processMsgs h rb
+        AudioSetExpression iid expr -> setExpression iid expr st >>= processMsgs h rb
+        AudioSetModWheel iid mw -> setModWheel iid mw st >>= processMsgs h rb
+        AudioSetPitchBend iid semis -> setPitchBend iid semis st >>= processMsgs h rb
+        AudioResetControllers iid -> resetMidiControls iid st >>= processMsgs h rb
 
         AudioNoteOffInstrument iid -> releaseInstrumentAllVoices iid st >>= processMsgs h rb
         AudioPlayBeep a p f d e -> addBeepVoice h st a p f d e >>= processMsgs h rb

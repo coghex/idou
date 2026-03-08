@@ -3,6 +3,7 @@
 module Audio.Types
   ( AudioMsg(..)
   , AudioHandle(..)
+  , defaultPitchBendRangeSemitones
 
   , NoteId(..)
   , NoteKey(..)
@@ -138,6 +139,35 @@ data AudioMsg
       , vibDepthCents ∷ !Float
       }
 
+  | AudioSetChannelVolume
+      { instrumentId  ∷ !InstrumentId
+      , channelVolume ∷ !Float
+      }
+
+  | AudioSetChannelPan
+      { instrumentId ∷ !InstrumentId
+      , channelPan   ∷ !Float
+      }
+
+  | AudioSetExpression
+      { instrumentId ∷ !InstrumentId
+      , expression   ∷ !Float
+      }
+
+  | AudioSetModWheel
+      { instrumentId ∷ !InstrumentId
+      , modWheel     ∷ !Float
+      }
+
+  | AudioSetPitchBend
+      { instrumentId      ∷ !InstrumentId
+      , pitchBendSemitones ∷ !Float
+      }
+
+  | AudioResetControllers
+      { instrumentId ∷ !InstrumentId
+      }
+
   | AudioPlayBeep
       { amp     ∷ !Float
       , pan     ∷ !Float
@@ -174,3 +204,6 @@ data AudioHandle = AudioHandle
   , sampleRate ∷ !Word32
   , channels   ∷ !Word32
   }
+
+defaultPitchBendRangeSemitones ∷ Float
+defaultPitchBendRangeSemitones = 2

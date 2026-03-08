@@ -18,8 +18,34 @@ import Audio.Oscillator (oscSetHz, oscStepWrap, oscResetPhase0)
 import Sound.Miniaudio.RingBuffer
 
 import Audio.Thread.Types
-import Audio.Thread.InstrumentTable (lookupVibrato, lookupInstrument)
+import Audio.Thread.InstrumentTable (MidiControls(..), lookupInstrument, lookupMidiControls, lookupVibrato)
+import Audio.Thread.Voice (panGains)
 import Audio.Types (Instrument(..), ModRoute(..), ModSrc(..), ModDst(..))
+
+defaultModWheelLfoRateHz ∷ Float
+defaultModWheelLfoRateHz = 5
+
+defaultModWheelDepthCents ∷ Float
+defaultModWheelDepthCents = 50
+
+clampPan ∷ Float → Float
+clampPan x
+  | x < (-1) = -1
+  | x > 1 = 1
+  | otherwise = x
+
+stereoAmp ∷ Float → Float → Float
+stereoAmp l r = sqrt (l*l + r*r)
+
+stereoPan ∷ Float → Float → Float
+stereoPan l r
+  | l == 0 && r == 0 = 0
+  | otherwise =
+      let ang = atan2 (realToFrac r ∷ Double) (realToFrac l ∷ Double)
+      in clampPan (realToFrac ((4 * ang / pi) - 1))
+
+semitonesToRatio ∷ Float → Float
+semitonesToRatio semis = 2 ** (semis / 12)
 
 renderIfNeeded ∷ Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded rb chunkFrames st0 = do
@@ -58,11 +84,20 @@ mixVoices srF chunkFrames out st0 = do
         | i >= stActiveCount st = pure st
         | otherwise = do
             v <- MV.read vec i
-            (rateHz, depthCents) <-
+            (instGain, channelGain, channelPan, modWheel, bendRatio, rateHz, depthCents) <-
               case vInstrId v of
-                Nothing  -> pure (0,0)
-                Just iid -> lookupVibrato iid st
-            v' <- mixOneVoice srF chunkFrames out rateHz depthCents st v
+                Nothing -> pure (1, 1, 0, 0, 1, 0, 0)
+                Just iid -> do
+                  instM <- lookupInstrument iid st
+                  ctrls <- lookupMidiControls iid st
+                  (vRateHz, vDepthCents) <- lookupVibrato iid st
+                  let instGain' = maybe 1 iGain instM
+                      channelGain' = mcChannelVolume ctrls * mcExpression ctrls
+                      channelPan' = mcChannelPan ctrls
+                      modWheel' = mcModWheel ctrls
+                      bendRatio' = semitonesToRatio (mcPitchBendSemis ctrls)
+                  pure (instGain', channelGain', channelPan', modWheel', bendRatio', vRateHz, vDepthCents)
+            v' <- mixOneVoice srF chunkFrames out instGain channelGain channelPan modWheel bendRatio rateHz depthCents st v
             if eStage (vEnv v') == EnvDone
               then do
                 let lastIx = stActiveCount st - 1
@@ -72,8 +107,8 @@ mixVoices srF chunkFrames out st0 = do
               else MV.write vec i v' >> loop (i+1) st
   loop 0 st0
 
-mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → AudioState → Voice → IO Voice
-mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
+mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → Float → Float → Float → Float → Float → AudioState → Voice → IO Voice
+mixOneVoice srF chunkFrames out instGain channelGain channelPan modWheel bendRatio vibRateHz vibDepthCents st v0 = do
   let framesToDo = chunkFrames
       retuneEvery = 16 ∷ Int
       modEvery = 16 ∷ Int
@@ -81,6 +116,20 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
       maxRoutes = 8 ∷ Int
       pitchModRatScratch = stPitchModScratch st
       pitchCentsScratch = stPitchCentsScratch st
+      baseAmp = stereoAmp (vBaseAmpL v0) (vBaseAmpR v0)
+      basePan = stereoPan (vBaseAmpL v0) (vBaseAmpR v0)
+      finalPan = clampPan (basePan + channelPan)
+      (voiceAmpL0, voiceAmpR0) = panGains (baseAmp * instGain * channelGain) finalPan
+      lfoRateHz
+        | vibRateHz > 0 = vibRateHz
+        | modWheel > 0 = defaultModWheelLfoRateHz
+        | otherwise = 0
+      lfoScale
+        | vibRateHz > 0 = 1
+        | otherwise = modWheel
+      vibDepthCentsEff
+        | vibRateHz > 0 = vibDepthCents + (modWheel * defaultModWheelDepthCents)
+        | otherwise = modWheel * defaultModWheelDepthCents
 
   let go :: Int -> Ptr CFloat -> Int -> Float -> Voice -> IO Voice
       go i p tick filtModOct v
@@ -92,20 +141,20 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
 
             -- vibrato ratio (pitch vibrato)
             let phV0 = vVibPhase v
-                vibOn = vibRateHz > 0 && vibDepthCents > 0
-                vibCents = if vibOn then vibDepthCents * sin (2*pi*phV0) else 0
+                vibOn = lfoRateHz > 0 && vibDepthCentsEff > 0
+                vibCents = if vibOn then vibDepthCentsEff * sin (2*pi*phV0) else 0
                 vibRatio = if vibOn then centsToRatio vibCents else 1
                 phV1 =
                   if vibOn
-                    then let x = phV0 + (vibRateHz / srF)
+                    then let x = phV0 + (lfoRateHz / srF)
                          in x - fromIntegral (floor x ∷ Int)
                     else phV0
 
-            -- LFO1 phase (uses same rate as AudioSetVibrato)
+            -- LFO1 phase follows the vibrato rate, or a mod-wheel fallback rate.
             let phL0 = vLfo1Phase v
                 phL1 =
-                  if vibRateHz > 0
-                    then let x = phL0 + (vibRateHz / srF)
+                  if lfoRateHz > 0
+                    then let x = phL0 + (lfoRateHz / srF)
                          in x - fromIntegral (floor x ∷ Int)
                     else phL0
 
@@ -113,12 +162,14 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
             (ampModMul, filtModOct', v') <-
               if tick `mod` modEvery == 0
                 then do
-                  (ampMul, fOct) <- computeMods maxRoutes st vibRateHz phL1 envAmp v pitchCentsScratch pitchModRatScratch
+                  let lfo1Value = lfoScale * sin (2*pi*phL1)
+                  (ampMul, fOct) <- computeMods maxRoutes st lfo1Value envAmp v pitchCentsScratch pitchModRatScratch
                   pure (ampMul, fOct, v)
                 else pure (1, filtModOct, v)
 
             let nOsc = vOscCount v'
-            (xL0, xR0) <- stepOscsSync4StereoMod srF nOsc vibRatio pitchModRatScratch v'
+                bentNoteHz = vNoteHz v' * bendRatio
+            (xL0, xR0) <- stepOscsSync4StereoMod srF bentNoteHz nOsc vibRatio pitchModRatScratch v'
             let xMono = 0.5 * (xL0 + xR0)
 
             let (mfilt1, mfenv1, tick1, x1) =
@@ -128,31 +179,31 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
                       let spec = fsSpec fs0
                           tick0 = vFiltTick v'
                           tickN = tick0 + 1
-
                           (mfenvN, envLvl) =
                             if fEnvAmountOct spec == 0 && fQEnvAmount spec == 0
                               then (vFiltEnv v', 0)
-                              else case vFiltEnv v' of
-                                     Nothing -> (Just envInit, 0)
-                                     Just fe0 ->
-                                       let (fe1, e) = envStep srF (fEnvADSR spec) fe0
-                                       in (Just fe1, e)
-
-                          baseCutoff = keyTrackedBaseCutoff (vNoteHz v') spec
-                          cutoffHz0  = filterEnvCutoff baseCutoff envLvl spec
-                          cutoffHz   = cutoffHz0 * (2 ** filtModOct')
-                          qEff       = if fQEnvAmount spec == 0 then fQ spec else filterEnvQ envLvl spec
-
+                              else
+                                case vFiltEnv v' of
+                                  Nothing -> (Just envInit, 0)
+                                  Just fe0 ->
+                                    let (fe1, e) = envStep srF (fEnvADSR spec) fe0
+                                    in (Just fe1, e)
+                          baseCutoff = keyTrackedBaseCutoff bentNoteHz spec
+                          cutoffHz0 = filterEnvCutoff baseCutoff envLvl spec
+                          cutoffHz = cutoffHz0 * (2 ** filtModOct')
+                          qEff =
+                            if fQEnvAmount spec == 0
+                              then fQ spec
+                              else filterEnvQ envLvl spec
                           fsRetuned =
                             if (fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0 || filtModOct' /= 0) && (tickN `mod` retuneEvery == 0)
                               then filterRetune srF cutoffHz qEff fs0
                               else fs0
-
                           (fs1, y0) = filterStep srF fsRetuned xMono
                       in (Just fs1, mfenvN, tickN, y0)
 
-            let ampL = vAmpL v' * ampModMul
-                ampR = vAmpR v' * ampModMul
+            let ampL = voiceAmpL0 * ampModMul
+                ampR = voiceAmpR0 * ampModMul
                 sL = realToFrac (x1 * (ampL * envAmp)) :: CFloat
                 sR = realToFrac (x1 * (ampR * envAmp)) :: CFloat
 
@@ -182,17 +233,15 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
 computeMods
   :: Int
   -> AudioState
-  -> Float          -- lfo rate hz (vibRateHz)
-  -> Float          -- lfo phase [0..1]
+  -> Float          -- current lfo1 value
   -> Float          -- envAmp [0..1]
   -> Voice
   -> MV.IOVector Float  -- pitchCentsScratch (len maxLayers)
   -> MV.IOVector Float  -- pitchModRatOut (len maxLayers), written
   -> IO (Float, Float)
-computeMods maxRoutes st _lfoRateHz lfoPhase envAmp v pitchCentsScratch pitchModRatOut = do
+computeMods maxRoutes st lfo1 envAmp v pitchCentsScratch pitchModRatOut = do
   -- sources
-  let lfo1 = sin (2*pi*lfoPhase)          -- [-1..1]
-      keyTrack = keyTrack01 (vNoteHz v)   -- [0..1]
+  let keyTrack = keyTrack01 (vNoteHz v)   -- [0..1]
       envFilt = case vFiltEnv v of
                   Nothing -> 0
                   Just fe -> eLevel fe
@@ -254,9 +303,8 @@ keyTrack01 hz =
   in max 0 (min 1 x)
 
 stepOscsSync4StereoMod
-  :: Float -> Int -> Float -> MV.IOVector Float -> Voice -> IO (Float, Float)
-stepOscsSync4StereoMod srF n vibRatio pitchModRat v = do
-  let baseHz = vNoteHz v
+  :: Float -> Float -> Int -> Float -> MV.IOVector Float -> Voice -> IO (Float, Float)
+stepOscsSync4StereoMod srF baseHz n vibRatio pitchModRat v = do
 
   let stepOne li wm0 wm1 wm2 wm3 = do
         osc0 <- MV.read (vOscs v) li

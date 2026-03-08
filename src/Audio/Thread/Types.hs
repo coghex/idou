@@ -76,6 +76,11 @@ data AudioState = AudioState
   , stLegAmpRetrig   ∷ !(MV.IOVector Bool)
   , stVibRateHz      ∷ !(MV.IOVector Float)
   , stVibDepthCents  ∷ !(MV.IOVector Float)
+  , stChannelVolume  ∷ !(MV.IOVector Float)
+  , stChannelExpression ∷ !(MV.IOVector Float)
+  , stChannelPan     ∷ !(MV.IOVector Float)
+  , stModWheel       ∷ !(MV.IOVector Float)
+  , stPitchBendSemis ∷ !(MV.IOVector Float)
   , stNow            ∷ !Word64
   }
 

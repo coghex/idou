@@ -23,6 +23,7 @@ import Audio.Types
   , NoteKey(..)
   , NoteInstanceId(..)
   )
+import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
 
 import Midi.ZMidi.Core.ReadFile (readMidi)
 import Midi.ZMidi.Core.Datatypes
@@ -56,12 +57,20 @@ data MidiEv
   = EvNoteOn  { evChan :: !Int, evKey :: !Int, evVel :: !Int }
   | EvNoteOff { evChan :: !Int, evKey :: !Int }
   | EvTempoUSPerQN { evTempo :: !Int }  -- microseconds per quarter note
+  | EvController { evChan :: !Int, evController :: !Int, evValue :: !Int }
+  | EvPitchBend { evChan :: !Int, evPitchBend :: !Int }
   deriving (Eq, Show)
 
 data TimedEv = TimedEv
   { teTick :: !AbsTick
   , teEv   :: !MidiEv
   } deriving (Eq, Show)
+
+type HeldNotes = Map (Int, Int) [NoteInstanceId]
+
+type DeferredReleases = Map Int [NoteInstanceId]
+
+type SustainChannels = Map Int Bool
 
 --------------------------------------------------------------------------------
 -- Top-level
@@ -74,7 +83,7 @@ playMidiFile chanMap sys fp = do
     Right mf  -> do
       let ppqn = midiPPQN mf
           evs  = sortOn (unAbsTick . teTick) (midiToTimedEvents mf)
-      loop ppqn defaultTempoUSPerQN 0 M.empty (AbsTick 0) evs
+      loop ppqn defaultTempoUSPerQN 0 M.empty M.empty M.empty (AbsTick 0) evs
   where
     defaultTempoUSPerQN :: Int
     defaultTempoUSPerQN = 500000  -- 120 bpm
@@ -83,27 +92,29 @@ playMidiFile chanMap sys fp = do
       :: Int
       -> Int
       -> Word64
-      -> Map (Int, Int) [NoteInstanceId]
+      -> HeldNotes
+      -> DeferredReleases
+      -> SustainChannels
       -> AbsTick
       -> [TimedEv]
       -> IO ()
-    loop _ppqn _tempo _instCounter _held _prevTick [] = do
+    loop _ppqn _tempo _instCounter _held _deferred _sustain _prevTick [] = do
       -- release everything on the 16 MIDI channels
       forM_ [0..15] $ \ch ->
         sendAudio sys (AudioNoteOffInstrument (channelToInstrument chanMap ch))
 
-    loop ppqn tempo instCounter held prevTick (TimedEv t ev : xs) = do
+    loop ppqn tempo instCounter held deferred sustain prevTick (TimedEv t ev : xs) = do
       let dt = unAbsTick t - unAbsTick prevTick
       when (dt > 0) $ threadDelay (ticksToMicroseconds ppqn tempo dt)
 
       case ev of
         EvTempoUSPerQN usPerQN ->
-          loop ppqn usPerQN instCounter held t xs
+          loop ppqn usPerQN instCounter held deferred sustain t xs
 
         EvNoteOn ch key vel
           | vel <= 0 -> do
-              (held', instCounter') <- doNoteOff ch key held instCounter
-              loop ppqn tempo instCounter' held' t xs
+              (held', deferred') <- doNoteOff ch key held deferred sustain
+              loop ppqn tempo instCounter held' deferred' sustain t xs
 
           | otherwise -> do
               let iid = channelToInstrument chanMap ch
@@ -122,35 +133,106 @@ playMidiFile chanMap sys fp = do
                   }
 
               let held' = M.insertWith (++) (ch, key) [instId] held
-              loop ppqn tempo instCounter' held' t xs
+              loop ppqn tempo instCounter' held' deferred sustain t xs
 
         EvNoteOff ch key -> do
-          (held', instCounter') <- doNoteOff ch key held instCounter
-          loop ppqn tempo instCounter' held' t xs
+          (held', deferred') <- doNoteOff ch key held deferred sustain
+          loop ppqn tempo instCounter held' deferred' sustain t xs
 
-    -- Note: we keep a stack so repeated NoteOns of same (chan,key)
-    -- will be released LIFO, which matches typical MIDI sequencing.
+        EvController ch ctrl val -> do
+          let iid = channelToInstrument chanMap ch
+              wasSustainDown = M.findWithDefault False ch sustain
+          case ctrl of
+            1 -> do
+              sendAudio sys (AudioSetModWheel iid (controllerValue01 val))
+              loop ppqn tempo instCounter held deferred sustain t xs
+            7 -> do
+              sendAudio sys (AudioSetChannelVolume iid (controllerValue01 val))
+              loop ppqn tempo instCounter held deferred sustain t xs
+            10 -> do
+              sendAudio sys (AudioSetChannelPan iid (controllerPanValue val))
+              loop ppqn tempo instCounter held deferred sustain t xs
+            11 -> do
+              sendAudio sys (AudioSetExpression iid (controllerValue01 val))
+              loop ppqn tempo instCounter held deferred sustain t xs
+            64 ->
+              if sustainPedalDown val
+                then
+                  loop ppqn tempo instCounter held deferred (M.insert ch True sustain) t xs
+                else do
+                  deferred' <- flushDeferred ch deferred
+                  let sustain' = M.delete ch sustain
+                  loop ppqn tempo instCounter held deferred' sustain' t xs
+            120 -> do
+              sendAudio sys (AudioNoteOffInstrument iid)
+              let held' = dropHeldChannel ch held
+                  deferred' = M.delete ch deferred
+                  sustain' = M.delete ch sustain
+              loop ppqn tempo instCounter held' deferred' sustain' t xs
+            121 -> do
+              sendAudio sys (AudioResetControllers iid)
+              deferred' <-
+                if wasSustainDown
+                  then flushDeferred ch deferred
+                  else pure deferred
+              let sustain' = M.delete ch sustain
+              loop ppqn tempo instCounter held deferred' sustain' t xs
+            123 -> do
+              sendAudio sys (AudioNoteOffInstrument iid)
+              let held' = dropHeldChannel ch held
+                  deferred' = M.delete ch deferred
+                  sustain' = M.delete ch sustain
+              loop ppqn tempo instCounter held' deferred' sustain' t xs
+            _ ->
+              loop ppqn tempo instCounter held deferred sustain t xs
+
+        EvPitchBend ch bend14 -> do
+          let iid = channelToInstrument chanMap ch
+          sendAudio sys (AudioSetPitchBend iid (midiPitchBendSemitones bend14))
+          loop ppqn tempo instCounter held deferred sustain t xs
+
     doNoteOff
       :: Int -> Int
-      -> Map (Int, Int) [NoteInstanceId]
-      -> Word64
-      -> IO (Map (Int, Int) [NoteInstanceId], Word64)
-    doNoteOff ch key held instCounter =
+      -> HeldNotes
+      -> DeferredReleases
+      -> SustainChannels
+      -> IO (HeldNotes, DeferredReleases)
+    doNoteOff ch key held deferred sustainMap =
       case M.lookup (ch, key) held of
-        Nothing -> pure (held, instCounter)
-        Just [] -> pure (M.delete (ch, key) held, instCounter)
+        Nothing -> pure (held, deferred)
+        Just [] -> pure (M.delete (ch, key) held, deferred)
         Just (instId:rest) -> do
-          let iid = channelToInstrument chanMap ch
-          sendAudio sys $
-            AudioNoteOff
-              { instrumentId = iid
-              , noteInstanceId = instId
-              }
           let held' =
                 if null rest
                   then M.delete (ch, key) held
                   else M.insert (ch, key) rest held
-          pure (held', instCounter)
+              sustainDown = M.findWithDefault False ch sustainMap
+          if sustainDown
+            then pure (held', M.insertWith (++) ch [instId] deferred)
+            else do
+              sendAudio sys $
+                AudioNoteOff
+                  { instrumentId = channelToInstrument chanMap ch
+                  , noteInstanceId = instId
+                  }
+              pure (held', deferred)
+
+    flushDeferred :: Int -> DeferredReleases -> IO DeferredReleases
+    flushDeferred ch deferred =
+      case M.lookup ch deferred of
+        Nothing -> pure deferred
+        Just instIds -> do
+          let iid = channelToInstrument chanMap ch
+          forM_ instIds $ \instId ->
+            sendAudio sys $
+              AudioNoteOff
+                { instrumentId = iid
+                , noteInstanceId = instId
+                }
+          pure (M.delete ch deferred)
+
+    dropHeldChannel :: Int -> HeldNotes -> HeldNotes
+    dropHeldChannel ch = M.filterWithKey (\(ch', _) _ -> ch' /= ch)
 
 --------------------------------------------------------------------------------
 -- Conversion from zmidi-core CST to timed events
@@ -190,6 +272,10 @@ extractEvent t ev =
           [TimedEv t (EvNoteOn (fromIntegral ch) (fromIntegral key) (fromIntegral vel))]
         NoteOff ch key _relVel ->
           [TimedEv t (EvNoteOff (fromIntegral ch) (fromIntegral key))]
+        Controller ch ctrl val ->
+          [TimedEv t (EvController (fromIntegral ch) (fromIntegral ctrl) (fromIntegral val))]
+        PitchBend ch bend ->
+          [TimedEv t (EvPitchBend (fromIntegral ch) (fromIntegral bend))]
         _ ->
           []
 
