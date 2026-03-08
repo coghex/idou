@@ -48,6 +48,9 @@ data Waveform
   | WaveSaw
   | WaveSquare
   | WaveTriangle
+  | WaveWhiteNoise
+  | WavePinkNoise
+  | WaveNoiseMix !Float
   deriving (Eq, Show)
 
 newtype InstrumentId = InstrumentId Int
@@ -70,6 +73,7 @@ data OscLayer = OscLayer
   , olPitch    ∷ !PitchSpec
   , olLevel    ∷ !Float
   , olSync     ∷ !SyncSpec
+  , olAmpEnv   ∷ !(Maybe ADSR)
   } deriving (Eq, Show)
 
 data ModSrc

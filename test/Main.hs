@@ -14,7 +14,7 @@ import qualified Data.Vector.Mutable as MV
 
 import Audio.Config (AudioBufferConfig(..), AudioConfig(..), parseAudioConfigText)
 import Audio.Envelope
-import Audio.Oscillator (Osc(..))
+import Audio.Oscillator (Osc(..), oscInitSeeded, oscStep)
 import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmDrumInstrument, gmProgramInstrument, gmPercussionChannel)
 import Audio.Thread.InstrumentTable
   ( MidiControls(..)
@@ -81,6 +81,10 @@ testCases =
   , TestCase "release-all-voices-keeps-other-instruments-active" testReleaseAllVoicesKeepsOtherInstrumentsActive
   , TestCase "midi-controller-state-clamps-and-resets" testMidiControllerStateClampsAndResets
   , TestCase "midi-controller-conversions-are-normalized" testMidiControllerConversionsAreNormalized
+  , TestCase "noise-waveforms-mix-between-white-and-pink" testNoiseWaveformsMixBetweenWhiteAndPink
+  , TestCase "pink-noise-is-smoother-than-white" testPinkNoiseIsSmootherThanWhite
+  , TestCase "noise-layer-envelope-shapes-amplitude" testNoiseLayerEnvelopeShapesAmplitude
+  , TestCase "gm-drum-noise-layers-use-envelopes" testGmDrumNoiseLayersUseEnvelopes
   , TestCase "gm-program-map-varies-by-family" testGmProgramMapVariesByFamily
   , TestCase "gm-percussion-channel-ignores-program" testGmPercussionChannelIgnoresProgram
   , TestCase "gm-drum-map-varies-by-key-family" testGmDrumMapVariesByKeyFamily
@@ -283,6 +287,53 @@ testMidiControllerConversionsAreNormalized = do
   assertNear "pitch bend center" 0 (midiPitchBendSemitones 8192)
   assertNear "pitch bend max" defaultPitchBendRangeSemitones (midiPitchBendSemitones 16383)
 
+testNoiseWaveformsMixBetweenWhiteAndPink ∷ IO ()
+testNoiseWaveformsMixBetweenWhiteAndPink = do
+  let blend = 0.35
+      srF = fromIntegral testSampleRate
+      white0 = oscInitSeeded WaveWhiteNoise Nothing srF 0 0x12345678
+      pink0 = oscInitSeeded WavePinkNoise Nothing srF 0 0x12345678
+      mix0 = oscInitSeeded (WaveNoiseMix blend) Nothing srF 0 0x12345678
+      go ∷ Int → Osc → Osc → Osc → IO ()
+      go 0 _ _ _ = pure ()
+      go n ow op om = do
+        let (ow1, whiteSample) = oscStep ow
+            (op1, pinkSample) = oscStep op
+            (om1, mixSample) = oscStep om
+            expected = ((1 - blend) * whiteSample) + (blend * pinkSample)
+        assertNear "mixed noise sample" expected mixSample
+        go (n - 1) ow1 op1 om1
+  go 256 white0 pink0 mix0
+
+testPinkNoiseIsSmootherThanWhite ∷ IO ()
+testPinkNoiseIsSmootherThanWhite = do
+  let srF = fromIntegral testSampleRate
+      white = takeOscSamples 2048 (oscInitSeeded WaveWhiteNoise Nothing srF 0 0x87654321)
+      pink = takeOscSamples 2048 (oscInitSeeded WavePinkNoise Nothing srF 0 0x87654321)
+      whiteDelta = meanAbsDelta white
+      pinkDelta = meanAbsDelta pink
+  assertBool "pink noise should vary more smoothly than white noise" (pinkDelta < whiteDelta * 0.75)
+
+testNoiseLayerEnvelopeShapesAmplitude ∷ IO ()
+testNoiseLayerEnvelopeShapesAmplitude = do
+  let srF = fromIntegral testSampleRate
+      env = ADSR 0 0.0015 0 0.001
+      samples = takeOscSamples 256 (oscInitSeeded WaveWhiteNoise (Just env) srF 0 0xA5A5A5A5)
+      early = meanAbs (take 32 samples)
+      late = meanAbs (take 32 (drop 160 samples))
+  assertBool "noise layer envelope should decay toward silence" (early > late * 8)
+
+testGmDrumNoiseLayersUseEnvelopes ∷ IO ()
+testGmDrumNoiseLayersUseEnvelopes = do
+  let snare = gmDrumInstrument 38
+      hat = gmDrumInstrument 42
+      crash = gmDrumInstrument 49
+      ride = gmDrumInstrument 51
+  assertBool "snare should use white noise" (any (waveformIs (== WaveWhiteNoise) . olWaveform) (iOscs snare))
+  assertBool "hihat should use blended noise" (any (waveformIs isNoiseMix . olWaveform) (iOscs hat))
+  assertBool "crash should use pink noise" (any (waveformIs (== WavePinkNoise) . olWaveform) (iOscs crash))
+  assertBool "ride should use noise envelopes" (any noiseLayerHasEnvelope (iOscs ride))
+
 testGmProgramMapVariesByFamily ∷ IO ()
 testGmProgramMapVariesByFamily = do
   let piano = gmProgramInstrument defaultMidiProgram
@@ -325,13 +376,13 @@ testInstrumentLoadKeepsActiveVoiceUntilLiveApply = do
       routesB = [ModRoute ModSrcLfo1 ModDstFilterCutoffOct 0.5]
       instA =
         (mkInstrument Poly)
-          { iOscs = [OscLayer WaveSine rootPitch 1 NoSync]
+          { iOscs = [OscLayer WaveSine rootPitch 1 NoSync Nothing]
           , iGain = 0.5
           , iModRoutes = routesA
           }
       instB =
         (mkInstrument Poly)
-          { iOscs = [OscLayer WaveSaw rootPitch 1 NoSync]
+          { iOscs = [OscLayer WaveSaw rootPitch 1 NoSync Nothing]
           , iGain = 0.9
           , iModRoutes = routesB
           }
@@ -401,7 +452,7 @@ mkTestState = do
 mkInstrument ∷ PlayMode → Instrument
 mkInstrument playMode =
   Instrument
-    { iOscs = [OscLayer WaveSine rootPitch 1 NoSync]
+    { iOscs = [OscLayer WaveSine rootPitch 1 NoSync Nothing]
     , iLayerSpread = 0
     , iAdsrDefault = ADSR 0.01 0.02 0.5 0.03
     , iGain = 1
@@ -436,6 +487,49 @@ stepEnvN n adsr = go n
       | otherwise =
           let (st', _) = envStep (fromIntegral testSampleRate) adsr st
           in go (steps - 1) st'
+
+takeOscSamples ∷ Int → Osc → [Float]
+takeOscSamples n = go n []
+  where
+    go remaining acc osc0
+      | remaining <= 0 = reverse acc
+      | otherwise =
+          let (osc1, sample) = oscStep osc0
+          in go (remaining - 1) (sample : acc) osc1
+
+meanAbs ∷ [Float] → Float
+meanAbs [] = 0
+meanAbs xs = sum (map abs xs) / fromIntegral (length xs)
+
+meanAbsDelta ∷ [Float] → Float
+meanAbsDelta [] = 0
+meanAbsDelta [_] = 0
+meanAbsDelta (x:y:rest) = go y (abs (y - x)) 1 rest
+  where
+    go ∷ Float → Float → Int → [Float] → Float
+    go _ acc count [] = acc / fromIntegral count
+    go prev acc count (z:zs) = go z (acc + abs (z - prev)) (count + 1) zs
+
+waveformIs ∷ (Waveform → Bool) → Waveform → Bool
+waveformIs predicate wf = predicate wf
+
+isNoiseMix ∷ Waveform → Bool
+isNoiseMix wf =
+  case wf of
+    WaveNoiseMix _ -> True
+    _ -> False
+
+isNoiseWaveform ∷ Waveform → Bool
+isNoiseWaveform wf =
+  case wf of
+    WaveWhiteNoise -> True
+    WavePinkNoise -> True
+    WaveNoiseMix _ -> True
+    _ -> False
+
+noiseLayerHasEnvelope ∷ OscLayer → Bool
+noiseLayerHasEnvelope layer =
+  isNoiseWaveform (olWaveform layer) && olAmpEnv layer /= Nothing
 
 assertBool ∷ String → Bool → IO ()
 assertBool label cond =

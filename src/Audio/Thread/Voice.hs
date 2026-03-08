@@ -12,7 +12,8 @@ module Audio.Thread.Voice
   , panGains
   ) where
 
-import Data.Word (Word32)
+import Data.Bits (shiftL, shiftR, xor)
+import Data.Word (Word32, Word64)
 import qualified Data.Vector.Mutable as MV
 
 import Audio.Types
@@ -58,7 +59,7 @@ normalizeLayers ∷ Instrument → [OscLayer]
 normalizeLayers inst =
   case iOscs inst of
     [] ->
-      [ OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync ]
+      [ OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync Nothing ]
     xs -> take maxLayers xs
 
 layerMasterIx ∷ Int → SyncSpec → Int
@@ -73,6 +74,44 @@ clamp01' x
   | x < 0 = 0
   | x > 1 = 1
   | otherwise = x
+
+mixSeed32 ∷ Word32 → Word32 → Word32
+mixSeed32 seed salt =
+  let x0 = seed `xor` (salt * 0x9E3779B9)
+      x1 = x0 `xor` (x0 `shiftL` 13)
+      x2 = x1 `xor` (x1 `shiftR` 17)
+      x3 = x2 `xor` (x2 `shiftL` 5)
+  in if x3 == 0 then 0x6D2B79F5 else x3
+
+foldWord64 ∷ Word64 → Word32
+foldWord64 x = fromIntegral x `xor` fromIntegral (x `shiftR` 32)
+
+voiceSeedBase ∷ InstrumentId → NoteKey → NoteInstanceId → Word64 → Word32
+voiceSeedBase (InstrumentId iid) (NoteKey key) (NoteInstanceId instId) now =
+  mixSeed32
+    ( foldWord64 instId
+        `xor` foldWord64 now
+        `xor` fromIntegral iid
+        `xor` fromIntegral key
+    )
+    0x85EBCA6B
+
+beepSeedBase ∷ Float → Word32
+beepSeedBase freqHz =
+  mixSeed32 0x12345678 (fromIntegral (max 0 (floor (freqHz * 1000) ∷ Int)))
+
+layerSeed ∷ Word32 → Int → Word32
+layerSeed base layerIx = mixSeed32 base (fromIntegral (layerIx + 1))
+
+releaseVoiceOscAmpEnvs ∷ Voice → IO ()
+releaseVoiceOscAmpEnvs v =
+  let go li
+        | li >= vOscCount v = pure ()
+        | otherwise = do
+            osc0 <- MV.read (vOscs v) li
+            MV.write (vOscs v) li (oscReleaseAmpEnv osc0)
+            go (li+1)
+  in go 0
 
 layerBasePan :: Int -> Int -> Float
 layerBasePan n i =
@@ -119,6 +158,7 @@ mkVoiceLayers
   ∷ Float
   → Float
   → Float
+  → Word32
   → [OscLayer]
   → IO ( MV.IOVector Osc
        , MV.IOVector Float
@@ -128,8 +168,8 @@ mkVoiceLayers
        , MV.IOVector Float
        , MV.IOVector Float
        , Int
-       )
-mkVoiceLayers srF baseHz spread layers = do
+        )
+mkVoiceLayers srF baseHz spread seedBase layers = do
   oscs   <- MV.new maxLayers
   levels <- MV.new maxLayers
   rats   <- MV.new maxLayers
@@ -147,18 +187,19 @@ mkVoiceLayers srF baseHz spread layers = do
         | i >= maxLayers = pure ()
         | i < n0 =
             case layers !! i of
-              OscLayer wf ps lvl syncSpec -> do
+              OscLayer wf ps lvl syncSpec ampEnv -> do
                 let ratio = pitchSpecRatio ps
                     hz    = baseHz * ratio + psHzOffset ps
                     master = layerMasterIx i syncSpec
-                MV.write oscs i (oscInit wf srF (max 0 hz))
+                    seed = layerSeed seedBase i
+                MV.write oscs i (oscInitSeeded wf ampEnv srF (max 0 hz) seed)
                 MV.write levels i lvl
                 MV.write rats i ratio
                 MV.write hzOff i (psHzOffset ps)
                 MV.write syncM i master
                 go (i+1)
         | otherwise = do
-            MV.write oscs i (oscInit WaveSine srF 0)
+            MV.write oscs i (oscInit WaveSine Nothing srF 0)
             MV.write levels i 0
             MV.write rats i 1
             MV.write hzOff i 0
@@ -248,7 +289,7 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
           env0 = envInit
 
       (oscs, levels, rats, hzOff, syncM, gL, gR, oscCount) <-
-        mkVoiceLayers srF freqHz 0 [OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync]
+        mkVoiceLayers srF freqHz 0 (beepSeedBase freqHz) [OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync Nothing]
 
       let v = Voice
                 { vOscs = oscs
@@ -311,9 +352,9 @@ applyInstrumentToActiveVoices srW iid inst st = do
                       | li >= maxLayers = pure ()
                       | li < layerN0 =
                           case layers !! li of
-                            OscLayer wf ps lvl syncSpec -> do
+                            OscLayer wf ps lvl syncSpec ampEnv -> do
                               osc0 <- MV.read (vOscs v) li
-                              MV.write (vOscs v) li (osc0 { oWaveform = wf })
+                              MV.write (vOscs v) li (oscConfigureLayer wf ampEnv Nothing False osc0)
                               MV.write (vLevels v) li lvl
                               MV.write (vPitchRat v) li (pitchSpecRatio ps)
                               MV.write (vHzOffset v) li (psHzOffset ps)
@@ -402,6 +443,7 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
       holdFrames = maxBound `div` 4
       now' = stNow st + 1
       vel' = clamp01' vel
+      seedBase = voiceSeedBase iid key instId now'
 
       needsFiltEnv spec = fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0
 
@@ -423,16 +465,17 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
       writeLayerGains spread layerN (vLayerGainL v) (vLayerGainR v)
 
       let updateLayer li
-            | li >= maxLayers = pure ()
-            | li < layerN0 =
+              | li >= maxLayers = pure ()
+              | li < layerN0 =
                 case layers !! li of
-                  OscLayer wf ps lvl syncSpec -> do
+                  OscLayer wf ps lvl syncSpec ampEnv -> do
                     let ratio = pitchSpecRatio ps
                         hz    = baseHz * ratio + psHzOffset ps
+                        seed  = layerSeed seedBase li
                     osc0 <- MV.read (vOscs v) li
                     let osc1 = oscSetGlideSec srF glideSec
                              $ oscSetHz srF (max 0 hz)
-                             $ (osc0 { oWaveform = wf })
+                             $ oscConfigureLayer wf ampEnv (Just seed) True osc0
                     MV.write (vOscs v) li osc1
                     MV.write (vLevels v) li lvl
                     MV.write (vPitchRat v) li ratio
@@ -516,7 +559,7 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
               env0 = envInit
 
           (oscs, levels, rats, hzOff, syncM, gL, gR, oscCount) <-
-            mkVoiceLayers srF baseHz spread layers
+            mkVoiceLayers srF baseHz spread seedBase layers
 
           let initLayer li
                 | li >= oscCount = pure ()
@@ -582,6 +625,7 @@ addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
       holdFrames = maxBound `div` 4
       now' = stNow st + 1
       vel' = clamp01' vel
+      seedBase = voiceSeedBase iid key instId now'
       layers = normalizeLayers inst
       layerN0 = length layers
       layerN  = max 1 layerN0
@@ -609,7 +653,7 @@ addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
             env0 = envInit
 
         (oscs, levels, rats, hzOff, syncM, gL, gR, oscCount) <-
-          mkVoiceLayers srF baseHz spread layers
+          mkVoiceLayers srF baseHz spread seedBase layers
 
         let initLayer li
               | li >= oscCount = pure ()
@@ -688,6 +732,7 @@ releaseInstrumentNote iid instId st = do
             if vInstrId v == Just iid && vNoteInstanceId v == Just instId
               then do
                 let fe' = fmap envRelease (vFiltEnv v)
+                releaseVoiceOscAmpEnvs v
                 MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe' }
               else pure ()
             go (i+1)
@@ -704,6 +749,7 @@ releaseInstrumentAllVoices iid st = do
             if vInstrId v == Just iid
               then do
                 let fe' = fmap envRelease (vFiltEnv v)
+                releaseVoiceOscAmpEnvs v
                 MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe', vHoldRemain = 0 }
               else pure ()
             go (i+1)
