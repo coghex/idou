@@ -58,3 +58,33 @@ executable idou
                         Strict
                         UnicodeSyntax
   ghc-options:      -Wall -threaded -rtsopts
+
+test-suite idou-tests
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+                  , src
+  main-is:          Main.hs
+  other-modules:    Engine.Core.Queue
+                    Audio.Types
+                    Audio.Thread.Types
+                    Audio.Thread.Voice
+                    Audio.Thread.InstrumentTable
+                    Audio.Envelope
+                    Audio.Oscillator
+                    Audio.Filter
+                    Audio.Filter.Types
+                    Audio.Filter.Biquad
+                    Sound.Miniaudio.RingBuffer
+  build-depends:    base >=4.14 && <5
+                  , stm
+                  , vector
+  default-language: GHC2024
+  default-extensions:   ForeignFunctionInterface
+                        Strict
+                        UnicodeSyntax
+  include-dirs:     cbits
+  c-sources:        cbits/miniaudio.c
+                    cbits/miniaudio_helpers.c
+                    cbits/miniaudio_rb_helpers.c
+                    cbits/miniaudio_userdata.c
+  ghc-options:      -Wall

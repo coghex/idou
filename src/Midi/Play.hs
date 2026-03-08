@@ -12,8 +12,7 @@ import Control.Monad (forM_, when)
 import Data.Int (Int64)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
-import Data.Word (Word16, Word32, Word64, Word8)
-import System.IO (FilePath)
+import Data.Word (Word64)
 
 import qualified Data.Map.Strict as M
 
@@ -32,7 +31,6 @@ import Midi.ZMidi.Core.Datatypes
   , MidiTrack(..)
   , MidiTimeDivision(..)
   , MidiMessage
-  , DeltaTime(..)
   , MidiEvent(..)
   , MidiVoiceEvent(..)
   , MidiMetaEvent(..)

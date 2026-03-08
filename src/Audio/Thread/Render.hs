@@ -7,11 +7,8 @@ module Audio.Thread.Render
   ) where
 
 import Control.Monad (when)
-import Data.Word (Word32)
 import Foreign
 import Foreign.C
-import Foreign.ForeignPtr (withForeignPtr)
-import Foreign.Marshal.Utils (fillBytes)
 
 import qualified Data.Vector.Mutable as MV
 
@@ -26,7 +23,7 @@ import Audio.Types (Instrument(..), ModRoute(..), ModSrc(..), ModDst(..))
 
 renderIfNeeded ∷ Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded rb chunkFrames st0 = do
-  let targetFrames = fromIntegral (chunkFrames * 4) ∷ Word32
+  let targetFrames = fromIntegral (chunkFrames * 8) ∷ Word32
       loop st = do
         availRead  <- rbAvailableRead rb
         availWrite <- rbAvailableWrite rb

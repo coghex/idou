@@ -5,8 +5,9 @@ module Engine.Core.Thread
   , ThreadState(..)
   ) where
 
-import Data.IORef (IORef)
 import Control.Concurrent (ThreadId)
+import Control.Concurrent.MVar (MVar)
+import Data.IORef (IORef)
 
 data ThreadControl
   = ThreadRunning
@@ -17,4 +18,5 @@ data ThreadControl
 data ThreadState = ThreadState
   { tsRunning  ∷ IORef ThreadControl
   , tsThreadId ∷ ThreadId
+  , tsDone     ∷ MVar ()
   }

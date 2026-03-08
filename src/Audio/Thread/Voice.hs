@@ -12,7 +12,6 @@ module Audio.Thread.Voice
   , panGains
   ) where
 
-import Control.Monad (when)
 import Data.Word (Word32)
 import qualified Data.Vector.Mutable as MV
 
@@ -396,7 +395,7 @@ addInstrumentNoteMonoLegato
   ∷ AudioHandle → AudioState → InstrumentId → Instrument
   → Float → Float → NoteKey → NoteInstanceId → Float → Maybe ADSR
   → IO AudioState
-addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel _adsrOverride = do
+addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = do
   let srF = fromIntegral (sampleRate h) ∷ Float
       baseHz = noteKeyToHz key
       holdFrames = maxBound `div` 4
@@ -414,6 +413,8 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel _adsrOverride =
       layerN0 = length layers
       layerN  = max 1 layerN0
       spread  = clamp01' (iLayerSpread inst)
+      adsrSpec = maybe (iAdsrDefault inst) id adsrOverride
+      adsr' = adsrSpec { aSustain = clamp01 (aSustain adsrSpec) }
 
   case mLegIx of
     Just ix -> do
@@ -451,7 +452,6 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel _adsrOverride =
           baseR' = baseR * vel'
           ampL' = baseL' * iGain inst
           ampR' = baseR' * iGain inst
-          adsr' = iAdsrDefault inst
           envAmp' = if legRetrigAmp then envInit else vEnv v
 
           (mfilt', mfenv') =
@@ -510,7 +510,6 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel _adsrOverride =
               baseR' = baseR * vel'
               ampL = baseL' * iGain inst
               ampR = baseR' * iGain inst
-              adsr' = (iAdsrDefault inst) { aSustain = clamp01 (aSustain (iAdsrDefault inst)) }
               env0 = envInit
 
           (oscs, levels, rats, hzOff, syncM, gL, gR, oscCount) <-

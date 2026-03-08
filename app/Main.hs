@@ -5,8 +5,6 @@ module Main where
 import Control.Concurrent (forkIO)
 import Control.Exception (bracket)
 import Control.Monad (forM_)
-import Data.IORef
-import Data.Word (Word64)
 import System.Environment (getArgs)
 import System.Exit (exitSuccess)
 import System.IO
@@ -14,7 +12,6 @@ import System.IO
 import Audio.Thread
 import Audio.Types
 import Audio.Envelope
-import Audio.Filter.Types
 
 import Midi.Play (playMidiFile, defaultChannelMap)
 

@@ -9,13 +9,12 @@ module Audio.Thread
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (finally, onException)
 import Control.Monad (when, void)
 import Data.IORef
-import Data.Word (Word32, Word64)
 import Foreign hiding (void)
 import Foreign.C
-import Foreign.ForeignPtr (mallocForeignPtrArray)
-import Foreign.Marshal.Utils (fillBytes)
 
 import qualified Data.Vector.Mutable as MV
 
@@ -52,15 +51,15 @@ startAudioSystem = do
 
   q <- Q.newQueue
   let h = AudioHandle q sr ch
-
-  rb <- rbCreateF32 rbCapacityFrames ch
-  when (rb == nullPtr) $ error "rbCreateF32 failed"
-
-  underrunRef <- newIORef 0
-  udStable <- newStablePtr (AudioUserData rb ch underrunRef)
+  rb <- createRingBuffer rbCapacityFrames ch
+  (underrunRef, udStable) <- (`onException` rbDestroy rb) $ do
+    underrunRef <- newIORef 0
+    udStable <- newStablePtr (AudioUserData rb ch underrunRef)
+    pure (underrunRef, udStable)
   let udPtr = castStablePtrToPtr udStable
+      cleanupStable = freeStablePtr udStable >> rbDestroy rb
 
-  let cb ∷ MaDataCallback
+      cb ∷ MaDataCallback
       cb dev pOut _pIn frameCount = do
         ud <- hs_ma_device_get_user_data dev
         AudioUserData rb' ch' uref <- deRefStablePtr (castPtrToStablePtr ud)
@@ -75,50 +74,90 @@ startAudioSystem = do
               byteCount = remainingSamples * sizeOf (undefined ∷ CFloat)
           fillBytes (outF `advancePtr` fromIntegral samplesGot) 0 byteCount
 
-  cbFun <- mkMaDataCallback cb
+  cbFun <- mkMaDataCallback cb `onException` cleanupStable
+  let cleanupCallback = freeHaskellFunPtr cbFun >> cleanupStable
 
-  cfg <- hs_ma_device_config_init_playback MaFormatF32 ch sr cbFun udPtr
+  cfg <- createDeviceConfig ch cbFun udPtr `onException` cleanupCallback
+  let cleanupConfig = hs_ma_device_config_free cfg >> cleanupCallback
+
+  dev <- createDevice `onException` cleanupConfig
+  let cleanupAllocatedDevice = hs_ma_device_free dev >> cleanupConfig
+      cleanupInitializedDevice = ma_device_uninit dev >> cleanupAllocatedDevice
+      cleanupStartedSystem = void (ma_device_stop dev) >> cleanupInitializedDevice
+
+  initDevice cfg dev `onException` cleanupAllocatedDevice
+
+  (`onException` cleanupInitializedDevice) $ do
+    voicesVec <- MV.new maxVoices
+    instVec <- MV.replicate 256 Nothing
+    glideVec <- MV.replicate 256 0
+    legFiltRetrigVec <- MV.replicate 256 False
+    legAmpRetrigVec <- MV.replicate 256 False
+    vibRateVec <- MV.replicate 256 0
+    vibDepthVec <- MV.replicate 256 0
+
+    mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
+    let st0 = AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec legAmpRetrigVec vibRateVec vibDepthVec 0
+    st1 <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st0
+    stRef <- newIORef st1
+
+    controlRef <- newIORef ThreadRunning
+    doneVar <- newEmptyMVar
+
+    (`onException` cleanupStartedSystem) $ do
+      startDevice dev
+      tid <- forkIO $
+        runAudioLoop h controlRef stRef rb chunkFrames underrunRef
+          `finally` putMVar doneVar ()
+
+      let ts = ThreadState controlRef tid doneVar
+      pure AudioSystem
+        { asHandle = h
+        , asThread = ts
+        , asDevice = dev
+        , asCfg = cfg
+        , asCallback = cbFun
+        , asUserData = udStable
+        , asRingBuffer = rb
+        }
+
+createRingBuffer ∷ Word32 → Word32 → IO (Ptr MaRB)
+createRingBuffer capacityFrames channels = do
+  rb <- rbCreateF32 capacityFrames channels
+  when (rb == nullPtr) $ error "rbCreateF32 failed"
+  pure rb
+
+createDeviceConfig
+  ∷ Word32
+  → FunPtr MaDataCallback
+  → Ptr ()
+  → IO (Ptr MaDeviceConfig)
+createDeviceConfig channels cbFun udPtr = do
+  cfg <- hs_ma_device_config_init_playback MaFormatF32 channels sr cbFun udPtr
   when (cfg == nullPtr) $ error "Failed to allocate ma_device_config"
+  pure cfg
 
+createDevice ∷ IO (Ptr MaDevice)
+createDevice = do
   dev <- hs_ma_device_malloc
   when (dev == nullPtr) $ error "Failed to allocate ma_device"
+  pure dev
 
+initDevice ∷ Ptr MaDeviceConfig → Ptr MaDevice → IO ()
+initDevice cfg dev = do
   r <- ma_device_init nullPtr cfg dev
   when (r /= MA_SUCCESS) $ error ("ma_device_init failed: " <> show r)
 
-  r2 <- ma_device_start dev
-  when (r2 /= MA_SUCCESS) $ error ("ma_device_start failed: " <> show r2)
-
-  voicesVec <- MV.new maxVoices
-  instVec <- MV.replicate 256 Nothing
-  glideVec <- MV.replicate 256 0
-  legFiltRetrigVec <- MV.replicate 256 False
-  legAmpRetrigVec <- MV.replicate 256 False
-  vibRateVec <- MV.replicate 256 0
-  vibDepthVec <- MV.replicate 256 0
-
-  mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
-  stRef <- newIORef (AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec legAmpRetrigVec vibRateVec vibDepthVec 0)
-
-  controlRef <- newIORef ThreadRunning
-  tid <- forkIO $ runAudioLoop h controlRef stRef rb chunkFrames underrunRef
-
-  let ts = ThreadState controlRef tid
-  pure AudioSystem
-    { asHandle = h
-    , asThread = ts
-    , asDevice = dev
-    , asCfg = cfg
-    , asCallback = cbFun
-    , asUserData = udStable
-    , asRingBuffer = rb
-    }
+startDevice ∷ Ptr MaDevice → IO ()
+startDevice dev = do
+  r <- ma_device_start dev
+  when (r /= MA_SUCCESS) $ error ("ma_device_start failed: " <> show r)
 
 stopAudioSystem ∷ AudioSystem → IO ()
 stopAudioSystem sys = do
-  writeIORef (tsRunning (asThread sys)) ThreadStopped
   Q.writeQueue (audioQueue (asHandle sys)) AudioShutdown
-  threadDelay 20000
+  writeIORef (tsRunning (asThread sys)) ThreadStopped
+  takeMVar (tsDone (asThread sys))
 
   void (ma_device_stop (asDevice sys))
   ma_device_uninit (asDevice sys)
@@ -145,7 +184,10 @@ runAudioLoop h controlRef stRef rb chunkFrames underrunRef = go 0
     go lastPrinted = do
       control <- readIORef controlRef
       case control of
-        ThreadStopped -> pure ()
+        ThreadStopped -> do
+          st0 <- readIORef stRef
+          st1 <- processMsgs h rb st0
+          writeIORef stRef st1
         ThreadPaused  -> threadDelay 10000 >> go lastPrinted
         ThreadRunning -> do
           st0 <- readIORef stRef
@@ -154,13 +196,11 @@ runAudioLoop h controlRef stRef rb chunkFrames underrunRef = go 0
           writeIORef stRef st2
 
           u <- readIORef underrunRef
-          when (u /= lastPrinted) $ do
+          when (u /= lastPrinted) $
             putStrLn ("[audio] underruns: " <> show u)
-            threadDelay 1000000
-            go u
 
           threadDelay 1000
-          go lastPrinted
+          go (if u /= lastPrinted then u else lastPrinted)
 
 processMsgs ∷ AudioHandle → Ptr MaRB → AudioState → IO AudioState
 processMsgs h rb st = do

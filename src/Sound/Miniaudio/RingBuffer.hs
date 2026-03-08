@@ -11,7 +11,6 @@ module Sound.Miniaudio.RingBuffer
 
 import Foreign
 import Foreign.C
-import Data.Word (Word32)
 
 data MaRB -- opaque C struct hs_ma_rb
 

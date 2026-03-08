@@ -7,7 +7,7 @@ module Engine.Core.Queue
   , tryReadQueue
   ) where
 
-import Control.Concurrent.STM (STM, atomically)
+import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TQueue (TQueue)
 import qualified Control.Concurrent.STM.TQueue as TQ
 
