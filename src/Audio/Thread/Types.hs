@@ -56,6 +56,7 @@ data Voice = Voice
   , vNoteKey        ∷ !(Maybe NoteKey)
   , vNoteInstanceId ∷ !(Maybe NoteInstanceId)
   , vVelocity       ∷ !Float
+  , vNoteAftertouch ∷ !Float
 
   , vInstrId    ∷ !(Maybe InstrumentId)
 
@@ -82,6 +83,7 @@ data AudioState = AudioState
   , stChannelExpression ∷ !(MV.IOVector Float)
   , stChannelPan     ∷ !(MV.IOVector Float)
   , stModWheel       ∷ !(MV.IOVector Float)
+  , stChannelAftertouch ∷ !(MV.IOVector Float)
   , stPitchBendSemis ∷ !(MV.IOVector Float)
   , stNow            ∷ !Word64
   }

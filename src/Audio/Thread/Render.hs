@@ -84,18 +84,19 @@ mixVoices srF chunkFrames out st0 = do
         | i >= stActiveCount st = pure st
         | otherwise = do
             v <- MV.read vec i
-            (channelGain, channelPan, modWheel, bendRatio, rateHz, depthCents) <-
+            (channelGain, channelPan, modWheel, channelAftertouch, bendRatio, rateHz, depthCents) <-
               case vInstrId v of
-                Nothing -> pure (1, 0, 0, 1, 0, 0)
+                Nothing -> pure (1, 0, 0, 0, 1, 0, 0)
                 Just iid -> do
                   ctrls <- lookupMidiControls iid st
                   (vRateHz, vDepthCents) <- lookupVibrato iid st
                   let channelGain' = mcChannelVolume ctrls * mcExpression ctrls
                       channelPan' = mcChannelPan ctrls
                       modWheel' = mcModWheel ctrls
+                      channelAftertouch' = mcChannelAftertouch ctrls
                       bendRatio' = semitonesToRatio (mcPitchBendSemis ctrls)
-                  pure (channelGain', channelPan', modWheel', bendRatio', vRateHz, vDepthCents)
-            v' <- mixOneVoice srF chunkFrames out channelGain channelPan modWheel bendRatio rateHz depthCents st v
+                  pure (channelGain', channelPan', modWheel', channelAftertouch', bendRatio', vRateHz, vDepthCents)
+            v' <- mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouch bendRatio rateHz depthCents st v
             if eStage (vEnv v') == EnvDone
               then do
                 let lastIx = stActiveCount st - 1
@@ -105,8 +106,8 @@ mixVoices srF chunkFrames out st0 = do
               else MV.write vec i v' >> loop (i+1) st
   loop 0 st0
 
-mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → Float → Float → Float → Float → AudioState → Voice → IO Voice
-mixOneVoice srF chunkFrames out channelGain channelPan modWheel bendRatio vibRateHz vibDepthCents st v0 = do
+mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → Float → Float → Float → Float → Float → AudioState → Voice → IO Voice
+mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouch bendRatio vibRateHz vibDepthCents st v0 = do
   let framesToDo = chunkFrames
       retuneEvery = 16 ∷ Int
       modEvery = 16 ∷ Int
@@ -161,7 +162,7 @@ mixOneVoice srF chunkFrames out channelGain channelPan modWheel bendRatio vibRat
               if tick `mod` modEvery == 0
                 then do
                   let lfo1Value = lfoScale * sin (2*pi*phL1)
-                  (ampMul, fOct) <- computeMods maxRoutes lfo1Value envAmp v pitchCentsScratch pitchModRatScratch
+                  (ampMul, fOct) <- computeMods maxRoutes lfo1Value envAmp channelAftertouch (vNoteAftertouch v) v pitchCentsScratch pitchModRatScratch
                   pure (ampMul, fOct, v)
                 else pure (1, filtModOct, v)
 
@@ -232,11 +233,13 @@ computeMods
   :: Int
   -> Float          -- current lfo1 value
   -> Float          -- envAmp [0..1]
+  -> Float          -- channel aftertouch [0..1]
+  -> Float          -- poly aftertouch [0..1]
   -> Voice
   -> MV.IOVector Float  -- pitchCentsScratch (len maxLayers)
   -> MV.IOVector Float  -- pitchModRatOut (len maxLayers), written
   -> IO (Float, Float)
-computeMods maxRoutes lfo1 envAmp v pitchCentsScratch pitchModRatOut = do
+computeMods maxRoutes lfo1 envAmp chanAftertouch polyAftertouch v pitchCentsScratch pitchModRatOut = do
   -- sources
   let keyTrack = keyTrack01 (vNoteHz v)   -- [0..1]
       envFilt = case vFiltEnv v of
@@ -265,6 +268,8 @@ computeMods maxRoutes lfo1 envAmp v pitchCentsScratch pitchModRatOut = do
                     ModSrcEnvAmp    -> envAmp
                     ModSrcEnvFilter -> envFilt
                     ModSrcKeyTrack  -> keyTrack
+                    ModSrcChanAftertouch -> chanAftertouch
+                    ModSrcPolyAftertouch -> polyAftertouch
             (ampAcc', filtAcc') <-
               case dst of
                 ModDstLayerPitchCents ix -> addPitchCents ix (amt * s) >> pure (ampAcc, filtAcc)

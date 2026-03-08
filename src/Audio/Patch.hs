@@ -198,6 +198,15 @@ lfoAmp amt = ModRoute ModSrcLfo1 ModDstAmpGain amt
 envPitch ∷ Int → Float → ModRoute
 envPitch ix cents = ModRoute ModSrcEnvAmp (ModDstLayerPitchCents ix) cents
 
+aftertouchFilter ∷ ModSrc → Float → ModRoute
+aftertouchFilter src octs = ModRoute src ModDstFilterCutoffOct octs
+
+aftertouchAmp ∷ ModSrc → Float → ModRoute
+aftertouchAmp src amt = ModRoute src ModDstAmpGain amt
+
+aftertouchPitch ∷ ModSrc → Int → Float → ModRoute
+aftertouchPitch src ix cents = ModRoute src (ModDstLayerPitchCents ix) cents
+
 waveCycle ∷ Int → Waveform
 waveCycle n =
   case n `mod` 4 of
@@ -249,11 +258,15 @@ organPatch variant =
        , osc WaveTriangle (semiPitch 19) (0.12 + 0.08 * v)
        ]
        (0.15 + 0.10 * v)
-       (ADSR 0.006 0.05 1 0.08)
-       (0.86 + 0.08 * v)
-       Nothing
-       [lfoAmp (-0.04), lfoPitch 0 3]
-       12
+        (ADSR 0.006 0.05 1 0.08)
+        (0.86 + 0.08 * v)
+        Nothing
+        [ lfoAmp (-0.04)
+        , lfoPitch 0 3
+        , aftertouchAmp ModSrcChanAftertouch 0.08
+        , aftertouchFilter ModSrcChanAftertouch 0.12
+        ]
+        12
 
 guitarPatch ∷ Int → Instrument
 guitarPatch variant =
@@ -296,11 +309,15 @@ stringsPatch variant =
        , osc WaveSaw (detunePitch (5 + 3 * v)) 0.22
        ]
        (0.42 + 0.16 * v)
-       (ADSR (0.12 + 0.12 * v) 0.45 0.78 (0.75 + 0.30 * v))
-       (0.78 + 0.06 * v)
-       (Just filt)
-       [lfoFilter 0.12, lfoAmp (-0.05)]
-       10
+        (ADSR (0.12 + 0.12 * v) 0.45 0.78 (0.75 + 0.30 * v))
+        (0.78 + 0.06 * v)
+        (Just filt)
+        [ lfoFilter 0.12
+        , lfoAmp (-0.05)
+        , aftertouchFilter ModSrcChanAftertouch 0.24
+        , aftertouchAmp ModSrcPolyAftertouch 0.10
+        ]
+        10
 
 ensemblePatch ∷ Int → Instrument
 ensemblePatch variant =
@@ -313,11 +330,16 @@ ensemblePatch variant =
        , osc WaveTriangle (semiPitch 12) 0.17
        ]
        (0.50 + 0.14 * v)
-       (ADSR (0.08 + 0.10 * v) 0.35 0.82 (0.55 + 0.25 * v))
-       (0.80 + 0.06 * v)
-       (Just filt)
-       [lfoFilter 0.18, lfoAmp (-0.07), lfoPitch 0 4]
-       10
+        (ADSR (0.08 + 0.10 * v) 0.35 0.82 (0.55 + 0.25 * v))
+        (0.80 + 0.06 * v)
+        (Just filt)
+        [ lfoFilter 0.18
+        , lfoAmp (-0.07)
+        , lfoPitch 0 4
+        , aftertouchFilter ModSrcChanAftertouch 0.22
+        , aftertouchAmp ModSrcPolyAftertouch 0.10
+        ]
+        10
 
 brassPatch ∷ Int → Instrument
 brassPatch variant =
@@ -329,11 +351,15 @@ brassPatch variant =
        , osc WaveSquare rootPitch 0.18
        ]
        (0.20 + 0.10 * v)
-       (ADSR (0.015 + 0.02 * v) 0.20 0.62 (0.18 + 0.08 * v))
-       (0.88 + 0.08 * v)
-       (Just filt)
-       [envPitch 0 (-4), lfoFilter 0.10]
-       8
+        (ADSR (0.015 + 0.02 * v) 0.20 0.62 (0.18 + 0.08 * v))
+        (0.88 + 0.08 * v)
+        (Just filt)
+        [ envPitch 0 (-4)
+        , lfoFilter 0.10
+        , aftertouchFilter ModSrcChanAftertouch 0.18
+        , aftertouchAmp ModSrcChanAftertouch 0.12
+        ]
+        8
 
 reedPatch ∷ Int → Instrument
 reedPatch variant =
@@ -345,11 +371,15 @@ reedPatch variant =
        , osc WaveSine (semiPitch 12) 0.17
        ]
        0.16
-       (ADSR (0.01 + 0.01 * v) 0.15 0.56 (0.18 + 0.08 * v))
-       (0.86 + 0.06 * v)
-       (Just filt)
-       [lfoPitch 0 7, lfoAmp (-0.04)]
-       8
+        (ADSR (0.01 + 0.01 * v) 0.15 0.56 (0.18 + 0.08 * v))
+        (0.86 + 0.06 * v)
+        (Just filt)
+        [ lfoPitch 0 7
+        , lfoAmp (-0.04)
+        , aftertouchFilter ModSrcChanAftertouch 0.15
+        , aftertouchAmp ModSrcPolyAftertouch 0.08
+        ]
+        8
 
 pipePatch ∷ Int → Instrument
 pipePatch variant =
@@ -361,11 +391,14 @@ pipePatch variant =
        , osc (if even variant then WaveSquare else WaveSine) (detunePitch (1 + 3 * v)) 0.10
        ]
        0.12
-       (ADSR 0.01 0.12 0.82 (0.20 + 0.08 * v))
-       (0.82 + 0.08 * v)
-       (Just filt)
-       [lfoPitch 0 4]
-       8
+        (ADSR 0.01 0.12 0.82 (0.20 + 0.08 * v))
+        (0.82 + 0.08 * v)
+        (Just filt)
+        [ lfoPitch 0 4
+        , aftertouchAmp ModSrcChanAftertouch 0.08
+        , aftertouchFilter ModSrcPolyAftertouch 0.12
+        ]
+        8
 
 synthLeadPatch ∷ Int → Instrument
 synthLeadPatch variant =
@@ -377,11 +410,15 @@ synthLeadPatch variant =
        , osc (if even variant then WaveSaw else WaveTriangle) (semiPitch 12) 0.16
        ]
        (0.18 + 0.08 * v)
-       (ADSR 0.002 0.10 (0.44 + 0.10 * v) (0.12 + 0.06 * v))
-       (0.94 + 0.06 * v)
-       (Just filt)
-       [lfoPitch 0 18, lfoFilter 0.14]
-       6
+        (ADSR 0.002 0.10 (0.44 + 0.10 * v) (0.12 + 0.06 * v))
+        (0.94 + 0.06 * v)
+        (Just filt)
+        [ lfoPitch 0 18
+        , lfoFilter 0.14
+        , aftertouchFilter ModSrcChanAftertouch 0.30
+        , aftertouchPitch ModSrcPolyAftertouch 0 18
+        ]
+        6
 
 synthPadPatch ∷ Int → Instrument
 synthPadPatch variant =
@@ -394,11 +431,15 @@ synthPadPatch variant =
        , osc WaveSine (semiPitch 12) 0.14
        ]
        (0.55 + 0.12 * v)
-       (ADSR (0.24 + 0.18 * v) 0.70 0.86 (0.90 + 0.40 * v))
-       (0.78 + 0.06 * v)
-       (Just filt)
-       [lfoFilter 0.26, lfoAmp (-0.10)]
-       10
+        (ADSR (0.24 + 0.18 * v) 0.70 0.86 (0.90 + 0.40 * v))
+        (0.78 + 0.06 * v)
+        (Just filt)
+        [ lfoFilter 0.26
+        , lfoAmp (-0.10)
+        , aftertouchFilter ModSrcChanAftertouch 0.32
+        , aftertouchAmp ModSrcPolyAftertouch 0.12
+        ]
+        10
 
 synthFxPatch ∷ Int → Instrument
 synthFxPatch variant =
@@ -410,11 +451,16 @@ synthFxPatch variant =
        , osc WaveTriangle (semiPitch 12) 0.20
        ]
        (0.30 + 0.10 * v)
-       (ADSR 0.01 (0.20 + 0.08 * v) (0.32 + 0.12 * v) (0.25 + 0.10 * v))
-       (0.84 + 0.08 * v)
-       (Just filt)
-       [lfoPitch 0 15, lfoFilter 0.35, lfoAmp (-0.10)]
-       8
+        (ADSR 0.01 (0.20 + 0.08 * v) (0.32 + 0.12 * v) (0.25 + 0.10 * v))
+        (0.84 + 0.08 * v)
+        (Just filt)
+        [ lfoPitch 0 15
+        , lfoFilter 0.35
+        , lfoAmp (-0.10)
+        , aftertouchFilter ModSrcChanAftertouch 0.35
+        , aftertouchPitch ModSrcPolyAftertouch 1 22
+        ]
+        8
 
 ethnicPatch ∷ Int → Instrument
 ethnicPatch variant =
@@ -458,11 +504,15 @@ soundFxPatch variant =
        , osc WaveTriangle (octavePitch 1) 0.16
        ]
        (0.24 + 0.12 * v)
-       (ADSR 0.004 (0.18 + 0.12 * v) (0.20 + 0.16 * v) (0.20 + 0.18 * v))
-       (0.82 + 0.10 * v)
-       (Just filt)
-       [lfoPitch 0 24, lfoFilter 0.45, lfoAmp (-0.14)]
-       8
+        (ADSR 0.004 (0.18 + 0.12 * v) (0.20 + 0.16 * v) (0.20 + 0.18 * v))
+        (0.82 + 0.10 * v)
+        (Just filt)
+        [ lfoPitch 0 24
+        , lfoFilter 0.45
+        , lfoAmp (-0.14)
+        , aftertouchFilter ModSrcChanAftertouch 0.45
+        ]
+        8
 
 percussionPatch ∷ Instrument
 percussionPatch =

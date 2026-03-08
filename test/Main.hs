@@ -20,6 +20,7 @@ import Audio.Thread.InstrumentTable
   ( MidiControls(..)
   , lookupMidiControls
   , resetMidiControls
+  , setChannelAftertouch
   , setChannelPan
   , setChannelVolume
   , setExpression
@@ -28,7 +29,13 @@ import Audio.Thread.InstrumentTable
   , setPitchBend
   )
 import Audio.Thread.Types (AudioState(..), Voice(..))
-import Audio.Thread.Voice (addInstrumentNote, applyInstrumentToActiveVoices, releaseInstrumentAllVoices, releaseInstrumentNote)
+import Audio.Thread.Voice
+  ( addInstrumentNote
+  , applyInstrumentToActiveVoices
+  , releaseInstrumentAllVoices
+  , releaseInstrumentNote
+  , setInstrumentNoteAftertouch
+  )
 import Audio.Types
 import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
 import Engine.Core.Queue (newQueue)
@@ -81,6 +88,8 @@ testCases =
   , TestCase "release-all-voices-keeps-other-instruments-active" testReleaseAllVoicesKeepsOtherInstrumentsActive
   , TestCase "midi-controller-state-clamps-and-resets" testMidiControllerStateClampsAndResets
   , TestCase "midi-controller-conversions-are-normalized" testMidiControllerConversionsAreNormalized
+  , TestCase "poly-aftertouch-targets-matching-note-instance" testPolyAftertouchTargetsMatchingNoteInstance
+  , TestCase "aftertouch-routes-are-wired-into-expressive-patches" testAftertouchRoutesAreWiredIntoExpressivePatches
   , TestCase "noise-waveforms-mix-between-white-and-pink" testNoiseWaveformsMixBetweenWhiteAndPink
   , TestCase "pink-noise-is-smoother-than-white" testPinkNoiseIsSmootherThanWhite
   , TestCase "noise-layer-envelope-shapes-amplitude" testNoiseLayerEnvelopeShapesAmplitude
@@ -249,8 +258,9 @@ testMidiControllerStateClampsAndResets = do
   st2 <- setExpression iid (-0.25) st1
   st3 <- setChannelPan iid 2 st2
   st4 <- setModWheel iid 0.4 st3
-  st5 <- setPitchBend iid (defaultPitchBendRangeSemitones * 2) st4
-  ctrls <- lookupMidiControls iid st5
+  st5 <- setChannelAftertouch iid 1.5 st4
+  st6 <- setPitchBend iid (defaultPitchBendRangeSemitones * 2) st5
+  ctrls <- lookupMidiControls iid st6
   assertEqual
     "clamped controller state"
     MidiControls
@@ -258,11 +268,12 @@ testMidiControllerStateClampsAndResets = do
       , mcExpression = 0
       , mcChannelPan = 1
       , mcModWheel = 0.4
+      , mcChannelAftertouch = 1
       , mcPitchBendSemis = defaultPitchBendRangeSemitones
       }
     ctrls
-  st6 <- resetMidiControls iid st5
-  resetCtrls <- lookupMidiControls iid st6
+  st7 <- resetMidiControls iid st6
+  resetCtrls <- lookupMidiControls iid st7
   assertEqual
     "reset controller state"
     MidiControls
@@ -270,6 +281,7 @@ testMidiControllerStateClampsAndResets = do
       , mcExpression = 1
       , mcChannelPan = 0
       , mcModWheel = 0
+      , mcChannelAftertouch = 0
       , mcPitchBendSemis = 0
       }
     resetCtrls
@@ -286,6 +298,35 @@ testMidiControllerConversionsAreNormalized = do
   assertNear "pitch bend min" (negate defaultPitchBendRangeSemitones) (midiPitchBendSemitones 0)
   assertNear "pitch bend center" 0 (midiPitchBendSemitones 8192)
   assertNear "pitch bend max" defaultPitchBendRangeSemitones (midiPitchBendSemitones 16383)
+
+testPolyAftertouchTargetsMatchingNoteInstance ∷ IO ()
+testPolyAftertouchTargetsMatchingNoteInstance = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      inst = mkInstrument Poly
+      firstId = NoteInstanceId 1
+      secondId = NoteInstanceId 2
+  st1 <- setInstrument iid inst st0
+  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 64) secondId 0.8 Nothing
+  st4 <- setInstrumentNoteAftertouch iid secondId 1.5 st3
+  voices <- readActiveVoices st4
+  firstVoice <- findVoice firstId voices
+  secondVoice <- findVoice secondId voices
+  assertNear "first voice aftertouch remains zero" 0 (vNoteAftertouch firstVoice)
+  assertNear "second voice aftertouch is clamped" 1 (vNoteAftertouch secondVoice)
+
+testAftertouchRoutesAreWiredIntoExpressivePatches ∷ IO ()
+testAftertouchRoutesAreWiredIntoExpressivePatches = do
+  let strings = gmProgramInstrument 48
+      brass = gmProgramInstrument 56
+      lead = gmProgramInstrument 80
+      pad = gmProgramInstrument 88
+  assertBool "strings patch should expose channel aftertouch" (hasModSrc ModSrcChanAftertouch (iModRoutes strings))
+  assertBool "brass patch should expose channel aftertouch" (hasModSrc ModSrcChanAftertouch (iModRoutes brass))
+  assertBool "lead patch should expose poly aftertouch" (hasModSrc ModSrcPolyAftertouch (iModRoutes lead))
+  assertBool "pad patch should expose poly aftertouch" (hasModSrc ModSrcPolyAftertouch (iModRoutes pad))
 
 testNoiseWaveformsMixBetweenWhiteAndPink ∷ IO ()
 testNoiseWaveformsMixBetweenWhiteAndPink = do
@@ -424,6 +465,7 @@ mkTestState = do
   channelExpressionVec <- MV.replicate 256 1
   channelPanVec <- MV.replicate 256 0
   modWheelVec <- MV.replicate 256 0
+  channelAftertouchVec <- MV.replicate 256 0
   pitchBendVec <- MV.replicate 256 0
   pitchModScratch <- MV.replicate 4 1
   pitchCentsScratch <- MV.replicate 4 0
@@ -445,6 +487,7 @@ mkTestState = do
     , stChannelExpression = channelExpressionVec
     , stChannelPan = channelPanVec
     , stModWheel = modWheelVec
+    , stChannelAftertouch = channelAftertouchVec
     , stPitchBendSemis = pitchBendVec
     , stNow = 0
     }
@@ -530,6 +573,9 @@ isNoiseWaveform wf =
 noiseLayerHasEnvelope ∷ OscLayer → Bool
 noiseLayerHasEnvelope layer =
   isNoiseWaveform (olWaveform layer) && olAmpEnv layer /= Nothing
+
+hasModSrc ∷ ModSrc → [ModRoute] → Bool
+hasModSrc src = any ((== src) . mrSrc)
 
 assertBool ∷ String → Bool → IO ()
 assertBool label cond =

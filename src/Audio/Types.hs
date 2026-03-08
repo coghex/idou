@@ -81,6 +81,8 @@ data ModSrc
   | ModSrcEnvAmp
   | ModSrcEnvFilter
   | ModSrcKeyTrack
+  | ModSrcChanAftertouch
+  | ModSrcPolyAftertouch
   deriving (Eq, Show)
 
 data ModDst
@@ -168,6 +170,11 @@ data AudioMsg
       , modWheel     ∷ !Float
       }
 
+  | AudioSetChannelAftertouch
+      { instrumentId      ∷ !InstrumentId
+      , channelAftertouch ∷ !Float
+      }
+
   | AudioSetPitchBend
       { instrumentId      ∷ !InstrumentId
       , pitchBendSemitones ∷ !Float
@@ -198,6 +205,12 @@ data AudioMsg
   | AudioNoteOff
       { instrumentId   ∷ !InstrumentId
       , noteInstanceId ∷ !NoteInstanceId
+      }
+
+  | AudioSetNoteAftertouch
+      { instrumentId    ∷ !InstrumentId
+      , noteInstanceId  ∷ !NoteInstanceId
+      , noteAftertouch  ∷ !Float
       }
 
   | AudioNoteOffInstrument

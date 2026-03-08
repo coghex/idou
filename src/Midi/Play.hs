@@ -57,9 +57,11 @@ newtype AbsTick = AbsTick { unAbsTick :: Int }
 data MidiEv
   = EvNoteOn  { evChan :: !Int, evKey :: !Int, evVel :: !Int }
   | EvNoteOff { evChan :: !Int, evKey :: !Int }
+  | EvNoteAftertouch { evChan :: !Int, evKey :: !Int, evAftertouch :: !Int }
   | EvTempoUSPerQN { evTempo :: !Int }  -- microseconds per quarter note
   | EvController { evChan :: !Int, evController :: !Int, evValue :: !Int }
   | EvProgramChange { evChan :: !Int, evProgram :: !Int }
+  | EvChanAftertouch { evChan :: !Int, evAftertouch :: !Int }
   | EvPitchBend { evChan :: !Int, evPitchBend :: !Int }
   deriving (Eq, Show)
 
@@ -144,6 +146,16 @@ playMidiFile chanMap sys fp = do
           (held', deferred') <- doNoteOff ch key held deferred sustain
           loop ppqn tempo instCounter held' deferred' sustain t xs
 
+        EvNoteAftertouch ch key pressure -> do
+          let iid = channelToInstrument chanMap ch
+              pressureF = controllerValue01 pressure
+          case M.lookup (ch, key) held of
+            Nothing -> pure ()
+            Just instIds ->
+              forM_ instIds $ \instId ->
+                sendAudio sys (AudioSetNoteAftertouch iid instId pressureF)
+          loop ppqn tempo instCounter held deferred sustain t xs
+
         EvController ch ctrl val -> do
           let iid = channelToInstrument chanMap ch
               wasSustainDown = M.findWithDefault False ch sustain
@@ -194,6 +206,11 @@ playMidiFile chanMap sys fp = do
         EvProgramChange ch program -> do
           let iid = channelToInstrument chanMap ch
           sendAudio sys (AudioLoadInstrument iid (gmChannelInstrument ch program))
+          loop ppqn tempo instCounter held deferred sustain t xs
+
+        EvChanAftertouch ch pressure -> do
+          let iid = channelToInstrument chanMap ch
+          sendAudio sys (AudioSetChannelAftertouch iid (controllerValue01 pressure))
           loop ppqn tempo instCounter held deferred sustain t xs
 
         EvPitchBend ch bend14 -> do
@@ -282,14 +299,16 @@ extractEvent t ev =
           [TimedEv t (EvNoteOn (fromIntegral ch) (fromIntegral key) (fromIntegral vel))]
         NoteOff ch key _relVel ->
           [TimedEv t (EvNoteOff (fromIntegral ch) (fromIntegral key))]
+        NoteAftertouch ch key pressure ->
+          [TimedEv t (EvNoteAftertouch (fromIntegral ch) (fromIntegral key) (fromIntegral pressure))]
         Controller ch ctrl val ->
           [TimedEv t (EvController (fromIntegral ch) (fromIntegral ctrl) (fromIntegral val))]
         ProgramChange ch program ->
           [TimedEv t (EvProgramChange (fromIntegral ch) (fromIntegral program))]
+        ChanAftertouch ch pressure ->
+          [TimedEv t (EvChanAftertouch (fromIntegral ch) (fromIntegral pressure))]
         PitchBend ch bend ->
           [TimedEv t (EvPitchBend (fromIntegral ch) (fromIntegral bend))]
-        _ ->
-          []
 
     _ -> []
 

@@ -7,6 +7,7 @@ module Audio.Thread.Voice
   , addInstrumentNote
   , releaseInstrumentNote
   , releaseInstrumentAllVoices
+  , setInstrumentNoteAftertouch
   , applyInstrumentToActiveVoices
   , findLegatoVoiceIxNewest
   , panGains
@@ -313,9 +314,10 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
                  , vModRoutes = []
                  , vADSR = adsr'
                  , vEnv = env0
-                 , vNoteKey = Nothing
+                , vNoteKey = Nothing
                 , vNoteInstanceId = Nothing
                 , vVelocity = 1
+                , vNoteAftertouch = 0
                 , vInstrId = Nothing
                 , vStartedAt = stNow st
                 , vVibPhase = 0
@@ -536,11 +538,12 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
          , vFilter = mfilt'
         , vFiltEnv = mfenv'
         , vFiltTick = 0
-        , vNoteKey = Just key
-        , vNoteInstanceId = Just instId
-        , vVelocity = vel'
-        , vStartedAt = now'
-        }
+         , vNoteKey = Just key
+         , vNoteInstanceId = Just instId
+         , vVelocity = vel'
+         , vNoteAftertouch = 0
+         , vStartedAt = now'
+         }
 
       pure st { stNow = now' }
 
@@ -602,11 +605,12 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
                  , vADSR = adsr'
                  , vEnv = env0
                  , vNoteKey = Just key
-                , vNoteInstanceId = Just instId
-                , vVelocity = vel'
-                , vInstrId = Just iid
-                , vStartedAt = now'
-                , vVibPhase = 0
+                 , vNoteInstanceId = Just instId
+                 , vVelocity = vel'
+                 , vNoteAftertouch = 0
+                 , vInstrId = Just iid
+                 , vStartedAt = now'
+                 , vVibPhase = 0
                 , vLfo1Phase = 0
                 }
 
@@ -696,11 +700,12 @@ addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
            , vADSR = adsr'
            , vEnv = env0
            , vNoteKey = Just key
-          , vNoteInstanceId = Just instId
-          , vVelocity = vel'
-          , vInstrId = Just iid
-          , vStartedAt = now'
-          , vVibPhase = 0
+           , vNoteInstanceId = Just instId
+           , vVelocity = vel'
+           , vNoteAftertouch = 0
+           , vInstrId = Just iid
+           , vStartedAt = now'
+           , vVibPhase = 0
           , vLfo1Phase = 0
           }
 
@@ -751,6 +756,21 @@ releaseInstrumentAllVoices iid st = do
                 let fe' = fmap envRelease (vFiltEnv v)
                 releaseVoiceOscAmpEnvs v
                 MV.write vec i v { vEnv = envRelease (vEnv v), vFiltEnv = fe', vHoldRemain = 0 }
+              else pure ()
+            go (i+1)
+  go 0
+
+setInstrumentNoteAftertouch ∷ InstrumentId → NoteInstanceId → Float → AudioState → IO AudioState
+setInstrumentNoteAftertouch iid instId aft st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+      aft' = clamp01' aft
+      go i
+        | i >= n = pure st
+        | otherwise = do
+            v <- MV.read vec i
+            if vInstrId v == Just iid && vNoteInstanceId v == Just instId
+              then MV.write vec i v { vNoteAftertouch = aft' }
               else pure ()
             go (i+1)
   go 0

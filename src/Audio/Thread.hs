@@ -103,6 +103,7 @@ startAudioSystem audioCfg = do
     channelExpressionVec <- MV.replicate 256 1
     channelPanVec <- MV.replicate 256 0
     modWheelVec <- MV.replicate 256 0
+    channelAftertouchVec <- MV.replicate 256 0
     pitchBendVec <- MV.replicate 256 0
     pitchModScratch <- MV.replicate maxLayers 1
     pitchCentsScratch <- MV.replicate maxLayers 0
@@ -127,6 +128,7 @@ startAudioSystem audioCfg = do
             , stChannelExpression = channelExpressionVec
             , stChannelPan = channelPanVec
             , stModWheel = modWheelVec
+            , stChannelAftertouch = channelAftertouchVec
             , stPitchBendSemis = pitchBendVec
             , stNow = 0
             }
@@ -261,6 +263,7 @@ processMsgs h rb st = do
         AudioSetChannelPan iid pan -> setChannelPan iid pan st >>= processMsgs h rb
         AudioSetExpression iid expr -> setExpression iid expr st >>= processMsgs h rb
         AudioSetModWheel iid mw -> setModWheel iid mw st >>= processMsgs h rb
+        AudioSetChannelAftertouch iid aft -> setChannelAftertouch iid aft st >>= processMsgs h rb
         AudioSetPitchBend iid semis -> setPitchBend iid semis st >>= processMsgs h rb
         AudioResetControllers iid -> resetMidiControls iid st >>= processMsgs h rb
 
@@ -273,3 +276,6 @@ processMsgs h rb st = do
 
         AudioNoteOff iid instId ->
           releaseInstrumentNote iid instId st >>= processMsgs h rb
+
+        AudioSetNoteAftertouch iid instId aft ->
+          setInstrumentNoteAftertouch iid instId aft st >>= processMsgs h rb

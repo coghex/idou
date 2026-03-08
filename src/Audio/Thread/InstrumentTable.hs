@@ -16,6 +16,7 @@ module Audio.Thread.InstrumentTable
   , setChannelPan
   , setExpression
   , setModWheel
+  , setChannelAftertouch
   , setPitchBend
   , resetMidiControls
   , lookupMidiControls
@@ -31,6 +32,7 @@ data MidiControls = MidiControls
   , mcExpression      ∷ !Float
   , mcChannelPan      ∷ !Float
   , mcModWheel        ∷ !Float
+  , mcChannelAftertouch ∷ !Float
   , mcPitchBendSemis  ∷ !Float
   } deriving (Eq, Show)
 
@@ -53,6 +55,7 @@ defaultMidiControls =
     , mcExpression = 1
     , mcChannelPan = 0
     , mcModWheel = 0
+    , mcChannelAftertouch = 0
     , mcPitchBendSemis = 0
     }
 
@@ -139,6 +142,12 @@ setModWheel (InstrumentId i) mw st = do
       mw' = clamp01 mw
   if i < 0 || i >= MV.length vec then pure st else MV.write vec i mw' >> pure st
 
+setChannelAftertouch ∷ InstrumentId → Float → AudioState → IO AudioState
+setChannelAftertouch (InstrumentId i) aft st = do
+  let vec = stChannelAftertouch st
+      aft' = clamp01 aft
+  if i < 0 || i >= MV.length vec then pure st else MV.write vec i aft' >> pure st
+
 setPitchBend ∷ InstrumentId → Float → AudioState → IO AudioState
 setPitchBend (InstrumentId i) semis st = do
   let vec = stPitchBendSemis st
@@ -151,7 +160,8 @@ resetMidiControls iid st0 = do
   st2 <- setExpression iid 1 st1
   st3 <- setChannelPan iid 0 st2
   st4 <- setModWheel iid 0 st3
-  setPitchBend iid 0 st4
+  st5 <- setChannelAftertouch iid 0 st4
+  setPitchBend iid 0 st5
 
 lookupMidiControls ∷ InstrumentId → AudioState → IO MidiControls
 lookupMidiControls (InstrumentId i) st = do
@@ -159,6 +169,7 @@ lookupMidiControls (InstrumentId i) st = do
       expr = stChannelExpression st
       pan = stChannelPan st
       mw = stModWheel st
+      aft = stChannelAftertouch st
       bend = stPitchBendSemis st
   if i < 0 || i >= MV.length vol
     then pure defaultMidiControls
@@ -167,6 +178,7 @@ lookupMidiControls (InstrumentId i) st = do
       expr' <- MV.read expr i
       pan' <- MV.read pan i
       mw' <- MV.read mw i
+      aft' <- MV.read aft i
       bend' <- MV.read bend i
       pure
         MidiControls
@@ -174,5 +186,6 @@ lookupMidiControls (InstrumentId i) st = do
           , mcExpression = expr'
           , mcChannelPan = pan'
           , mcModWheel = mw'
+          , mcChannelAftertouch = aft'
           , mcPitchBendSemis = bend'
           }
