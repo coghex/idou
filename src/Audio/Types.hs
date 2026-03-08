@@ -118,6 +118,11 @@ data AudioMsg
       , instrument   ∷ !Instrument
       }
 
+  | AudioLoadInstrument
+      { instrumentId ∷ !InstrumentId
+      , instrument   ∷ !Instrument
+      }
+
   | AudioSetGlideSec
       { instrumentId ∷ !InstrumentId
       , glideSec     ∷ !Float

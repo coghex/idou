@@ -16,7 +16,7 @@ import Foreign.ForeignPtr (ForeignPtr)
 
 import qualified Data.Vector.Mutable as MV
 
-import Audio.Types (InstrumentId, Instrument, NoteKey, NoteInstanceId)
+import Audio.Types (InstrumentId, Instrument, ModRoute, NoteKey, NoteInstanceId)
 import Audio.Envelope (ADSR, EnvState)
 import Audio.Oscillator (Osc)
 import Audio.Filter (FilterState)
@@ -46,6 +46,8 @@ data Voice = Voice
   , vBaseAmpR   ∷ !Float
   , vAmpL       ∷ !Float
   , vAmpR       ∷ !Float
+  , vInstrGain  ∷ !Float
+  , vModRoutes  ∷ ![ModRoute]
 
   , vADSR       ∷ !ADSR
   , vEnv        ∷ !EnvState

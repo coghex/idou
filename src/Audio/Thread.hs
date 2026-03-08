@@ -245,6 +245,9 @@ processMsgs h rb st = do
         AudioShutdown -> rbReset rb >> pure st { stActiveCount = 0 }
         AudioStopAll  -> rbReset rb >> processMsgs h rb st { stActiveCount = 0 }
 
+        AudioLoadInstrument iid inst ->
+          setInstrument iid inst st >>= processMsgs h rb
+
         AudioSetInstrument iid inst -> do
           st'  <- setInstrument iid inst st
           st'' <- applyInstrumentToActiveVoices (sampleRate h) iid inst st'

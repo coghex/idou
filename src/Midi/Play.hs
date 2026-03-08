@@ -16,6 +16,7 @@ import Data.Word (Word64)
 
 import qualified Data.Map.Strict as M
 
+import Audio.Patch (gmChannelInstrument)
 import Audio.Thread (AudioSystem, sendAudio)
 import Audio.Types
   ( AudioMsg(..)
@@ -58,6 +59,7 @@ data MidiEv
   | EvNoteOff { evChan :: !Int, evKey :: !Int }
   | EvTempoUSPerQN { evTempo :: !Int }  -- microseconds per quarter note
   | EvController { evChan :: !Int, evController :: !Int, evValue :: !Int }
+  | EvProgramChange { evChan :: !Int, evProgram :: !Int }
   | EvPitchBend { evChan :: !Int, evPitchBend :: !Int }
   deriving (Eq, Show)
 
@@ -186,6 +188,11 @@ playMidiFile chanMap sys fp = do
             _ ->
               loop ppqn tempo instCounter held deferred sustain t xs
 
+        EvProgramChange ch program -> do
+          let iid = channelToInstrument chanMap ch
+          sendAudio sys (AudioLoadInstrument iid (gmChannelInstrument ch program))
+          loop ppqn tempo instCounter held deferred sustain t xs
+
         EvPitchBend ch bend14 -> do
           let iid = channelToInstrument chanMap ch
           sendAudio sys (AudioSetPitchBend iid (midiPitchBendSemitones bend14))
@@ -274,6 +281,8 @@ extractEvent t ev =
           [TimedEv t (EvNoteOff (fromIntegral ch) (fromIntegral key))]
         Controller ch ctrl val ->
           [TimedEv t (EvController (fromIntegral ch) (fromIntegral ctrl) (fromIntegral val))]
+        ProgramChange ch program ->
+          [TimedEv t (EvProgramChange (fromIntegral ch) (fromIntegral program))]
         PitchBend ch bend ->
           [TimedEv t (EvPitchBend (fromIntegral ch) (fromIntegral bend))]
         _ ->

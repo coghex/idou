@@ -14,6 +14,8 @@ import qualified Data.Vector.Mutable as MV
 
 import Audio.Config (AudioBufferConfig(..), AudioConfig(..), parseAudioConfigText)
 import Audio.Envelope
+import Audio.Oscillator (Osc(..))
+import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmProgramInstrument, gmPercussionChannel)
 import Audio.Thread.InstrumentTable
   ( MidiControls(..)
   , lookupMidiControls
@@ -26,7 +28,7 @@ import Audio.Thread.InstrumentTable
   , setPitchBend
   )
 import Audio.Thread.Types (AudioState(..), Voice(..))
-import Audio.Thread.Voice (addInstrumentNote, releaseInstrumentAllVoices, releaseInstrumentNote)
+import Audio.Thread.Voice (addInstrumentNote, applyInstrumentToActiveVoices, releaseInstrumentAllVoices, releaseInstrumentNote)
 import Audio.Types
 import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
 import Engine.Core.Queue (newQueue)
@@ -79,6 +81,9 @@ testCases =
   , TestCase "release-all-voices-keeps-other-instruments-active" testReleaseAllVoicesKeepsOtherInstrumentsActive
   , TestCase "midi-controller-state-clamps-and-resets" testMidiControllerStateClampsAndResets
   , TestCase "midi-controller-conversions-are-normalized" testMidiControllerConversionsAreNormalized
+  , TestCase "gm-program-map-varies-by-family" testGmProgramMapVariesByFamily
+  , TestCase "gm-percussion-channel-ignores-program" testGmPercussionChannelIgnoresProgram
+  , TestCase "instrument-load-keeps-active-voice-until-live-apply" testInstrumentLoadKeepsActiveVoiceUntilLiveApply
   ]
 
 testAudioConfigParsesYamlShape ∷ IO ()
@@ -277,6 +282,59 @@ testMidiControllerConversionsAreNormalized = do
   assertNear "pitch bend center" 0 (midiPitchBendSemitones 8192)
   assertNear "pitch bend max" defaultPitchBendRangeSemitones (midiPitchBendSemitones 16383)
 
+testGmProgramMapVariesByFamily ∷ IO ()
+testGmProgramMapVariesByFamily = do
+  let piano = gmProgramInstrument defaultMidiProgram
+      guitar = gmProgramInstrument 24
+      strings = gmProgramInstrument 48
+      lead = gmProgramInstrument 80
+  assertBool "piano and guitar patches should differ" (piano /= guitar)
+  assertBool "guitar and strings patches should differ" (guitar /= strings)
+  assertBool "strings and lead patches should differ" (strings /= lead)
+
+testGmPercussionChannelIgnoresProgram ∷ IO ()
+testGmPercussionChannelIgnoresProgram = do
+  let drum0 = gmChannelInstrument gmPercussionChannel 0
+      drum56 = gmChannelInstrument gmPercussionChannel 56
+      melodic = gmChannelInstrument 0 56
+  assertEqual "percussion patch should ignore program number" drum0 drum56
+  assertBool "percussion patch should differ from melodic patch" (drum0 /= melodic)
+  assertEqual "percussion patch sustain" 0 (aSustain (iAdsrDefault drum0))
+
+testInstrumentLoadKeepsActiveVoiceUntilLiveApply ∷ IO ()
+testInstrumentLoadKeepsActiveVoiceUntilLiveApply = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      routesA = [ModRoute ModSrcLfo1 (ModDstLayerPitchCents 0) 7]
+      routesB = [ModRoute ModSrcLfo1 ModDstFilterCutoffOct 0.5]
+      instA =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSine rootPitch 1 NoSync]
+          , iGain = 0.5
+          , iModRoutes = routesA
+          }
+      instB =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSaw rootPitch 1 NoSync]
+          , iGain = 0.9
+          , iModRoutes = routesB
+          }
+  st1 <- setInstrument iid instA st0
+  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) (NoteInstanceId 1) 0.8 Nothing
+  st3 <- setInstrument iid instB st2
+  voiceLoaded <- MV.read (stVoices st3) 0
+  oscLoaded <- MV.read (vOscs voiceLoaded) 0
+  assertNear "loaded voice keeps snapshot gain" 0.5 (vInstrGain voiceLoaded)
+  assertEqual "loaded voice keeps snapshot routes" routesA (vModRoutes voiceLoaded)
+  assertEqual "loaded voice keeps original waveform" WaveSine (oWaveform oscLoaded)
+  st4 <- applyInstrumentToActiveVoices testSampleRate iid instB st3
+  voiceLive <- MV.read (stVoices st4) 0
+  oscLive <- MV.read (vOscs voiceLive) 0
+  assertNear "live apply updates snapshot gain" 0.9 (vInstrGain voiceLive)
+  assertEqual "live apply updates snapshot routes" routesB (vModRoutes voiceLive)
+  assertEqual "live apply updates waveform" WaveSaw (oWaveform oscLive)
+
 mkTestHandle ∷ IO AudioHandle
 mkTestHandle = do
   q <- newQueue
@@ -328,7 +386,7 @@ mkTestState = do
 mkInstrument ∷ PlayMode → Instrument
 mkInstrument playMode =
   Instrument
-    { iOscs = [OscLayer WaveSine (PitchSpec 0 0 0 0) 1 NoSync]
+    { iOscs = [OscLayer WaveSine rootPitch 1 NoSync]
     , iLayerSpread = 0
     , iAdsrDefault = ADSR 0.01 0.02 0.5 0.03
     , iGain = 1
@@ -338,6 +396,9 @@ mkInstrument playMode =
     , iPolyMax = 8
     , iVoiceSteal = StealQuietest
     }
+
+rootPitch ∷ PitchSpec
+rootPitch = PitchSpec 0 0 0 0
 
 readActiveVoices ∷ AudioState → IO [Voice]
 readActiveVoices st =

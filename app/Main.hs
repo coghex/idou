@@ -10,9 +10,9 @@ import System.Exit (exitSuccess)
 import System.IO
 
 import Audio.Config (audioConfigPath, loadAudioConfig)
+import Audio.Patch (defaultMidiProgram, gmChannelInstrument)
 import Audio.Thread
 import Audio.Types
-import Audio.Envelope
 
 import Midi.Play (playMidiFile, defaultChannelMap)
 
@@ -41,36 +41,10 @@ main = do
 
 preloadChannels ∷ AudioSystem → IO ()
 preloadChannels sys = do
-  let envAmpNormal = ADSR 0.02 0.10 0.6 0.50
-
-      basePitch = PitchSpec 0 0 0 0
-      mkRoutes enabled =
-        if not enabled
-          then []
-          else
-            [ ModRoute ModSrcLfo1 ModDstFilterCutoffOct 0.5
-            , ModRoute ModSrcLfo1 ModDstAmpGain (-0.3)
-            , ModRoute ModSrcEnvAmp (ModDstLayerPitchCents 0) (-8)
-            ]
-
-      mkInst ∷ Instrument
-      mkInst =
-        Instrument
-          { iOscs =
-              [ OscLayer WaveSaw basePitch 1.0 NoSync
-              ]
-          , iLayerSpread = 0.7
-          , iAdsrDefault = envAmpNormal
-          , iGain = 1.0
-          , iFilter = Nothing
-          , iModRoutes = mkRoutes True
-          , iPlayMode = Poly
-          , iPolyMax = 8
-          , iVoiceSteal = StealQuietest
-          }
-
   forM_ [0..15] $ \ch ->
-    sendAudio sys (AudioSetInstrument (InstrumentId ch) mkInst)
+    sendAudio
+      sys
+      (AudioLoadInstrument (InstrumentId ch) (gmChannelInstrument ch defaultMidiProgram))
 
   -- Default vibrato/LFO off.
   forM_ [0..15] $ \ch ->

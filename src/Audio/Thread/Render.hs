@@ -18,9 +18,9 @@ import Audio.Oscillator (oscSetHz, oscStepWrap, oscResetPhase0)
 import Sound.Miniaudio.RingBuffer
 
 import Audio.Thread.Types
-import Audio.Thread.InstrumentTable (MidiControls(..), lookupInstrument, lookupMidiControls, lookupVibrato)
+import Audio.Thread.InstrumentTable (MidiControls(..), lookupMidiControls, lookupVibrato)
 import Audio.Thread.Voice (panGains)
-import Audio.Types (Instrument(..), ModRoute(..), ModSrc(..), ModDst(..))
+import Audio.Types (ModRoute(..), ModSrc(..), ModDst(..))
 
 defaultModWheelLfoRateHz ∷ Float
 defaultModWheelLfoRateHz = 5
@@ -84,20 +84,18 @@ mixVoices srF chunkFrames out st0 = do
         | i >= stActiveCount st = pure st
         | otherwise = do
             v <- MV.read vec i
-            (instGain, channelGain, channelPan, modWheel, bendRatio, rateHz, depthCents) <-
+            (channelGain, channelPan, modWheel, bendRatio, rateHz, depthCents) <-
               case vInstrId v of
-                Nothing -> pure (1, 1, 0, 0, 1, 0, 0)
+                Nothing -> pure (1, 0, 0, 1, 0, 0)
                 Just iid -> do
-                  instM <- lookupInstrument iid st
                   ctrls <- lookupMidiControls iid st
                   (vRateHz, vDepthCents) <- lookupVibrato iid st
-                  let instGain' = maybe 1 iGain instM
-                      channelGain' = mcChannelVolume ctrls * mcExpression ctrls
+                  let channelGain' = mcChannelVolume ctrls * mcExpression ctrls
                       channelPan' = mcChannelPan ctrls
                       modWheel' = mcModWheel ctrls
                       bendRatio' = semitonesToRatio (mcPitchBendSemis ctrls)
-                  pure (instGain', channelGain', channelPan', modWheel', bendRatio', vRateHz, vDepthCents)
-            v' <- mixOneVoice srF chunkFrames out instGain channelGain channelPan modWheel bendRatio rateHz depthCents st v
+                  pure (channelGain', channelPan', modWheel', bendRatio', vRateHz, vDepthCents)
+            v' <- mixOneVoice srF chunkFrames out channelGain channelPan modWheel bendRatio rateHz depthCents st v
             if eStage (vEnv v') == EnvDone
               then do
                 let lastIx = stActiveCount st - 1
@@ -107,8 +105,8 @@ mixVoices srF chunkFrames out st0 = do
               else MV.write vec i v' >> loop (i+1) st
   loop 0 st0
 
-mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → Float → Float → Float → Float → Float → AudioState → Voice → IO Voice
-mixOneVoice srF chunkFrames out instGain channelGain channelPan modWheel bendRatio vibRateHz vibDepthCents st v0 = do
+mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → Float → Float → Float → Float → AudioState → Voice → IO Voice
+mixOneVoice srF chunkFrames out channelGain channelPan modWheel bendRatio vibRateHz vibDepthCents st v0 = do
   let framesToDo = chunkFrames
       retuneEvery = 16 ∷ Int
       modEvery = 16 ∷ Int
@@ -119,7 +117,7 @@ mixOneVoice srF chunkFrames out instGain channelGain channelPan modWheel bendRat
       baseAmp = stereoAmp (vBaseAmpL v0) (vBaseAmpR v0)
       basePan = stereoPan (vBaseAmpL v0) (vBaseAmpR v0)
       finalPan = clampPan (basePan + channelPan)
-      (voiceAmpL0, voiceAmpR0) = panGains (baseAmp * instGain * channelGain) finalPan
+      (voiceAmpL0, voiceAmpR0) = panGains (baseAmp * vInstrGain v0 * channelGain) finalPan
       lfoRateHz
         | vibRateHz > 0 = vibRateHz
         | modWheel > 0 = defaultModWheelLfoRateHz
@@ -163,7 +161,7 @@ mixOneVoice srF chunkFrames out instGain channelGain channelPan modWheel bendRat
               if tick `mod` modEvery == 0
                 then do
                   let lfo1Value = lfoScale * sin (2*pi*phL1)
-                  (ampMul, fOct) <- computeMods maxRoutes st lfo1Value envAmp v pitchCentsScratch pitchModRatScratch
+                  (ampMul, fOct) <- computeMods maxRoutes lfo1Value envAmp v pitchCentsScratch pitchModRatScratch
                   pure (ampMul, fOct, v)
                 else pure (1, filtModOct, v)
 
@@ -232,28 +230,20 @@ mixOneVoice srF chunkFrames out instGain channelGain channelPan modWheel bendRat
 --  * ampMul: linear amplitude multiplier (>=0)
 computeMods
   :: Int
-  -> AudioState
   -> Float          -- current lfo1 value
   -> Float          -- envAmp [0..1]
   -> Voice
   -> MV.IOVector Float  -- pitchCentsScratch (len maxLayers)
   -> MV.IOVector Float  -- pitchModRatOut (len maxLayers), written
   -> IO (Float, Float)
-computeMods maxRoutes st lfo1 envAmp v pitchCentsScratch pitchModRatOut = do
+computeMods maxRoutes lfo1 envAmp v pitchCentsScratch pitchModRatOut = do
   -- sources
   let keyTrack = keyTrack01 (vNoteHz v)   -- [0..1]
       envFilt = case vFiltEnv v of
                   Nothing -> 0
                   Just fe -> eLevel fe
 
-  routes <-
-    case vInstrId v of
-      Nothing -> pure []
-      Just iid -> do
-        mi <- lookupInstrument iid st
-        pure $ case mi of
-          Nothing -> []
-          Just inst -> take maxRoutes (iModRoutes inst)
+  let routes = take maxRoutes (vModRoutes v)
 
   let clearPitchCents i
         | i >= maxLayers = pure ()

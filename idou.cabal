@@ -28,6 +28,7 @@ executable idou
                   , src
   main-is:          Main.hs
   other-modules:  Audio.Config
+                  Audio.Patch
                   Sound.Miniaudio
                   Sound.Miniaudio.RingBuffer
                   Engine.Core.Thread
@@ -67,6 +68,7 @@ test-suite idou-tests
                   , src
   main-is:          Main.hs
   other-modules:    Audio.Config
+                    Audio.Patch
                     Engine.Core.Queue
                     Midi.Control
                     Audio.Types

@@ -264,13 +264,15 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
                 , vFiltTick = 0
                 , vNoteHz = freqHz
                 , vHoldRemain = holdFrames
-                , vBaseAmpL = baseL
-                , vBaseAmpR = baseR
-                , vAmpL = ampL
-                , vAmpR = ampR
-                , vADSR = adsr'
-                , vEnv = env0
-                , vNoteKey = Nothing
+                 , vBaseAmpL = baseL
+                 , vBaseAmpR = baseR
+                 , vAmpL = ampL
+                 , vAmpR = ampR
+                 , vInstrGain = 1
+                 , vModRoutes = []
+                 , vADSR = adsr'
+                 , vEnv = env0
+                 , vNoteKey = Nothing
                 , vNoteInstanceId = Nothing
                 , vVelocity = 1
                 , vInstrId = Nothing
@@ -299,9 +301,8 @@ applyInstrumentToActiveVoices srW iid inst st = do
         | i >= n = pure ()
         | otherwise = do
             v <- MV.read vec i
-            if vInstrId v /= Just iid
-              then go (i+1)
-              else do
+            if vInstrId v == Just iid
+              then do
                 let baseHz = vNoteHz v
 
                 writeLayerGains spread layerN (vLayerGainL v) (vLayerGainR v)
@@ -327,12 +328,10 @@ applyInstrumentToActiveVoices srW iid inst st = do
 
                 updateLayer 0
 
-                -- apply iGain live; keep velocity baked into vBaseAmp* already
                 let ampL' = vBaseAmpL v * iGain inst
                     ampR' = vBaseAmpR v * iGain inst
                     adsr' = iAdsrDefault inst
-
-                let (mfilt', mfenv') =
+                    (mfilt', mfenv') =
                       case iFilter inst of
                         Nothing -> (Nothing, Nothing)
                         Just spec ->
@@ -347,7 +346,7 @@ applyInstrumentToActiveVoices srW iid inst st = do
                                   Nothing -> filterStateInit srF baseHz spec
                                   Just fs0 ->
                                     let baseCutoff = keyTrackedBaseCutoff baseHz spec
-                                        qEff      = fQ spec
+                                        qEff = fQ spec
                                         fs1 = fs0 { fsSpec = spec }
                                     in filterRetune srF baseCutoff qEff fs1
                           in (Just fs', env')
@@ -356,13 +355,15 @@ applyInstrumentToActiveVoices srW iid inst st = do
                   { vOscCount = layerN
                   , vAmpL = ampL'
                   , vAmpR = ampR'
+                  , vInstrGain = iGain inst
+                  , vModRoutes = iModRoutes inst
                   , vADSR = adsr'
                   , vFilter = mfilt'
                   , vFiltEnv = mfenv'
                   , vFiltTick = 0
                   }
-
                 go (i+1)
+              else go (i+1)
 
   go 0
   pure st
@@ -478,16 +479,18 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
                 in (Just fs', env')
 
       MV.write (stVoices st) ix v
-        { vOscCount = layerN
-        , vNoteHz = baseHz
-        , vHoldRemain = holdFrames
-        , vBaseAmpL = baseL'
-        , vBaseAmpR = baseR'
-        , vAmpL = ampL'
-        , vAmpR = ampR'
-        , vADSR = adsr'
-        , vEnv = envAmp'
-        , vFilter = mfilt'
+         { vOscCount = layerN
+         , vNoteHz = baseHz
+         , vHoldRemain = holdFrames
+         , vBaseAmpL = baseL'
+         , vBaseAmpR = baseR'
+         , vAmpL = ampL'
+         , vAmpR = ampR'
+         , vInstrGain = iGain inst
+         , vModRoutes = iModRoutes inst
+         , vADSR = adsr'
+         , vEnv = envAmp'
+         , vFilter = mfilt'
         , vFiltEnv = mfenv'
         , vFiltTick = 0
         , vNoteKey = Just key
@@ -547,13 +550,15 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
                 , vFiltTick = 0
                 , vNoteHz = baseHz
                 , vHoldRemain = holdFrames
-                , vBaseAmpL = baseL'
-                , vBaseAmpR = baseR'
-                , vAmpL = ampL
-                , vAmpR = ampR
-                , vADSR = adsr'
-                , vEnv = env0
-                , vNoteKey = Just key
+                 , vBaseAmpL = baseL'
+                 , vBaseAmpR = baseR'
+                 , vAmpL = ampL
+                 , vAmpR = ampR
+                 , vInstrGain = iGain inst
+                 , vModRoutes = iModRoutes inst
+                 , vADSR = adsr'
+                 , vEnv = env0
+                 , vNoteKey = Just key
                 , vNoteInstanceId = Just instId
                 , vVelocity = vel'
                 , vInstrId = Just iid
@@ -638,13 +643,15 @@ addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
           , vFiltTick = 0
           , vNoteHz = baseHz
           , vHoldRemain = holdFrames
-          , vBaseAmpL = baseL'
-          , vBaseAmpR = baseR'
-          , vAmpL = ampL
-          , vAmpR = ampR
-          , vADSR = adsr'
-          , vEnv = env0
-          , vNoteKey = Just key
+           , vBaseAmpL = baseL'
+           , vBaseAmpR = baseR'
+           , vAmpL = ampL
+           , vAmpR = ampR
+           , vInstrGain = iGain inst
+           , vModRoutes = iModRoutes inst
+           , vADSR = adsr'
+           , vEnv = env0
+           , vNoteKey = Just key
           , vNoteInstanceId = Just instId
           , vVelocity = vel'
           , vInstrId = Just iid
