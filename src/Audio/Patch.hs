@@ -4,6 +4,7 @@ module Audio.Patch
   ( defaultMidiProgram
   , gmPercussionChannel
   , gmChannelInstrument
+  , gmDrumInstrument
   , gmProgramInstrument
   ) where
 
@@ -20,8 +21,48 @@ gmPercussionChannel = 9
 
 gmChannelInstrument ∷ Int → Int → Instrument
 gmChannelInstrument ch program
-  | ch == gmPercussionChannel = percussionPatch
+  | ch == gmPercussionChannel = gmDrumInstrument 36
   | otherwise = gmProgramInstrument program
+
+gmDrumInstrument ∷ Int → Instrument
+gmDrumInstrument key =
+  case key of
+    35 -> kickPatch 0.92
+    36 -> kickPatch 1.0
+    37 -> rimPatch
+    38 -> snarePatch 0.0
+    39 -> clapPatch
+    40 -> snarePatch 0.2
+    41 -> tomPatch (-0.35)
+    42 -> hatPatch False
+    43 -> tomPatch (-0.15)
+    44 -> pedalHatPatch
+    45 -> tomPatch 0.05
+    46 -> hatPatch True
+    47 -> tomPatch 0.2
+    48 -> tomPatch 0.38
+    49 -> crashPatch 0.0
+    50 -> tomPatch 0.55
+    51 -> ridePatch 0.0
+    52 -> crashPatch 0.2
+    53 -> rideBellPatch
+    54 -> tambourinePatch
+    55 -> crashPatch 0.4
+    56 -> cowbellPatch
+    57 -> crashPatch 0.7
+    58 -> clapPatch
+    59 -> ridePatch 0.4
+    60 -> bongoPatch 0.0
+    61 -> bongoPatch 0.2
+    62 -> congaPatch 0.0
+    63 -> congaPatch 0.2
+    64 -> congaPatch 0.35
+    _
+      | key < 35 -> kickPatch 0.88
+      | key < 41 -> snarePatch 0.1
+      | key < 49 -> tomPatch 0.15
+      | key < 57 -> crashPatch 0.25
+      | otherwise -> percussionPatch
 
 gmProgramInstrument ∷ Int → Instrument
 gmProgramInstrument program =
@@ -96,6 +137,19 @@ bpFilter cutoffHz q keyTrack envAmount envAdsr =
     , fQEnvAmount = 0
     }
 
+hpFilter ∷ Float → Float → Float → Float → ADSR → FilterSpec
+hpFilter cutoffHz q keyTrack envAmount envAdsr =
+  FilterSpec
+    { fType = FHP
+    , fCutoffHz = cutoffHz
+    , fQ = q
+    , fSlope = S12
+    , fKeyTrack = KeyTrack keyTrack
+    , fEnvAmountOct = envAmount
+    , fEnvADSR = envAdsr
+    , fQEnvAmount = 0
+    }
+
 mkPatch
   ∷ [OscLayer]
   → Float
@@ -117,6 +171,17 @@ mkPatch layers spread adsr gain filt routes polyMax =
     , iPolyMax = polyMax
     , iVoiceSteal = StealQuietest
     }
+
+drumPatch
+  ∷ [OscLayer]
+  → Float
+  → ADSR
+  → Float
+  → Maybe FilterSpec
+  → [ModRoute]
+  → Instrument
+drumPatch layers spread adsr gain filt routes =
+  mkPatch layers spread adsr gain filt routes 20
 
 lfoPitch ∷ Int → Float → ModRoute
 lfoPitch ix cents = ModRoute ModSrcLfo1 (ModDstLayerPitchCents ix) cents
@@ -396,7 +461,7 @@ soundFxPatch variant =
 percussionPatch ∷ Instrument
 percussionPatch =
   let filt = bpFilter 1800 1.3 0.15 1.2 (ADSR 0.001 0.05 0 0.05)
-  in mkPatch
+  in drumPatch
        [ osc WaveTriangle rootPitch 0.56
        , osc WaveSquare (octavePitch (-1)) 0.28
        , osc WaveSaw rootPitch 0.16
@@ -406,4 +471,208 @@ percussionPatch =
        1.0
        (Just filt)
        [envPitch 0 (-36)]
-       16
+
+kickPatch ∷ Float → Instrument
+kickPatch weight =
+  let filt = lpFilter 260 0.9 0.15 0.8 (ADSR 0.001 0.08 0 0.06)
+  in drumPatch
+       [ osc WaveSine (octavePitch (-1)) 0.68
+       , osc WaveTriangle rootPitch 0.22
+       , osc WaveSquare (octavePitch (-2)) 0.10
+       ]
+       0.02
+       (ADSR 0.001 0.10 0 0.10)
+       (0.92 + 0.16 * weight)
+       (Just filt)
+       [envPitch 0 (-40), envPitch 1 (-22)]
+
+snarePatch ∷ Float → Instrument
+snarePatch variant =
+  let filt = bpFilter (1800 + 500 * variant) 1.4 0.25 0.45 (ADSR 0.001 0.06 0 0.06)
+  in drumPatch
+       [ osc WaveTriangle rootPitch 0.28
+       , osc WaveSquare (semiPitch 19) 0.26
+       , osc WaveSaw (semiPitch 31) 0.24
+       , osc WaveSquare (semiPitch (43 + 8 * variant)) 0.16
+       ]
+       0.12
+       (ADSR 0.001 0.13 0 0.12)
+       0.92
+       (Just filt)
+       [envPitch 0 (-10)]
+
+clapPatch ∷ Instrument
+clapPatch =
+  let filt = hpFilter 2400 0.8 0.05 0.30 (ADSR 0.001 0.05 0 0.08)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 24) 0.34
+       , osc WaveSaw (semiPitch 31) 0.26
+       , osc WaveSquare (semiPitch 43) 0.22
+       , osc WaveTriangle (semiPitch 55) 0.10
+       ]
+       0.18
+       (ADSR 0.001 0.17 0 0.18)
+       0.80
+       (Just filt)
+       [envPitch 0 (-7), envPitch 1 (-5)]
+
+rimPatch ∷ Instrument
+rimPatch =
+  let filt = bpFilter 2300 1.6 0.1 0.25 (ADSR 0.001 0.03 0 0.04)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 24) 0.44
+       , osc WaveTriangle (semiPitch 36) 0.30
+       , osc WaveSine (semiPitch 48) 0.16
+       ]
+       0.08
+       (ADSR 0.001 0.05 0 0.06)
+       0.74
+       (Just filt)
+       [envPitch 0 (-14)]
+
+hatPatch ∷ Bool → Instrument
+hatPatch isOpen =
+  let decay = if isOpen then 0.26 else 0.08
+      release = if isOpen then 0.22 else 0.05
+      filt = hpFilter 4200 0.9 0.02 0.12 (ADSR 0.001 0.03 0 0.03)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 30) 0.30
+       , osc WaveSquare (semiPitch 43) 0.24
+       , osc WaveSaw (semiPitch 51) 0.24
+       , osc WaveTriangle (semiPitch 58) 0.14
+       ]
+       0.16
+       (ADSR 0.001 decay 0 release)
+       (if isOpen then 0.66 else 0.58)
+       (Just filt)
+       []
+
+pedalHatPatch ∷ Instrument
+pedalHatPatch =
+  let filt = hpFilter 3600 1.0 0.02 0.18 (ADSR 0.001 0.03 0 0.03)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 24) 0.40
+       , osc WaveSaw (semiPitch 36) 0.26
+       , osc WaveTriangle (semiPitch 48) 0.12
+       ]
+       0.12
+       (ADSR 0.001 0.05 0 0.05)
+       0.56
+       (Just filt)
+       []
+
+tomPatch ∷ Float → Instrument
+tomPatch position =
+  let pitch = semiPitch (6 * position)
+      filt = lpFilter (700 + 450 * position) 0.9 0.55 0.35 (ADSR 0.001 0.08 0 0.06)
+  in drumPatch
+       [ osc WaveTriangle pitch 0.54
+       , osc WaveSine (semiPitch (12 * position)) 0.24
+       , osc WaveSaw (octavePitch (-1)) 0.16
+       ]
+       0.08
+       (ADSR 0.001 0.16 0 0.14)
+       0.86
+       (Just filt)
+       [envPitch 0 (-20), envPitch 1 (-10)]
+
+crashPatch ∷ Float → Instrument
+crashPatch brightness =
+  let filt = hpFilter (3400 + 400 * brightness) 0.8 0.02 0.08 (ADSR 0.001 0.04 0 0.06)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 29) 0.26
+       , osc WaveSaw (semiPitch 40) 0.24
+       , osc WaveSquare (semiPitch 52) 0.22
+       , osc WaveTriangle (semiPitch 59) 0.16
+       ]
+       0.28
+       (ADSR 0.001 (0.22 + 0.12 * brightness) 0 (0.34 + 0.12 * brightness))
+       0.74
+       (Just filt)
+       []
+
+ridePatch ∷ Float → Instrument
+ridePatch brightness =
+  let filt = hpFilter (3000 + 350 * brightness) 0.9 0.02 0.06 (ADSR 0.001 0.03 0 0.06)
+  in drumPatch
+       [ osc WaveTriangle (semiPitch 19) 0.22
+       , osc WaveSquare (semiPitch 31) 0.24
+       , osc WaveSaw (semiPitch 43) 0.20
+       , osc WaveSquare (semiPitch 55) 0.16
+       ]
+       0.22
+       (ADSR 0.001 (0.18 + 0.08 * brightness) 0 (0.30 + 0.12 * brightness))
+       0.68
+       (Just filt)
+       []
+
+rideBellPatch ∷ Instrument
+rideBellPatch =
+  let filt = bpFilter 2600 1.2 0.05 0.20 (ADSR 0.001 0.05 0 0.08)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 19) 0.38
+       , osc WaveSine (semiPitch 31) 0.24
+       , osc WaveTriangle (semiPitch 43) 0.18
+       ]
+       0.10
+       (ADSR 0.001 0.14 0 0.14)
+       0.66
+       (Just filt)
+       [envPitch 0 (-9)]
+
+tambourinePatch ∷ Instrument
+tambourinePatch =
+  let filt = hpFilter 3600 1.0 0.02 0.16 (ADSR 0.001 0.04 0 0.05)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 24) 0.28
+       , osc WaveSaw (semiPitch 36) 0.24
+       , osc WaveTriangle (semiPitch 48) 0.18
+       , osc WaveSquare (semiPitch 60) 0.10
+       ]
+       0.20
+       (ADSR 0.001 0.13 0 0.16)
+       0.64
+       (Just filt)
+       []
+
+cowbellPatch ∷ Instrument
+cowbellPatch =
+  let filt = bpFilter 1800 1.3 0.05 0.15 (ADSR 0.001 0.04 0 0.08)
+  in drumPatch
+       [ osc WaveSquare (semiPitch 19) 0.34
+       , osc WaveSquare (semiPitch 31) 0.30
+       , osc WaveTriangle (semiPitch 43) 0.16
+       ]
+       0.12
+       (ADSR 0.001 0.11 0 0.13)
+       0.72
+       (Just filt)
+       []
+
+bongoPatch ∷ Float → Instrument
+bongoPatch variant =
+  let filt = bpFilter (900 + 250 * variant) 1.1 0.25 0.28 (ADSR 0.001 0.05 0 0.06)
+  in drumPatch
+       [ osc WaveTriangle rootPitch 0.52
+       , osc WaveSine (semiPitch (7 + 4 * variant)) 0.22
+       , osc WaveSquare (semiPitch 19) 0.14
+       ]
+       0.08
+       (ADSR 0.001 0.10 0 0.10)
+       0.78
+       (Just filt)
+       [envPitch 0 (-14)]
+
+congaPatch ∷ Float → Instrument
+congaPatch variant =
+  let filt = bpFilter (700 + 220 * variant) 1.0 0.30 0.24 (ADSR 0.001 0.06 0 0.08)
+  in drumPatch
+       [ osc WaveTriangle rootPitch 0.56
+       , osc WaveSine (semiPitch (5 + 3 * variant)) 0.20
+       , osc WaveSaw (semiPitch 12) 0.14
+       ]
+       0.08
+       (ADSR 0.001 0.14 0 0.12)
+       0.78
+       (Just filt)
+       [envPitch 0 (-12)]

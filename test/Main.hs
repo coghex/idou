@@ -15,7 +15,7 @@ import qualified Data.Vector.Mutable as MV
 import Audio.Config (AudioBufferConfig(..), AudioConfig(..), parseAudioConfigText)
 import Audio.Envelope
 import Audio.Oscillator (Osc(..))
-import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmProgramInstrument, gmPercussionChannel)
+import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmDrumInstrument, gmProgramInstrument, gmPercussionChannel)
 import Audio.Thread.InstrumentTable
   ( MidiControls(..)
   , lookupMidiControls
@@ -83,6 +83,7 @@ testCases =
   , TestCase "midi-controller-conversions-are-normalized" testMidiControllerConversionsAreNormalized
   , TestCase "gm-program-map-varies-by-family" testGmProgramMapVariesByFamily
   , TestCase "gm-percussion-channel-ignores-program" testGmPercussionChannelIgnoresProgram
+  , TestCase "gm-drum-map-varies-by-key-family" testGmDrumMapVariesByKeyFamily
   , TestCase "instrument-load-keeps-active-voice-until-live-apply" testInstrumentLoadKeepsActiveVoiceUntilLiveApply
   ]
 
@@ -299,7 +300,21 @@ testGmPercussionChannelIgnoresProgram = do
       melodic = gmChannelInstrument 0 56
   assertEqual "percussion patch should ignore program number" drum0 drum56
   assertBool "percussion patch should differ from melodic patch" (drum0 /= melodic)
-  assertEqual "percussion patch sustain" 0 (aSustain (iAdsrDefault drum0))
+  assertEqual "default percussion preload is kick-like" drum0 (gmDrumInstrument 36)
+
+testGmDrumMapVariesByKeyFamily ∷ IO ()
+testGmDrumMapVariesByKeyFamily = do
+  let kick = gmDrumInstrument 36
+      snare = gmDrumInstrument 38
+      hatClosed = gmDrumInstrument 42
+      hatOpen = gmDrumInstrument 46
+      cowbell = gmDrumInstrument 56
+      bongo = gmDrumInstrument 60
+  assertBool "kick and snare patches should differ" (kick /= snare)
+  assertBool "snare and hihat patches should differ" (snare /= hatClosed)
+  assertBool "closed and open hihat patches should differ" (hatClosed /= hatOpen)
+  assertBool "cowbell and bongo patches should differ" (cowbell /= bongo)
+  assertEqual "kick patch should be short" 0 (aSustain (iAdsrDefault kick))
 
 testInstrumentLoadKeepsActiveVoiceUntilLiveApply ∷ IO ()
 testInstrumentLoadKeepsActiveVoiceUntilLiveApply = do

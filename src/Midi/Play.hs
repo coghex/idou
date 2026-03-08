@@ -16,7 +16,7 @@ import Data.Word (Word64)
 
 import qualified Data.Map.Strict as M
 
-import Audio.Patch (gmChannelInstrument)
+import Audio.Patch (gmChannelInstrument, gmDrumInstrument, gmPercussionChannel)
 import Audio.Thread (AudioSystem, sendAudio)
 import Audio.Types
   ( AudioMsg(..)
@@ -122,6 +122,9 @@ playMidiFile chanMap sys fp = do
               let iid = channelToInstrument chanMap ch
                   velF = velToFloat vel
                   (instId, instCounter') = freshInstance instCounter
+
+              when (ch == gmPercussionChannel) $
+                sendAudio sys (AudioLoadInstrument iid (gmDrumInstrument key))
 
               sendAudio sys $
                 AudioNoteOn
