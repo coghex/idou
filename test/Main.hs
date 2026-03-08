@@ -5,15 +5,17 @@ module Main where
 import Control.Exception (SomeException, try)
 import Control.Monad (forM, unless, when)
 import Data.List (find, intercalate, isInfixOf)
+import Data.Word (Word32)
 import Foreign.ForeignPtr (mallocForeignPtrArray)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 
 import qualified Data.Vector.Mutable as MV
 
+import Audio.Config (AudioBufferConfig(..), AudioConfig(..), parseAudioConfigText)
 import Audio.Envelope
 import Audio.Thread.InstrumentTable (setInstrument)
-import Audio.Thread.Types (AudioState(..), Voice(..), sr)
+import Audio.Thread.Types (AudioState(..), Voice(..))
 import Audio.Thread.Voice (addInstrumentNote, releaseInstrumentNote)
 import Audio.Types
 import Engine.Core.Queue (newQueue)
@@ -56,11 +58,56 @@ runTest tc = do
 
 testCases ∷ [TestCase]
 testCases =
-  [ TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
+  [ TestCase "audio-config-parses-yaml-shape" testAudioConfigParsesYamlShape
+  , TestCase "audio-config-rejects-too-small-buffer" testAudioConfigRejectsTooSmallBuffer
+  , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
   , TestCase "release-targets-matching-note-instance" testReleaseTargetsMatchingNoteInstance
   ]
+
+testAudioConfigParsesYamlShape ∷ IO ()
+testAudioConfigParsesYamlShape = do
+  let yamlText =
+        unlines
+          [ "audio:"
+          , "  sample_rate: 44100"
+          , "  chunk_frames: 128"
+          , "  max_voices: 64"
+          , "  buffer:"
+          , "    capacity_frames: 2048"
+          , "    target_chunks: 8"
+          ]
+      expected =
+        AudioConfig
+          { acSampleRate = 44100
+          , acChunkFrames = 128
+          , acMaxVoices = 64
+          , acBuffer =
+              AudioBufferConfig
+                { abCapacityFrames = 2048
+                , abTargetChunks = 8
+                }
+          }
+  assertEqual "parsed audio config" (Right expected) (parseAudioConfigText yamlText)
+
+testAudioConfigRejectsTooSmallBuffer ∷ IO ()
+testAudioConfigRejectsTooSmallBuffer = do
+  let yamlText =
+        unlines
+          [ "audio:"
+          , "  sample_rate: 48000"
+          , "  chunk_frames: 512"
+          , "  max_voices: 256"
+          , "  buffer:"
+          , "    capacity_frames: 1024"
+          , "    target_chunks: 4"
+          ]
+  case parseAudioConfigText yamlText of
+    Left err ->
+      assertBool "expected capacity validation error" ("capacity_frames" `isInfixOf` err)
+    Right cfg ->
+      error ("expected config parse failure, got " <> show cfg)
 
 testEnvelopeReleaseReachesDone ∷ IO ()
 testEnvelopeReleaseReachesDone = do
@@ -127,7 +174,7 @@ mkTestHandle = do
   q <- newQueue
   pure AudioHandle
     { audioQueue = q
-    , sampleRate = sr
+    , sampleRate = testSampleRate
     , channels = 2
     }
 
@@ -141,10 +188,16 @@ mkTestState = do
   legAmpRetrigVec <- MV.replicate 256 False
   vibRateVec <- MV.replicate 256 0
   vibDepthVec <- MV.replicate 256 0
+  pitchModScratch <- MV.replicate 4 1
+  pitchCentsScratch <- MV.replicate 4 0
   pure AudioState
     { stVoices = voices
     , stActiveCount = 0
     , stMixBuf = mixBuf
+    , stSampleRate = testSampleRate
+    , stTargetBufferFrames = 2048
+    , stPitchModScratch = pitchModScratch
+    , stPitchCentsScratch = pitchCentsScratch
     , stInstruments = instVec
     , stGlideSec = glideVec
     , stLegFiltRetrig = legFiltRetrigVec
@@ -178,13 +231,16 @@ findVoice instId voices =
     Just voice -> pure voice
     Nothing -> error ("missing voice with instance " <> show instId)
 
+testSampleRate ∷ Word32
+testSampleRate = 48000
+
 stepEnvN ∷ Int → ADSR → EnvState → EnvState
 stepEnvN n adsr = go n
   where
     go steps st
       | steps <= 0 = st
       | otherwise =
-          let (st', _) = envStep (fromIntegral sr) adsr st
+          let (st', _) = envStep (fromIntegral testSampleRate) adsr st
           in go (steps - 1) st'
 
 assertBool ∷ String → Bool → IO ()

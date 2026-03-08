@@ -9,6 +9,7 @@ import System.Environment (getArgs)
 import System.Exit (exitSuccess)
 import System.IO
 
+import Audio.Config (audioConfigPath, loadAudioConfig)
 import Audio.Thread
 import Audio.Types
 import Audio.Envelope
@@ -19,8 +20,9 @@ main ∷ IO ()
 main = do
   args <- getArgs
   case args of
-    [midiPath] ->
-      bracket startAudioSystem stopAudioSystem $ \sys -> do
+    [midiPath] -> do
+      audioCfg <- loadAudioConfig audioConfigPath
+      bracket (startAudioSystem audioCfg) stopAudioSystem $ \sys -> do
         -- Preload instruments 0..15 (MIDI channels) with the same patch for now.
         preloadChannels sys
 
@@ -32,7 +34,7 @@ main = do
         withRawStdin $ waitForQuit sys
 
     _ -> do
-      putStrLn "usage: your-exe <file.mid>"
+      putStrLn "usage: idou <file.mid>"
       exitSuccess
 
 --------------------------------------------------------------------------------

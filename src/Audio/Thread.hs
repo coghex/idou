@@ -18,6 +18,7 @@ import Foreign.C
 
 import qualified Data.Vector.Mutable as MV
 
+import Audio.Config (AudioConfig(..), AudioBufferConfig(..))
 import Engine.Core.Thread
 import Engine.Core.Queue as Q
 import Audio.Types
@@ -42,15 +43,18 @@ data AudioSystem = AudioSystem
 sendAudio ∷ AudioSystem → AudioMsg → IO ()
 sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
 
-startAudioSystem ∷ IO AudioSystem
-startAudioSystem = do
-  let ch  = 2     ∷ Word32
-      chunkFrames = 256 ∷ Int
-      rbCapacityFrames = 8192 ∷ Word32
-      maxVoices = 256 ∷ Int
+startAudioSystem ∷ AudioConfig → IO AudioSystem
+startAudioSystem audioCfg = do
+  let ch  = 2 ∷ Word32
+      sampleRate = acSampleRate audioCfg
+      chunkFrames = acChunkFrames audioCfg
+      bufferCfg = acBuffer audioCfg
+      rbCapacityFrames = abCapacityFrames bufferCfg
+      targetBufferFrames = fromIntegral (chunkFrames * abTargetChunks bufferCfg) ∷ Word32
+      maxVoices = acMaxVoices audioCfg
 
   q <- Q.newQueue
-  let h = AudioHandle q sr ch
+  let h = AudioHandle q sampleRate ch
   rb <- createRingBuffer rbCapacityFrames ch
   (underrunRef, udStable) <- (`onException` rbDestroy rb) $ do
     underrunRef <- newIORef 0
@@ -77,7 +81,7 @@ startAudioSystem = do
   cbFun <- mkMaDataCallback cb `onException` cleanupStable
   let cleanupCallback = freeHaskellFunPtr cbFun >> cleanupStable
 
-  cfg <- createDeviceConfig ch cbFun udPtr `onException` cleanupCallback
+  cfg <- createDeviceConfig ch sampleRate cbFun udPtr `onException` cleanupCallback
   let cleanupConfig = hs_ma_device_config_free cfg >> cleanupCallback
 
   dev <- createDevice `onException` cleanupConfig
@@ -95,9 +99,11 @@ startAudioSystem = do
     legAmpRetrigVec <- MV.replicate 256 False
     vibRateVec <- MV.replicate 256 0
     vibDepthVec <- MV.replicate 256 0
+    pitchModScratch <- MV.replicate maxLayers 1
+    pitchCentsScratch <- MV.replicate maxLayers 0
 
     mixBuf <- mallocForeignPtrArray (chunkFrames * 2)
-    let st0 = AudioState voicesVec 0 mixBuf instVec glideVec legFiltRetrigVec legAmpRetrigVec vibRateVec vibDepthVec 0
+    let st0 = AudioState voicesVec 0 mixBuf sampleRate targetBufferFrames pitchModScratch pitchCentsScratch instVec glideVec legFiltRetrigVec legAmpRetrigVec vibRateVec vibDepthVec 0
     st1 <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st0
     stRef <- newIORef st1
 
@@ -129,11 +135,12 @@ createRingBuffer capacityFrames channels = do
 
 createDeviceConfig
   ∷ Word32
+  → Word32
   → FunPtr MaDataCallback
   → Ptr ()
   → IO (Ptr MaDeviceConfig)
-createDeviceConfig channels cbFun udPtr = do
-  cfg <- hs_ma_device_config_init_playback MaFormatF32 channels sr cbFun udPtr
+createDeviceConfig channels sampleRate cbFun udPtr = do
+  cfg <- hs_ma_device_config_init_playback MaFormatF32 channels sampleRate cbFun udPtr
   when (cfg == nullPtr) $ error "Failed to allocate ma_device_config"
   pure cfg
 

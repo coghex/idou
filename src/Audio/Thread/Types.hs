@@ -4,7 +4,6 @@ module Audio.Thread.Types
   ( Voice(..)
   , AudioState(..)
   , AudioUserData(..)
-  , sr
   , clamp01
   , maxLayers
   ) where
@@ -22,9 +21,6 @@ import Audio.Envelope (ADSR, EnvState)
 import Audio.Oscillator (Osc)
 import Audio.Filter (FilterState)
 import Sound.Miniaudio.RingBuffer (MaRB)
-
-sr ∷ Word32
-sr = 48000
 
 maxLayers ∷ Int
 maxLayers = 4
@@ -70,6 +66,10 @@ data AudioState = AudioState
   { stVoices         ∷ !(MV.IOVector Voice)
   , stActiveCount    ∷ !Int
   , stMixBuf         ∷ !(ForeignPtr CFloat)
+  , stSampleRate     ∷ !Word32
+  , stTargetBufferFrames ∷ !Word32
+  , stPitchModScratch ∷ !(MV.IOVector Float)
+  , stPitchCentsScratch ∷ !(MV.IOVector Float)
   , stInstruments    ∷ !(MV.IOVector (Maybe Instrument))
   , stGlideSec       ∷ !(MV.IOVector Float)
   , stLegFiltRetrig  ∷ !(MV.IOVector Bool)

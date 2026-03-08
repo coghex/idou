@@ -27,7 +27,8 @@ executable idou
   hs-source-dirs:   app
                   , src
   main-is:          Main.hs
-  other-modules:  Sound.Miniaudio
+  other-modules:  Audio.Config
+                  Sound.Miniaudio
                   Sound.Miniaudio.RingBuffer
                   Engine.Core.Thread
                   Engine.Core.Queue
@@ -64,7 +65,8 @@ test-suite idou-tests
   hs-source-dirs:   test
                   , src
   main-is:          Main.hs
-  other-modules:    Engine.Core.Queue
+  other-modules:    Audio.Config
+                    Engine.Core.Queue
                     Audio.Types
                     Audio.Thread.Types
                     Audio.Thread.Voice
@@ -76,6 +78,7 @@ test-suite idou-tests
                     Audio.Filter.Biquad
                     Sound.Miniaudio.RingBuffer
   build-depends:    base >=4.14 && <5
+                  , containers
                   , stm
                   , vector
   default-language: GHC2024

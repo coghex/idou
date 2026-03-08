@@ -23,7 +23,7 @@ import Audio.Types (Instrument(..), ModRoute(..), ModSrc(..), ModDst(..))
 
 renderIfNeeded ∷ Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded rb chunkFrames st0 = do
-  let targetFrames = fromIntegral (chunkFrames * 8) ∷ Word32
+  let targetFrames = stTargetBufferFrames st0
       loop st = do
         availRead  <- rbAvailableRead rb
         availWrite <- rbAvailableWrite rb
@@ -42,7 +42,7 @@ renderChunkFrames rb framesNow st = do
         samples = framesNow * 2
         bytes = samples * sizeOf (undefined ∷ CFloat)
     fillBytes out 0 bytes
-    mixVoices (fromIntegral sr) framesNow out st
+    mixVoices (fromIntegral (stSampleRate st)) framesNow out st
 
   withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
@@ -79,8 +79,8 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
       modEvery = 16 ∷ Int
       centsToRatio c = 2 ** (c / 1200)
       maxRoutes = 8 ∷ Int
-
-  pitchModRat0 <- MV.replicate maxLayers 1
+      pitchModRatScratch = stPitchModScratch st
+      pitchCentsScratch = stPitchCentsScratch st
 
   let go :: Int -> Ptr CFloat -> Int -> Float -> Voice -> IO Voice
       go i p tick filtModOct v
@@ -113,12 +113,12 @@ mixOneVoice srF chunkFrames out vibRateHz vibDepthCents st v0 = do
             (ampModMul, filtModOct', v') <-
               if tick `mod` modEvery == 0
                 then do
-                  (ampMul, fOct) <- computeMods maxRoutes st vibRateHz phL1 envAmp v pitchModRat0
+                  (ampMul, fOct) <- computeMods maxRoutes st vibRateHz phL1 envAmp v pitchCentsScratch pitchModRatScratch
                   pure (ampMul, fOct, v)
                 else pure (1, filtModOct, v)
 
             let nOsc = vOscCount v'
-            (xL0, xR0) <- stepOscsSync4StereoMod srF nOsc vibRatio pitchModRat0 v'
+            (xL0, xR0) <- stepOscsSync4StereoMod srF nOsc vibRatio pitchModRatScratch v'
             let xMono = 0.5 * (xL0 + xR0)
 
             let (mfilt1, mfenv1, tick1, x1) =
@@ -186,9 +186,10 @@ computeMods
   -> Float          -- lfo phase [0..1]
   -> Float          -- envAmp [0..1]
   -> Voice
+  -> MV.IOVector Float  -- pitchCentsScratch (len maxLayers)
   -> MV.IOVector Float  -- pitchModRatOut (len maxLayers), written
   -> IO (Float, Float)
-computeMods maxRoutes st _lfoRateHz lfoPhase envAmp v pitchModRatOut = do
+computeMods maxRoutes st _lfoRateHz lfoPhase envAmp v pitchCentsScratch pitchModRatOut = do
   -- sources
   let lfo1 = sin (2*pi*lfoPhase)          -- [-1..1]
       keyTrack = keyTrack01 (vNoteHz v)   -- [0..1]
@@ -205,12 +206,15 @@ computeMods maxRoutes st _lfoRateHz lfoPhase envAmp v pitchModRatOut = do
           Nothing -> []
           Just inst -> take maxRoutes (iModRoutes inst)
 
-  pitchCents <- MV.replicate maxLayers 0
+  let clearPitchCents i
+        | i >= maxLayers = pure ()
+        | otherwise = MV.write pitchCentsScratch i 0 >> clearPitchCents (i+1)
+  clearPitchCents 0
 
   let addPitchCents ix c =
         when (ix >= 0 && ix < maxLayers) $ do
-          cur <- MV.read pitchCents ix
-          MV.write pitchCents ix (cur + c)
+          cur <- MV.read pitchCentsScratch ix
+          MV.write pitchCentsScratch ix (cur + c)
 
   let loop rs ampAcc filtAcc =
         case rs of
@@ -235,7 +239,7 @@ computeMods maxRoutes st _lfoRateHz lfoPhase envAmp v pitchModRatOut = do
   let goIx i
         | i >= maxLayers = pure ()
         | otherwise = do
-            c <- MV.read pitchCents i
+            c <- MV.read pitchCentsScratch i
             MV.write pitchModRatOut i (centsToRatio c)
             goIx (i+1)
   goIx 0

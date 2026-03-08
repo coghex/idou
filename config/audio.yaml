@@ -1,0 +1,7 @@
+audio:
+  sample_rate: 48000
+  chunk_frames: 256
+  max_voices: 256
+  buffer:
+    capacity_frames: 8192
+    target_chunks: 8
