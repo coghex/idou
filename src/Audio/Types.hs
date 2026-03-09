@@ -305,6 +305,19 @@ data ScheduledAudioAction
       , saClipPan ∷ !Float
       , saClipLoop ∷ !Bool
       }
+  | ScheduledNoteOn
+      { saInstrumentId ∷ !InstrumentId
+      , saAmp ∷ !Float
+      , saPan ∷ !Float
+      , saNoteKey ∷ !NoteKey
+      , saNoteInstanceId ∷ !NoteInstanceId
+      , saVelocity ∷ !Float
+      , saAdsrOverride ∷ !(Maybe ADSR)
+      }
+  | ScheduledNoteOff
+      { saInstrumentId ∷ !InstrumentId
+      , saNoteInstanceId ∷ !NoteInstanceId
+      }
   | ScheduledStopClip
       { saClipId ∷ !ClipId
       }

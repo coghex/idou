@@ -128,6 +128,7 @@ testCases =
   , TestCase "clip-finished-emits-audio-event" testClipFinishedEmitsAudioEvent
   , TestCase "note-finished-emits-audio-event" testNoteFinishedEmitsAudioEvent
   , TestCase "scheduled-bus-gain-switches-at-frame" testScheduledBusGainSwitchesAtFrame
+  , TestCase "scheduled-note-on-off-trigger-at-frames" testScheduledNoteOnOffTriggerAtFrames
   , TestCase "wav-decoder-loads-stereo-f32" testWavDecoderLoadsStereoF32
   ]
 
@@ -694,6 +695,52 @@ testScheduledBusGainSwitchesAtFrame = do
       "schedule trigger event should be emitted"
       (AudioEventScheduleTriggered 2 (ScheduledSetBusGain AudioBusMusic 0) `elem` events)
 
+testScheduledNoteOnOffTriggerAtFrames ∷ IO ()
+testScheduledNoteOnOffTriggerAtFrames = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      noteInst = NoteInstanceId 77
+      noteKey = NoteKey 60
+      inst = (mkInstrument Poly) { iAdsrDefault = ADSR 0 0 1 0.5 }
+      noteOnAction =
+        ScheduledNoteOn
+          { saInstrumentId = iid
+          , saAmp = 1
+          , saPan = 0
+          , saNoteKey = noteKey
+          , saNoteInstanceId = noteInst
+          , saVelocity = 0.8
+          , saAdsrOverride = Nothing
+          }
+      noteOffAction =
+        ScheduledNoteOff
+          { saInstrumentId = iid
+          , saNoteInstanceId = noteInst
+          }
+  st1 <- setInstrument iid inst st0
+  let st2 =
+        st1
+          { stScheduled =
+              [ ScheduledItem 1 1 noteOnAction
+              , ScheduledItem 3 2 noteOffAction
+              ]
+          }
+  bracket (rbCreateF32 16 2) rbDestroy $ \rb -> do
+    (st3, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 4 st2
+    assertEqual "transport should advance by rendered frames" 4 (stTransportFrame st3)
+    assertEqual "scheduled note-on should allocate one active voice" 1 (stActiveCount st3)
+    v <- MV.read (stVoices st3) 0
+    assertEqual "voice should keep scheduled note instance id" (Just noteInst) (vNoteInstanceId v)
+    assertEqual "scheduled note-off should move envelope to release stage" EnvRelease (eStage (vEnv v))
+    events <- drainAudioEvents (audioEventQueue handle)
+    assertBool
+      "note-on schedule trigger event should be emitted"
+      (AudioEventScheduleTriggered 1 noteOnAction `elem` events)
+    assertBool
+      "note-off schedule trigger event should be emitted"
+      (AudioEventScheduleTriggered 3 noteOffAction `elem` events)
+
 testWavDecoderLoadsStereoF32 ∷ IO ()
 testWavDecoderLoadsStereoF32 =
   withTempWav [0, 32767, -32768, 16384] $ \path -> do
@@ -744,18 +791,23 @@ runScheduledForTest action st =
       in if active >= cap
            then pure st
            else do
-             MV.write
-               (stClipSources st)
-               active
-               ClipSource
-                 { csClipId = cid
-                 , csBus = bus
-                 , csGainL = gainL
-                 , csGainR = gainR
-                 , csFramePos = 0
-                 , csLoop = loop
-                 }
-             pure st { stClipActiveCount = active + 1 }
+              MV.write
+                (stClipSources st)
+                active
+                ClipSource
+                  { csClipId = cid
+                  , csBus = bus
+                  , csGainL = gainL
+                  , csGainR = gainR
+                  , csFramePos = 0
+                  , csLoop = loop
+                  }
+              pure st { stClipActiveCount = active + 1 }
+    ScheduledNoteOn iid amp pan key noteInst vel adsrOverride -> do
+      handle <- mkTestHandle
+      addInstrumentNote handle st iid amp pan key noteInst vel adsrOverride
+    ScheduledNoteOff iid noteInst ->
+      releaseInstrumentNote iid noteInst st
     ScheduledStopClip cid -> do
       let vec = stClipSources st
           go i st'

@@ -29,9 +29,13 @@ import Audio.Types
   , AudioEvent
   , AudioMsg(..)
   , ClipId
+  , InstrumentId
+  , NoteInstanceId
+  , NoteKey
   , ScheduledAudioAction(..)
   , sampleRate
   )
+import Audio.Envelope (ADSR)
 import Engine.Core.Queue (Queue)
 import qualified Engine.Core.Queue as Q
 import Engine.Core.Thread (ThreadControl(..), ThreadState(..))
@@ -56,6 +60,19 @@ data PlayerMsg
   | PlayerScheduleBusGainNextBar
       { pmGainBus ∷ !AudioBus
       , pmGainValue ∷ !Float
+      }
+  | PlayerScheduleNoteOnNextBar
+      { pmNoteOnInstrumentId ∷ !InstrumentId
+      , pmNoteOnAmp ∷ !Float
+      , pmNoteOnPan ∷ !Float
+      , pmNoteOnKey ∷ !NoteKey
+      , pmNoteOnInstanceId ∷ !NoteInstanceId
+      , pmNoteOnVelocity ∷ !Float
+      , pmNoteOnAdsrOverride ∷ !(Maybe ADSR)
+      }
+  | PlayerScheduleNoteOffNextBar
+      { pmNoteOffInstrumentId ∷ !InstrumentId
+      , pmNoteOffInstanceId ∷ !NoteInstanceId
       }
   deriving (Eq, Show)
 
@@ -182,6 +199,43 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
                   (pstBeatsPerBar ps)
                   (pstTempoBpm ps)
               action = ScheduledSetBusGain bus gain
+          scheduleAudioActionAtFrame audioSys frame action
+          Q.writeQueue evQ (PlayerEventScheduled frame action)
+        PlayerScheduleNoteOnNextBar iid amp pan key noteInst vel adsrOverride -> do
+          ps <- readIORef playerStateRef
+          now <- readTransportFrame audioSys
+          let frame =
+                nextBarFrame
+                  now
+                  (sampleRate (asHandle audioSys))
+                  (pstBeatsPerBar ps)
+                  (pstTempoBpm ps)
+              action =
+                ScheduledNoteOn
+                  { saInstrumentId = iid
+                  , saAmp = amp
+                  , saPan = pan
+                  , saNoteKey = key
+                  , saNoteInstanceId = noteInst
+                  , saVelocity = vel
+                  , saAdsrOverride = adsrOverride
+                  }
+          scheduleAudioActionAtFrame audioSys frame action
+          Q.writeQueue evQ (PlayerEventScheduled frame action)
+        PlayerScheduleNoteOffNextBar iid noteInst -> do
+          ps <- readIORef playerStateRef
+          now <- readTransportFrame audioSys
+          let frame =
+                nextBarFrame
+                  now
+                  (sampleRate (asHandle audioSys))
+                  (pstBeatsPerBar ps)
+                  (pstTempoBpm ps)
+              action =
+                ScheduledNoteOff
+                  { saInstrumentId = iid
+                  , saNoteInstanceId = noteInst
+                  }
           scheduleAudioActionAtFrame audioSys frame action
           Q.writeQueue evQ (PlayerEventScheduled frame action)
       processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef

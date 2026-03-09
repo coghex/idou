@@ -556,10 +556,14 @@ setBusGain bus gain st =
     AudioBusSfx -> pure st { stBusSfxGain = clamp01 gain }
 
 applyScheduledAction ∷ AudioHandle → ScheduledAudioAction → AudioState → IO AudioState
-applyScheduledAction _h action st =
+applyScheduledAction h action st =
   case action of
     ScheduledPlayClip cid bus gain pan loop ->
       addClipSource cid bus gain pan loop st
+    ScheduledNoteOn iid amp pan key noteInst vel adsrOverride ->
+      addInstrumentNote h st iid amp pan key noteInst vel adsrOverride
+    ScheduledNoteOff iid noteInst ->
+      releaseInstrumentNote iid noteInst st
     ScheduledStopClip cid ->
       stopClipSourcesByClip cid st
     ScheduledStopBus bus ->
