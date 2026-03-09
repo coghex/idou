@@ -85,6 +85,8 @@ testCases =
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
+  , TestCase "mono-legato-sustain-style-stale-release-is-ignored" testMonoLegatoSustainStyleStaleReleaseIsIgnored
+  , TestCase "mono-legato-sustain-style-current-release-still-works" testMonoLegatoSustainStyleCurrentReleaseStillWorks
   , TestCase "release-targets-matching-note-instance" testReleaseTargetsMatchingNoteInstance
   , TestCase "poly-voice-steal-reuses-released-slot" testPolyVoiceStealReusesReleasedSlot
   , TestCase "release-all-voices-keeps-other-instruments-active" testReleaseAllVoicesKeepsOtherInstrumentsActive
@@ -189,6 +191,40 @@ testMonoLegatoReusesVoiceAndUpdatesOverride = do
   assertEqual "reused voice note key" (Just (NoteKey 67)) (vNoteKey voice)
   assertEqual "reused voice instance" (Just (NoteInstanceId 2)) (vNoteInstanceId voice)
   assertEqual "reused voice ADSR" expected2 (vADSR voice)
+
+testMonoLegatoSustainStyleStaleReleaseIsIgnored ∷ IO ()
+testMonoLegatoSustainStyleStaleReleaseIsIgnored = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      inst = mkInstrument MonoLegato
+      firstId = NoteInstanceId 1
+      secondId = NoteInstanceId 2
+  st1 <- setInstrument iid inst st0
+  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 67) secondId 0.8 Nothing
+  st4 <- releaseInstrumentNote iid firstId st3
+  assertEqual "active voice count after stale release" 1 (stActiveCount st4)
+  voice <- MV.read (stVoices st4) 0
+  assertEqual "voice should still be newest key" (Just (NoteKey 67)) (vNoteKey voice)
+  assertEqual "voice should still be newest instance" (Just secondId) (vNoteInstanceId voice)
+  assertBool "stale release should not release current legato voice" (eStage (vEnv voice) /= EnvRelease)
+
+testMonoLegatoSustainStyleCurrentReleaseStillWorks ∷ IO ()
+testMonoLegatoSustainStyleCurrentReleaseStillWorks = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      inst = mkInstrument MonoLegato
+      firstId = NoteInstanceId 1
+      secondId = NoteInstanceId 2
+  st1 <- setInstrument iid inst st0
+  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 67) secondId 0.8 Nothing
+  st4 <- releaseInstrumentNote iid firstId st3
+  st5 <- releaseInstrumentNote iid secondId st4
+  voice <- MV.read (stVoices st5) 0
+  assertEqual "current instance should enter release" EnvRelease (eStage (vEnv voice))
 
 testReleaseTargetsMatchingNoteInstance ∷ IO ()
 testReleaseTargetsMatchingNoteInstance = do

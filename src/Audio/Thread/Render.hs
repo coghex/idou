@@ -49,19 +49,24 @@ semitonesToRatio semis = 2 ** (semis / 12)
 
 renderIfNeeded ∷ Ptr MaRB → Int → AudioState → IO AudioState
 renderIfNeeded rb chunkFrames st0 = do
-  let targetFrames = stTargetBufferFrames st0
-      loop st = do
-        availRead  <- rbAvailableRead rb
-        availWrite <- rbAvailableWrite rb
-        if availRead >= targetFrames || availWrite == 0
-          then pure st
-          else do
-            let framesNow = min chunkFrames (fromIntegral availWrite)
-            st' <- renderChunkFrames rb framesNow st
-            loop st'
-  loop st0
+  if chunkFrames <= 0
+    then error "renderIfNeeded: chunkFrames must be > 0"
+    else do
+      let targetFrames = stTargetBufferFrames st0
+          loop st = do
+            availRead  <- rbAvailableRead rb
+            availWrite <- rbAvailableWrite rb
+            if availRead >= targetFrames || availWrite == 0
+              then pure st
+              else do
+                let framesNow = min chunkFrames (fromIntegral availWrite)
+                (st', wroteFrames) <- renderChunkFrames rb framesNow st
+                if wroteFrames <= 0
+                  then pure st'
+                  else loop st'
+      loop st0
 
-renderChunkFrames ∷ Ptr MaRB → Int → AudioState → IO AudioState
+renderChunkFrames ∷ Ptr MaRB → Int → AudioState → IO (AudioState, Int)
 renderChunkFrames rb framesNow st = do
   st' <- withForeignPtr (stMixBuf st) $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
@@ -70,12 +75,27 @@ renderChunkFrames rb framesNow st = do
     fillBytes out 0 bytes
     mixVoices (fromIntegral (stSampleRate st)) framesNow out st
 
-  withForeignPtr (stMixBuf st') $ \out0 -> do
+  wroteFrames <- withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
-    _ <- rbWriteF32 rb out (fromIntegral framesNow)
-    pure ()
+    writeMixedFrames rb out framesNow
 
-  pure st'
+  pure (st', wroteFrames)
+
+writeMixedFrames ∷ Ptr MaRB → Ptr CFloat → Int → IO Int
+writeMixedFrames rb out totalFrames = go 0
+  where
+    channels = 2 ∷ Int
+
+    go written
+      | written >= totalFrames = pure written
+      | otherwise = do
+          let remaining = totalFrames - written
+              out' = out `advancePtr` (written * channels)
+          wroteW <- rbWriteF32 rb out' (fromIntegral remaining)
+          let wrote = fromIntegral wroteW
+          if wrote <= 0
+            then pure written
+            else go (written + wrote)
 
 mixVoices ∷ Float → Int → Ptr CFloat → AudioState → IO AudioState
 mixVoices srF chunkFrames out st0 = do
