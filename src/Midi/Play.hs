@@ -9,7 +9,6 @@ module Midi.Play
 
 import Control.Concurrent (threadDelay)
 import Control.Monad (forM_, when)
-import Data.Int (Int64)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Word (Word64)
@@ -24,6 +23,7 @@ import Audio.Types
   , NoteKey(..)
   , NoteInstanceId(..)
   )
+import Midi.Play.Util (pushHeldNote, popHeldNote, ticksToMicroseconds)
 import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
 
 import Midi.ZMidi.Core.ReadFile (readMidi)
@@ -139,7 +139,7 @@ playMidiFile chanMap sys fp = do
                   , adsrOverride = Nothing
                   }
 
-              let held' = M.insertWith (++) (ch, key) [instId] held
+              let held' = pushHeldNote ch key instId held
               loop ppqn tempo instCounter' held' deferred sustain t xs
 
         EvNoteOff ch key -> do
@@ -225,24 +225,21 @@ playMidiFile chanMap sys fp = do
       -> SustainChannels
       -> IO (HeldNotes, DeferredReleases)
     doNoteOff ch key held deferred sustainMap =
-      case M.lookup (ch, key) held of
-        Nothing -> pure (held, deferred)
-        Just [] -> pure (M.delete (ch, key) held, deferred)
-        Just (instId:rest) -> do
-          let held' =
-                if null rest
-                  then M.delete (ch, key) held
-                  else M.insert (ch, key) rest held
-              sustainDown = M.findWithDefault False ch sustainMap
-          if sustainDown
-            then pure (held', M.insertWith (++) ch [instId] deferred)
-            else do
-              sendAudio sys $
-                AudioNoteOff
-                  { instrumentId = channelToInstrument chanMap ch
-                  , noteInstanceId = instId
-                  }
-              pure (held', deferred)
+      let (mInstId, held') = popHeldNote ch key held
+      in
+        case mInstId of
+          Nothing -> pure (held', deferred)
+          Just instId -> do
+            let sustainDown = M.findWithDefault False ch sustainMap
+            if sustainDown
+              then pure (held', M.insertWith (++) ch [instId] deferred)
+              else do
+                sendAudio sys $
+                  AudioNoteOff
+                    { instrumentId = channelToInstrument chanMap ch
+                    , noteInstanceId = instId
+                    }
+                pure (held', deferred)
 
     flushDeferred :: Int -> DeferredReleases -> IO DeferredReleases
     flushDeferred ch deferred =
@@ -267,7 +264,12 @@ playMidiFile chanMap sys fp = do
 midiPPQN :: MidiFile -> Int
 midiPPQN mf =
   case time_division (mf_header mf) of
-    TPB w16 -> fromIntegral w16
+    TPB w16 ->
+      let ppqn = fromIntegral w16
+      in
+        if ppqn > 0
+          then ppqn
+          else error "Invalid MIDI header: PPQN must be greater than 0."
     FPS _   ->
       error "SMPTE time division (FPS) not supported yet; add SMPTE support or convert the MIDI."
 
@@ -314,11 +316,6 @@ extractEvent t ev =
 
 --------------------------------------------------------------------------------
 -- Utilities
-
-ticksToMicroseconds :: Int -> Int -> Int -> Int
-ticksToMicroseconds ppqn tempoUSPerQN dtTicks =
-  fromIntegral
-    ((fromIntegral dtTicks :: Int64) * fromIntegral tempoUSPerQN `div` fromIntegral ppqn)
 
 velToFloat :: Int -> Float
 velToFloat v =

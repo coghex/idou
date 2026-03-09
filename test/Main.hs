@@ -2,9 +2,10 @@
 
 module Main where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (SomeException, evaluate, try)
 import Control.Monad (forM, unless, when)
 import Data.List (find, intercalate, isInfixOf)
+import qualified Data.Map.Strict as M
 import Data.Word (Word32)
 import Foreign.ForeignPtr (mallocForeignPtrArray)
 import System.Environment (getArgs)
@@ -38,6 +39,7 @@ import Audio.Thread.Voice
   )
 import Audio.Types
 import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
+import Midi.Play.Util (pushHeldNote, popHeldNote, ticksToMicroseconds)
 import Engine.Core.Queue (newQueue)
 
 data TestCase = TestCase
@@ -88,6 +90,9 @@ testCases =
   , TestCase "release-all-voices-keeps-other-instruments-active" testReleaseAllVoicesKeepsOtherInstrumentsActive
   , TestCase "midi-controller-state-clamps-and-resets" testMidiControllerStateClampsAndResets
   , TestCase "midi-controller-conversions-are-normalized" testMidiControllerConversionsAreNormalized
+  , TestCase "midi-held-notes-release-oldest-instance-first" testMidiHeldNotesReleaseOldestInstanceFirst
+  , TestCase "midi-tick-conversion-basic" testMidiTickConversionBasic
+  , TestCase "midi-tick-conversion-rejects-zero-ppqn" testMidiTickConversionRejectsZeroPpqn
   , TestCase "poly-aftertouch-targets-matching-note-instance" testPolyAftertouchTargetsMatchingNoteInstance
   , TestCase "aftertouch-routes-are-wired-into-expressive-patches" testAftertouchRoutesAreWiredIntoExpressivePatches
   , TestCase "noise-waveforms-mix-between-white-and-pink" testNoiseWaveformsMixBetweenWhiteAndPink
@@ -298,6 +303,33 @@ testMidiControllerConversionsAreNormalized = do
   assertNear "pitch bend min" (negate defaultPitchBendRangeSemitones) (midiPitchBendSemitones 0)
   assertNear "pitch bend center" 0 (midiPitchBendSemitones 8192)
   assertNear "pitch bend max" defaultPitchBendRangeSemitones (midiPitchBendSemitones 16383)
+
+testMidiHeldNotesReleaseOldestInstanceFirst ∷ IO ()
+testMidiHeldNotesReleaseOldestInstanceFirst = do
+  let firstId = NoteInstanceId 1
+      secondId = NoteInstanceId 2
+      held0 = M.empty
+      held1 = pushHeldNote 0 60 firstId held0
+      held2 = pushHeldNote 0 60 secondId held1
+      (released1, held3) = popHeldNote 0 60 held2
+      (released2, held4) = popHeldNote 0 60 held3
+  assertEqual "first release should match first note-on" (Just firstId) released1
+  assertEqual "second release should match second note-on" (Just secondId) released2
+  assertBool "held stack should be empty after two pops" (M.null held4)
+
+testMidiTickConversionBasic ∷ IO ()
+testMidiTickConversionBasic =
+  assertEqual
+    "tick conversion should match tempo math"
+    250000
+    (ticksToMicroseconds 480 500000 240)
+
+testMidiTickConversionRejectsZeroPpqn ∷ IO ()
+testMidiTickConversionRejectsZeroPpqn = do
+  result <- try (evaluate (ticksToMicroseconds 0 500000 240)) ∷ IO (Either SomeException Int)
+  case result of
+    Left _ -> pure ()
+    Right v -> error ("expected exception for ppqn=0, got " <> show v)
 
 testPolyAftertouchTargetsMatchingNoteInstance ∷ IO ()
 testPolyAftertouchTargetsMatchingNoteInstance = do

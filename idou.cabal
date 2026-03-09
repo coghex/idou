@@ -41,15 +41,16 @@ executable idou
                   Audio.Thread.InstrumentTable
                   Audio.Envelope
                   Audio.Oscillator
-                   Audio.Filter
-                   Audio.Filter.Types
-                   Audio.Filter.Biquad
-                   Midi.Control
-                   Midi.Play
-                   Midi.ZMidi.Core.Datatypes
-                   Midi.ZMidi.Core.ReadFile
-                   Midi.ZMidi.Core.Internal.ExtraTypes
-                   Midi.ZMidi.Core.Internal.ParserMonad
+                  Audio.Filter
+                  Audio.Filter.Types
+                  Audio.Filter.Biquad
+                  Midi.Control
+                  Midi.Play
+                  Midi.Play.Util
+                  Midi.ZMidi.Core.Datatypes
+                  Midi.ZMidi.Core.ReadFile
+                  Midi.ZMidi.Core.Internal.ExtraTypes
+                  Midi.ZMidi.Core.Internal.ParserMonad
   build-depends:    base >=4.14 && <5
                 ,   bytestring
                 ,   idou
@@ -81,6 +82,7 @@ test-suite idou-tests
                     Audio.Filter.Types
                     Audio.Filter.Biquad
                     Sound.Miniaudio.RingBuffer
+                    Midi.Play.Util
   build-depends:    base >=4.14 && <5
                   , containers
                   , stm
