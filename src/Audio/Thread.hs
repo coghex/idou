@@ -5,6 +5,10 @@ module Audio.Thread
   ( startAudioSystem
   , stopAudioSystem
   , sendAudio
+  , tryReadAudioEvent
+  , readTransportFrame
+  , scheduleAudioActionAtFrame
+  , scheduleAudioActionAfterFrames
   , loadClipFromFile
   , AudioHealthVerbosity(..)
   , AudioSystem(..)
@@ -37,6 +41,7 @@ import Audio.Thread.Render
 data AudioSystem = AudioSystem
   { asHandle     ∷ !AudioHandle
   , asThread     ∷ !ThreadState
+  , asTransportFrameRef ∷ !(IORef Word64)
   , asDevice     ∷ !(Ptr MaDevice)
   , asCfg        ∷ !(Ptr MaDeviceConfig)
   , asCallback   ∷ !(FunPtr MaDataCallback)
@@ -52,6 +57,21 @@ data AudioHealthVerbosity
 
 sendAudio ∷ AudioSystem → AudioMsg → IO ()
 sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
+
+tryReadAudioEvent ∷ AudioSystem → IO (Maybe AudioEvent)
+tryReadAudioEvent sys = Q.tryReadQueue (audioEventQueue (asHandle sys))
+
+readTransportFrame ∷ AudioSystem → IO Word64
+readTransportFrame = readIORef . asTransportFrameRef
+
+scheduleAudioActionAtFrame ∷ AudioSystem → Word64 → ScheduledAudioAction → IO ()
+scheduleAudioActionAtFrame sys frame action =
+  sendAudio sys (AudioScheduleAt frame action)
+
+scheduleAudioActionAfterFrames ∷ AudioSystem → Word64 → ScheduledAudioAction → IO ()
+scheduleAudioActionAfterFrames sys delta action = do
+  now <- readTransportFrame sys
+  sendAudio sys (AudioScheduleAt (now + delta) action)
 
 loadClipFromFile ∷ AudioSystem → ClipId → FilePath → IO ()
 loadClipFromFile sys clip path = do
@@ -76,7 +96,9 @@ startAudioSystem audioCfg healthVerbosity = do
       maxVoices = acMaxVoices audioCfg
 
   q <- Q.newQueue
-  let h = AudioHandle q sampleRate ch
+  eventsQ <- Q.newQueue
+  let h = AudioHandle q eventsQ sampleRate ch
+  transportFrameRef <- newIORef 0
   rb <- createRingBuffer rbCapacityFrames ch
   (underrunRef, udStable) <- (`onException` rbDestroy rb) $ do
     underrunRef <- newIORef 0
@@ -160,8 +182,12 @@ startAudioSystem audioCfg healthVerbosity = do
             , stChannelAftertouch = channelAftertouchVec
             , stPitchBendSemis = pitchBendVec
             , stNow = 0
+            , stTransportFrame = 0
+            , stTransportBpm = 120
+            , stScheduleSeq = 0
+            , stScheduled = []
             }
-    (st1, _) <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st0
+    (st1, _) <- Audio.Thread.Render.renderIfNeeded (audioEventQueue h) (applyScheduledAction h) rb chunkFrames st0
     stRef <- newIORef st1
 
     controlRef <- newIORef ThreadRunning
@@ -170,13 +196,14 @@ startAudioSystem audioCfg healthVerbosity = do
     (`onException` cleanupStartedSystem) $ do
       startDevice dev
       tid <- forkIO $
-        runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg
+        runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg transportFrameRef
           `finally` putMVar doneVar ()
 
       let ts = ThreadState controlRef tid doneVar
       pure AudioSystem
         { asHandle = h
         , asThread = ts
+        , asTransportFrameRef = transportFrameRef
         , asDevice = dev
         , asCfg = cfg
         , asCallback = cbFun
@@ -243,8 +270,9 @@ runAudioLoop
   → IORef Word64
   → AudioHealthVerbosity
   → AudioTelemetryConfig
+  → IORef Word64
   → IO ()
-runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg =
+runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg transportFrameRef =
   go 0 0 0 0 emptyHealthStats
   where
     verboseEveryLoops = fromIntegral (atVerboseReportEveryLoops telemetryCfg) ∷ Word64
@@ -257,12 +285,14 @@ runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telem
         ThreadStopped -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
+          writeIORef transportFrameRef (stTransportFrame st1)
           writeIORef stRef st1
         ThreadPaused  -> threadDelay 10000 >> go lastUnderruns lastPartialWrites lastZeroWrites lastVerboseLogLoop health
         ThreadRunning -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
-          (st2, rs) <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st1
+          (st2, rs) <- Audio.Thread.Render.renderIfNeeded (audioEventQueue h) (applyScheduledAction h) rb chunkFrames st1
+          writeIORef transportFrameRef (stTransportFrame st2)
           writeIORef stRef st2
 
           let health' = absorbRenderStats health rs
@@ -392,6 +422,31 @@ processMsgs h rb st = do
         AudioSetBusGain bus gain ->
           setBusGain bus gain st >>= processMsgs h rb
 
+        AudioSetTransportFrame frame ->
+          processMsgs h rb st { stTransportFrame = frame }
+
+        AudioSetTransportBpm bpm ->
+          processMsgs h rb st { stTransportBpm = max 1 bpm }
+
+        AudioScheduleAt frame action ->
+          if frame <= stTransportFrame st
+            then do
+              Q.writeQueue
+                (audioEventQueue h)
+                (AudioEventScheduleMissed frame (stTransportFrame st) action)
+              st' <- applyScheduledAction h action st
+              Q.writeQueue
+                (audioEventQueue h)
+                (AudioEventScheduleTriggered (stTransportFrame st') action)
+              processMsgs h rb st'
+            else do
+              let seqNo = stScheduleSeq st + 1
+                  item = ScheduledItem frame seqNo action
+              processMsgs h rb st
+                { stScheduleSeq = seqNo
+                , stScheduled = insertScheduled item (stScheduled st)
+                }
+
         -- UPDATED: MIDI-native NoteOn/NoteOff
         AudioNoteOn iid a p key instId vel eOverride ->
           addInstrumentNote h st iid a p key instId vel eOverride >>= processMsgs h rb
@@ -499,3 +554,27 @@ setBusGain bus gain st =
   case bus of
     AudioBusMusic -> pure st { stBusMusicGain = clamp01 gain }
     AudioBusSfx -> pure st { stBusSfxGain = clamp01 gain }
+
+applyScheduledAction ∷ AudioHandle → ScheduledAudioAction → AudioState → IO AudioState
+applyScheduledAction _h action st =
+  case action of
+    ScheduledPlayClip cid bus gain pan loop ->
+      addClipSource cid bus gain pan loop st
+    ScheduledStopClip cid ->
+      stopClipSourcesByClip cid st
+    ScheduledStopBus bus ->
+      stopClipSourcesByBus bus st
+    ScheduledSetBusGain bus gain ->
+      setBusGain bus gain st
+
+insertScheduled ∷ ScheduledItem → [ScheduledItem] → [ScheduledItem]
+insertScheduled item = go
+  where
+    go [] = [item]
+    go (x:xs)
+      | before item x = item : x : xs
+      | otherwise = x : go xs
+
+    before a b =
+      (siFrame a < siFrame b)
+        || (siFrame a == siFrame b && siSeq a < siSeq b)

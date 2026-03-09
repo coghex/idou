@@ -41,6 +41,7 @@ executable idou
                   Audio.Thread.Render
                   Audio.Thread.Voice
                   Audio.Thread.InstrumentTable
+                  Player.Thread
                   Audio.Envelope
                   Audio.Oscillator
                   Audio.Filter

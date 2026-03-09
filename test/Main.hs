@@ -37,10 +37,11 @@ import Audio.Thread.InstrumentTable
   , setModWheel
   , setPitchBend
   )
-import Audio.Thread.Types (AudioState(..), ClipAsset(..), ClipSource(..), Voice(..))
+import Audio.Thread.Types (AudioState(..), ClipAsset(..), ClipSource(..), ScheduledItem(..), Voice(..))
 import Audio.Thread.Voice
   ( addInstrumentNote
   , applyInstrumentToActiveVoices
+  , panGains
   , releaseInstrumentAllVoices
   , releaseInstrumentNote
   , setInstrumentNoteAftertouch
@@ -54,7 +55,7 @@ import Midi.Play.Util
   , takeDeferredReleases
   , ticksToMicroseconds
   )
-import Engine.Core.Queue (newQueue)
+import Engine.Core.Queue (Queue, newQueue, tryReadQueue)
 import Sound.Miniaudio.Decode (DecodedAudio(..), decodeAudioFileStereoF32)
 import Sound.Miniaudio.RingBuffer (rbCreateF32, rbDestroy, rbReadF32)
 
@@ -124,6 +125,9 @@ testCases =
   , TestCase "instrument-load-keeps-active-voice-until-live-apply" testInstrumentLoadKeepsActiveVoiceUntilLiveApply
   , TestCase "clip-one-shot-auto-releases-source" testClipOneShotAutoReleasesSource
   , TestCase "clip-music-bus-gain-zero-mutes-output" testClipMusicBusGainZeroMutesOutput
+  , TestCase "clip-finished-emits-audio-event" testClipFinishedEmitsAudioEvent
+  , TestCase "note-finished-emits-audio-event" testNoteFinishedEmitsAudioEvent
+  , TestCase "scheduled-bus-gain-switches-at-frame" testScheduledBusGainSwitchesAtFrame
   , TestCase "wav-decoder-loads-stereo-f32" testWavDecoderLoadsStereoF32
   ]
 
@@ -559,6 +563,7 @@ testInstrumentLoadKeepsActiveVoiceUntilLiveApply = do
 testClipOneShotAutoReleasesSource ∷ IO ()
 testClipOneShotAutoReleasesSource = do
   st0 <- mkTestState
+  evQ <- newQueue
   let clip = ClipAsset 1 4 (VU.fromList [0.5, -0.5, 0.25, -0.25])
       src =
         ClipSource
@@ -573,13 +578,14 @@ testClipOneShotAutoReleasesSource = do
   MV.write (stClipSources st0) 0 src
   let st1 = st0 { stClipActiveCount = 1 }
   bracket (rbCreateF32 64 2) rbDestroy $ \rb -> do
-    (st2, wrote) <- renderChunkFrames rb 8 st1
+    (st2, wrote) <- renderChunkFrames evQ runScheduledForTest rb 8 st1
     assertEqual "clip chunk write count" 8 wrote
     assertEqual "one-shot should release source after end" 0 (stClipActiveCount st2)
 
 testClipMusicBusGainZeroMutesOutput ∷ IO ()
 testClipMusicBusGainZeroMutesOutput = do
   st0 <- mkTestState
+  evQ <- newQueue
   let clip = ClipAsset 1 1 (VU.fromList [1])
       src =
         ClipSource
@@ -598,13 +604,95 @@ testClipMusicBusGainZeroMutesOutput = do
           , stBusMusicGain = 0
           }
   bracket (rbCreateF32 16 2) rbDestroy $ \rb -> do
-    (_st2, _wrote) <- renderChunkFrames rb 1 st1
+    (_st2, _wrote) <- renderChunkFrames evQ runScheduledForTest rb 1 st1
     allocaArray 2 $ \buf -> do
       got <- rbReadF32 rb buf 1
       assertEqual "ring buffer should contain one frame" 1 (fromIntegral got ∷ Int)
       [l, r] <- peekArray 2 buf
       assertNear "left output should be muted by bus gain" 0 (realToFrac (l ∷ CFloat))
       assertNear "right output should be muted by bus gain" 0 (realToFrac (r ∷ CFloat))
+
+testClipFinishedEmitsAudioEvent ∷ IO ()
+testClipFinishedEmitsAudioEvent = do
+  st0 <- mkTestState
+  evQ <- newQueue
+  let clip = ClipAsset 1 2 (VU.fromList [1, 0])
+      src =
+        ClipSource
+          { csClipId = ClipId 42
+          , csBus = AudioBusSfx
+          , csGainL = 1
+          , csGainR = 1
+          , csFramePos = 0
+          , csLoop = False
+          }
+  MV.write (stClipAssets st0) 42 (Just clip)
+  MV.write (stClipSources st0) 0 src
+  let st1 = st0 { stClipActiveCount = 1 }
+  bracket (rbCreateF32 16 2) rbDestroy $ \rb -> do
+    (_st2, _wrote) <- renderChunkFrames evQ runScheduledForTest rb 8 st1
+    events <- drainAudioEvents evQ
+    assertBool
+      "clip finished event should be emitted"
+      (AudioEventClipFinished (ClipId 42) AudioBusSfx `elem` events)
+
+testNoteFinishedEmitsAudioEvent ∷ IO ()
+testNoteFinishedEmitsAudioEvent = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      noteInst = NoteInstanceId 99
+      inst = (mkInstrument Poly) { iAdsrDefault = ADSR 0 0 0 0.001 }
+  st1 <- setInstrument iid inst st0
+  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) noteInst 0.8 Nothing
+  st3 <- releaseInstrumentNote iid noteInst st2
+  bracket (rbCreateF32 512 2) rbDestroy $ \rb -> do
+    (_st4, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 512 st3
+    events <- drainAudioEvents (audioEventQueue handle)
+    assertBool
+      "note finished event should be emitted"
+      (AudioEventNoteFinished iid noteInst `elem` events)
+
+testScheduledBusGainSwitchesAtFrame ∷ IO ()
+testScheduledBusGainSwitchesAtFrame = do
+  st0 <- mkTestState
+  evQ <- newQueue
+  let clip = ClipAsset 1 4 (VU.fromList [1, 1, 1, 1])
+      src =
+        ClipSource
+          { csClipId = ClipId 0
+          , csBus = AudioBusMusic
+          , csGainL = 1
+          , csGainR = 1
+          , csFramePos = 0
+          , csLoop = False
+          }
+      sched = ScheduledItem 2 1 (ScheduledSetBusGain AudioBusMusic 0)
+      st1 =
+        st0
+          { stClipActiveCount = 1
+          , stScheduled = [sched]
+          }
+  MV.write (stClipAssets st1) 0 (Just clip)
+  MV.write (stClipSources st1) 0 src
+  bracket (rbCreateF32 16 2) rbDestroy $ \rb -> do
+    (st2, _wrote) <- renderChunkFrames evQ runScheduledForTest rb 4 st1
+    assertEqual "transport should advance by rendered frames" 4 (stTransportFrame st2)
+    allocaArray 8 $ \buf -> do
+      got <- rbReadF32 rb buf 4
+      assertEqual "should read 4 rendered frames" 4 (fromIntegral got ∷ Int)
+      vals <- map realToFrac <$> peekArray 8 buf
+      case vals of
+        [f0L, _f0R, f1L, _f1R, f2L, _f2R, f3L, _f3R] -> do
+          assertBool "frames before schedule should be audible" (f0L > 0.9 && f1L > 0.9)
+          assertNear "frame 2 should be muted after scheduled bus gain" 0 f2L
+          assertNear "frame 3 should remain muted" 0 f3L
+        _ ->
+          error ("expected 8 samples from rendered frames, got " <> show (length vals))
+    events <- drainAudioEvents evQ
+    assertBool
+      "schedule trigger event should be emitted"
+      (AudioEventScheduleTriggered 2 (ScheduledSetBusGain AudioBusMusic 0) `elem` events)
 
 testWavDecoderLoadsStereoF32 ∷ IO ()
 testWavDecoderLoadsStereoF32 =
@@ -637,6 +725,70 @@ catchIgnore io = do
   _ <- try io ∷ IO (Either SomeException ())
   pure ()
 
+drainAudioEvents ∷ Queue AudioEvent → IO [AudioEvent]
+drainAudioEvents q = go []
+  where
+    go acc = do
+      m <- tryReadQueue q
+      case m of
+        Nothing -> pure (reverse acc)
+        Just ev -> go (ev : acc)
+
+runScheduledForTest ∷ ScheduledAudioAction → AudioState → IO AudioState
+runScheduledForTest action st =
+  case action of
+    ScheduledPlayClip cid bus gain pan loop ->
+      let (gainL, gainR) = panGains (max 0 gain) pan
+          active = stClipActiveCount st
+          cap = MV.length (stClipSources st)
+      in if active >= cap
+           then pure st
+           else do
+             MV.write
+               (stClipSources st)
+               active
+               ClipSource
+                 { csClipId = cid
+                 , csBus = bus
+                 , csGainL = gainL
+                 , csGainR = gainR
+                 , csFramePos = 0
+                 , csLoop = loop
+                 }
+             pure st { stClipActiveCount = active + 1 }
+    ScheduledStopClip cid -> do
+      let vec = stClipSources st
+          go i st'
+            | i >= stClipActiveCount st' = pure st'
+            | otherwise = do
+                src <- MV.read vec i
+                if csClipId src == cid
+                  then do
+                    let lastIx = stClipActiveCount st' - 1
+                    when (i /= lastIx) $
+                      MV.read vec lastIx >>= MV.write vec i
+                    go i st' { stClipActiveCount = lastIx }
+                  else go (i + 1) st'
+      go 0 st
+    ScheduledStopBus bus -> do
+      let vec = stClipSources st
+          go i st'
+            | i >= stClipActiveCount st' = pure st'
+            | otherwise = do
+                src <- MV.read vec i
+                if csBus src == bus
+                  then do
+                    let lastIx = stClipActiveCount st' - 1
+                    when (i /= lastIx) $
+                      MV.read vec lastIx >>= MV.write vec i
+                    go i st' { stClipActiveCount = lastIx }
+                  else go (i + 1) st'
+      go 0 st
+    ScheduledSetBusGain bus gain ->
+      case bus of
+        AudioBusMusic -> pure st { stBusMusicGain = max 0 (min 1 gain) }
+        AudioBusSfx -> pure st { stBusSfxGain = max 0 (min 1 gain) }
+
 mkWav16Mono ∷ Word32 → [Int] → BL.ByteString
 mkWav16Mono sampleRate samples =
   toLazyByteString $
@@ -664,8 +816,10 @@ mkWav16Mono sampleRate samples =
 mkTestHandle ∷ IO AudioHandle
 mkTestHandle = do
   q <- newQueue
+  evQ <- newQueue
   pure AudioHandle
     { audioQueue = q
+    , audioEventQueue = evQ
     , sampleRate = testSampleRate
     , channels = 2
     }
@@ -716,6 +870,10 @@ mkTestState = do
     , stChannelAftertouch = channelAftertouchVec
     , stPitchBendSemis = pitchBendVec
     , stNow = 0
+    , stTransportFrame = 0
+    , stTransportBpm = 120
+    , stScheduleSeq = 0
+    , stScheduled = []
     }
 
 mkInstrument ∷ PlayMode → Instrument

@@ -2,6 +2,8 @@
 
 module Audio.Types
   ( AudioMsg(..)
+  , AudioEvent(..)
+  , ScheduledAudioAction(..)
   , AudioHandle(..)
   , defaultPitchBendRangeSemitones
 
@@ -233,6 +235,19 @@ data AudioMsg
       , busGain  ∷ !Float
       }
 
+  | AudioSetTransportFrame
+      { transportFrame ∷ !Word64
+      }
+
+  | AudioSetTransportBpm
+      { transportBpm ∷ !Float
+      }
+
+  | AudioScheduleAt
+      { scheduleFrame  ∷ !Word64
+      , scheduleAction ∷ !ScheduledAudioAction
+      }
+
   | AudioNoteOn
       { instrumentId   ∷ !InstrumentId
       , amp            ∷ !Float
@@ -262,8 +277,49 @@ data AudioMsg
   | AudioShutdown
   deriving (Eq, Show)
 
+data AudioEvent
+  = AudioEventNoteFinished
+      { aeInstrumentId ∷ !InstrumentId
+      , aeNoteInstanceId ∷ !NoteInstanceId
+      }
+  | AudioEventClipFinished
+      { aeClipId ∷ !ClipId
+      , aeAudioBus ∷ !AudioBus
+      }
+  | AudioEventScheduleTriggered
+      { aeScheduledFrame ∷ !Word64
+      , aeScheduledAction ∷ !ScheduledAudioAction
+      }
+  | AudioEventScheduleMissed
+      { aeScheduledFrame ∷ !Word64
+      , aeActualFrame ∷ !Word64
+      , aeScheduledAction ∷ !ScheduledAudioAction
+      }
+  deriving (Eq, Show)
+
+data ScheduledAudioAction
+  = ScheduledPlayClip
+      { saClipId ∷ !ClipId
+      , saClipBus ∷ !AudioBus
+      , saClipGain ∷ !Float
+      , saClipPan ∷ !Float
+      , saClipLoop ∷ !Bool
+      }
+  | ScheduledStopClip
+      { saClipId ∷ !ClipId
+      }
+  | ScheduledStopBus
+      { saBus ∷ !AudioBus
+      }
+  | ScheduledSetBusGain
+      { saBus ∷ !AudioBus
+      , saBusGain ∷ !Float
+      }
+  deriving (Eq, Show)
+
 data AudioHandle = AudioHandle
   { audioQueue ∷ Queue AudioMsg
+  , audioEventQueue ∷ Queue AudioEvent
   , sampleRate ∷ !Word32
   , channels   ∷ !Word32
   }

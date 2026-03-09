@@ -4,6 +4,7 @@ module Audio.Thread.Types
   ( Voice(..)
   , ClipAsset(..)
   , ClipSource(..)
+  , ScheduledItem(..)
   , AudioState(..)
   , AudioUserData(..)
   , clamp01
@@ -19,7 +20,16 @@ import Foreign.ForeignPtr (ForeignPtr)
 import qualified Data.Vector.Mutable as MV
 import qualified Data.Vector.Unboxed as VU
 
-import Audio.Types (InstrumentId, Instrument, ModRoute, NoteKey, NoteInstanceId, ClipId, AudioBus)
+import Audio.Types
+  ( InstrumentId
+  , Instrument
+  , ModRoute
+  , NoteKey
+  , NoteInstanceId
+  , ClipId
+  , AudioBus
+  , ScheduledAudioAction
+  )
 import Audio.Envelope (ADSR, EnvState)
 import Audio.Oscillator (Osc)
 import Audio.Filter (FilterState)
@@ -83,6 +93,12 @@ data ClipSource = ClipSource
   , csLoop     ∷ !Bool
   }
 
+data ScheduledItem = ScheduledItem
+  { siFrame  ∷ !Word64
+  , siSeq    ∷ !Word64
+  , siAction ∷ !ScheduledAudioAction
+  }
+
 data AudioState = AudioState
   { stVoices         ∷ !(MV.IOVector Voice)
   , stActiveCount    ∷ !Int
@@ -109,6 +125,10 @@ data AudioState = AudioState
   , stChannelAftertouch ∷ !(MV.IOVector Float)
   , stPitchBendSemis ∷ !(MV.IOVector Float)
   , stNow            ∷ !Word64
+  , stTransportFrame ∷ !Word64
+  , stTransportBpm   ∷ !Float
+  , stScheduleSeq    ∷ !Word64
+  , stScheduled      ∷ ![ScheduledItem]
   }
 
 data AudioUserData = AudioUserData

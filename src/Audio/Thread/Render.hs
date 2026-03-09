@@ -17,12 +17,22 @@ import qualified Data.Vector.Unboxed as VU
 import Audio.Envelope
 import Audio.Filter
 import Audio.Oscillator (oscSetHz, oscStepWrap, oscResetPhase0)
+import Engine.Core.Queue (Queue)
+import qualified Engine.Core.Queue as Q
 import Sound.Miniaudio.RingBuffer
 
 import Audio.Thread.Types
 import Audio.Thread.InstrumentTable (MidiControls(..), lookupMidiControls, lookupVibrato)
 import Audio.Thread.Voice (panGains)
-import Audio.Types (AudioBus(..), ClipId(..), ModRoute(..), ModSrc(..), ModDst(..))
+import Audio.Types
+  ( AudioBus(..)
+  , AudioEvent(..)
+  , ClipId(..)
+  , ScheduledAudioAction
+  , ModRoute(..)
+  , ModSrc(..)
+  , ModDst(..)
+  )
 
 defaultModWheelLfoRateHz ∷ Float
 defaultModWheelLfoRateHz = 5
@@ -59,8 +69,14 @@ data RenderStats = RenderStats
 emptyRenderStats ∷ RenderStats
 emptyRenderStats = RenderStats 0 0 0 0
 
-renderIfNeeded ∷ Ptr MaRB → Int → AudioState → IO (AudioState, RenderStats)
-renderIfNeeded rb chunkFrames st0 = do
+renderIfNeeded
+  ∷ Queue AudioEvent
+  → (ScheduledAudioAction → AudioState → IO AudioState)
+  → Ptr MaRB
+  → Int
+  → AudioState
+  → IO (AudioState, RenderStats)
+renderIfNeeded eventsQ runScheduled rb chunkFrames st0 = do
   if chunkFrames <= 0
     then error "renderIfNeeded: chunkFrames must be > 0"
     else do
@@ -72,7 +88,7 @@ renderIfNeeded rb chunkFrames st0 = do
               then pure (st, stats)
               else do
                 let framesNow = min chunkFrames (fromIntegral availWrite)
-                (st', wroteFrames) <- renderChunkFrames rb framesNow st
+                (st', wroteFrames) <- renderChunkFrames eventsQ runScheduled rb framesNow st
                 let partialWrite = if wroteFrames < framesNow then 1 else 0
                     zeroWrite = if wroteFrames <= 0 then 1 else 0
                     stats' =
@@ -87,21 +103,81 @@ renderIfNeeded rb chunkFrames st0 = do
                   else loop stats' st'
       loop emptyRenderStats st0
 
-renderChunkFrames ∷ Ptr MaRB → Int → AudioState → IO (AudioState, Int)
-renderChunkFrames rb framesNow st = do
+renderChunkFrames
+  ∷ Queue AudioEvent
+  → (ScheduledAudioAction → AudioState → IO AudioState)
+  → Ptr MaRB
+  → Int
+  → AudioState
+  → IO (AudioState, Int)
+renderChunkFrames eventsQ runScheduled rb framesNow st = do
   st' <- withForeignPtr (stMixBuf st) $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
         samples = framesNow * 2
         bytes = samples * sizeOf (undefined ∷ CFloat)
     fillBytes out 0 bytes
-    stVoicesMixed <- mixVoices (fromIntegral (stSampleRate st)) framesNow out st
-    mixClipSources framesNow out stVoicesMixed
+    mixScheduledChunk eventsQ runScheduled (fromIntegral (stSampleRate st)) framesNow out st
 
   wroteFrames <- withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
     writeMixedFrames rb out framesNow
 
   pure (st', wroteFrames)
+
+mixScheduledChunk
+  ∷ Queue AudioEvent
+  → (ScheduledAudioAction → AudioState → IO AudioState)
+  → Float
+  → Int
+  → Ptr CFloat
+  → AudioState
+  → IO AudioState
+mixScheduledChunk eventsQ runScheduled srF totalFrames out st0 = go 0 st0
+  where
+    go mixed st
+      | mixed >= totalFrames = pure st
+      | otherwise = do
+          stDue <- applyDueScheduled eventsQ runScheduled st
+          let framesRemaining = totalFrames - mixed
+              framesToNext = framesUntilNextSchedule stDue
+              segmentFrames =
+                case framesToNext of
+                  Nothing -> framesRemaining
+                  Just n -> max 1 (min framesRemaining n)
+              outSeg = out `advancePtr` (mixed * 2)
+          stVoicesMixed <- mixVoices eventsQ srF segmentFrames outSeg stDue
+          stClipMixed <- mixClipSources eventsQ segmentFrames outSeg stVoicesMixed
+          let stNext =
+                stClipMixed
+                  { stTransportFrame = stTransportFrame stClipMixed + fromIntegral segmentFrames
+                  }
+          go (mixed + segmentFrames) stNext
+
+applyDueScheduled
+  ∷ Queue AudioEvent
+  → (ScheduledAudioAction → AudioState → IO AudioState)
+  → AudioState
+  → IO AudioState
+applyDueScheduled eventsQ runScheduled st0 = do
+  let now = stTransportFrame st0
+      (due, rest) = span (\si -> siFrame si <= now) (stScheduled st0)
+      stBase = st0 { stScheduled = rest }
+  applyAll stBase due
+  where
+    applyAll st [] = pure st
+    applyAll st (si:sis) = do
+      Q.writeQueue eventsQ (AudioEventScheduleTriggered (siFrame si) (siAction si))
+      st' <- runScheduled (siAction si) st
+      applyAll st' sis
+
+framesUntilNextSchedule ∷ AudioState → Maybe Int
+framesUntilNextSchedule st =
+  case stScheduled st of
+    [] -> Nothing
+    (si:_) ->
+      if siFrame si <= stTransportFrame st
+        then Just 0
+        else Just (fromIntegral (siFrame si - stTransportFrame st))
 
 writeMixedFrames ∷ Ptr MaRB → Ptr CFloat → Int → IO Int
 writeMixedFrames rb out totalFrames = go 0
@@ -119,8 +195,8 @@ writeMixedFrames rb out totalFrames = go 0
             then pure written
             else go (written + wrote)
 
-mixVoices ∷ Float → Int → Ptr CFloat → AudioState → IO AudioState
-mixVoices srF chunkFrames out st0 = do
+mixVoices ∷ Queue AudioEvent → Float → Int → Ptr CFloat → AudioState → IO AudioState
+mixVoices eventsQ srF chunkFrames out st0 = do
   let vec = stVoices st0
       loop i st
         | i >= stActiveCount st = pure st
@@ -141,6 +217,7 @@ mixVoices srF chunkFrames out st0 = do
             v' <- mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouch bendRatio rateHz depthCents st v
             if eStage (vEnv v') == EnvDone
               then do
+                emitNoteFinishedEvent eventsQ v'
                 let lastIx = stActiveCount st - 1
                 when (i /= lastIx) $
                   MV.read vec lastIx >>= MV.write vec i
@@ -148,8 +225,8 @@ mixVoices srF chunkFrames out st0 = do
               else MV.write vec i v' >> loop (i+1) st
   loop 0 st0
 
-mixClipSources ∷ Int → Ptr CFloat → AudioState → IO AudioState
-mixClipSources chunkFrames out st0 = do
+mixClipSources ∷ Queue AudioEvent → Int → Ptr CFloat → AudioState → IO AudioState
+mixClipSources eventsQ chunkFrames out st0 = do
   let srcVec = stClipSources st0
       removeAt i st =
         let lastIx = stClipActiveCount st - 1
@@ -162,13 +239,34 @@ mixClipSources chunkFrames out st0 = do
             src <- MV.read srcVec i
             mAsset <- lookupClipAsset (csClipId src) st
             case mAsset of
-              Nothing -> removeAt i st >>= loop i
+              Nothing -> do
+                emitClipFinishedEvent eventsQ src
+                removeAt i st >>= loop i
               Just asset -> do
                 (src', done) <- mixOneClip chunkFrames out st asset src
                 if done
-                  then removeAt i st >>= loop i
+                  then do
+                    emitClipFinishedEvent eventsQ src
+                    removeAt i st >>= loop i
                   else MV.write srcVec i src' >> loop (i + 1) st
   loop 0 st0
+
+emitNoteFinishedEvent ∷ Queue AudioEvent → Voice → IO ()
+emitNoteFinishedEvent eventsQ v =
+  case (vInstrId v, vNoteInstanceId v) of
+    (Just iid, Just nid) ->
+      Q.writeQueue eventsQ (AudioEventNoteFinished iid nid)
+    _ ->
+      pure ()
+
+emitClipFinishedEvent ∷ Queue AudioEvent → ClipSource → IO ()
+emitClipFinishedEvent eventsQ src =
+  Q.writeQueue
+    eventsQ
+    (AudioEventClipFinished
+      { aeClipId = csClipId src
+      , aeAudioBus = csBus src
+      })
 
 lookupClipAsset ∷ ClipId → AudioState → IO (Maybe ClipAsset)
 lookupClipAsset (ClipId clipIx) st = do

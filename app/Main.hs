@@ -15,6 +15,7 @@ import Audio.Config (audioConfigPath, loadAudioConfig)
 import Audio.Patch (defaultMidiProgram, gmChannelInstrument)
 import Audio.Thread
 import Audio.Types
+import Player.Thread
 
 import Midi.Play (playMidiFile, defaultChannelMap)
 
@@ -25,12 +26,13 @@ main = do
     Right (healthVerbosity, inputPath) -> do
       audioCfg <- loadAudioConfig audioConfigPath
       bracket (startAudioSystem audioCfg healthVerbosity) stopAudioSystem $ \sys -> do
-        -- Preload instruments 0..15 (MIDI channels) with the same patch for now.
-        preloadChannels sys
+        bracket (startPlayerThread sys) stopPlayerThread $ \_player -> do
+          -- Preload instruments 0..15 (MIDI channels) with the same patch for now.
+          preloadChannels sys
 
-        playInput sys inputPath
-        putStrLn "Press q to quit."
-        withRawStdin $ waitForQuit sys
+          playInput sys inputPath
+          putStrLn "Press q to quit."
+          withRawStdin $ waitForQuit sys
 
     Left usage -> do
       putStrLn usage
