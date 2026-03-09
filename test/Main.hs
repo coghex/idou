@@ -60,9 +60,11 @@ import Player.Timeline
   ( SongMode(..)
   , TimelineBar(..)
   , TimelineNote(..)
+  , TimelineTransitionTelemetry(..)
   , TimelineRuntime
   , compileTimelineBars
   , parseSongSpecText
+  , popTransitionTelemetry
   , popReadyBars
   , prepareTimelineRuntime
   , setTimelineTargets
@@ -123,6 +125,9 @@ testCases =
   , TestCase "timeline-energy-target-steers-density" testTimelineEnergyTargetSteersDensity
   , TestCase "timeline-energy-target-steers-conductor" testTimelineEnergyTargetSteersConductor
   , TestCase "timeline-mood-target-steers-transposition" testTimelineMoodTargetSteersTransposition
+  , TestCase "timeline-section-metadata-steers-conductor" testTimelineSectionMetadataSteersConductor
+  , TestCase "timeline-section-feel-steers-variation" testTimelineSectionFeelSteersVariation
+  , TestCase "timeline-transition-telemetry-emits-reason-and-weights" testTimelineTransitionTelemetryEmitsReasonAndWeights
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
@@ -398,6 +403,81 @@ testTimelineConductorTransitionsAtPhraseBoundary = do
           | tbSectionName x == name = go name (n + 1) xs
           | otherwise = (name, n) : go (tbSectionName x) 1 xs
 
+testTimelineTransitionTelemetryEmitsReasonAndWeights ∷ IO ()
+testTimelineTransitionTelemetryEmitsReasonAndWeights = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 3"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pad:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8"
+          , "    pattern_ending: 0/62/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 =
+        setTimelineTargets (Just "combat") 0.9 (prepareTimelineRuntime testSampleRate 0 spec)
+      (_bars, telemetry, runtimeFinal) = drainTimelineWithTelemetry 0 0 [] [] runtime0
+  assertBool "telemetry should include one transition event" (length telemetry == 1)
+  case telemetry of
+    [] -> error "expected transition telemetry event"
+    ev : _ -> do
+      assertEqual "from section" "intro" (ttFromSectionName ev)
+      assertEqual "to section" "ending" (ttToSectionName ev)
+      assertEqual "transition reason" "phrase-boundary-weighted" (ttReason ev)
+      assertEqual "transition boundary bar index" 0 (ttBoundaryBarIx ev)
+      assertBool "transition boundary should be positive frame offset" (ttBoundaryOffsetFrames ev > 0)
+      assertEqual "base scripted weights" [("ending", 1)] (ttBaseWeights ev)
+      assertBool
+        "final weighted candidates should still include ending"
+        (any ((== "ending") . fst) (ttFinalWeights ev))
+      assertEqual "mood target should be captured" (Just "combat") (ttMoodTarget ev)
+      assertBool "energy target should be captured" (abs (ttEnergyTarget ev - 0.9) < 0.0001)
+      assertBool "pick total should be positive" (ttPickTotal ev > 0)
+      assertBool
+        "pick ticket should be within total"
+        (ttPickTicket ev >= 0 && ttPickTicket ev < ttPickTotal ev)
+  assertBool "runtime should finish in cue mode after ending" (timelineRuntimeDone runtimeFinal)
+  where
+    drainTimelineWithTelemetry
+      ∷ Word64
+      → Int
+      → [TimelineBar]
+      → [TimelineTransitionTelemetry]
+      → TimelineRuntime
+      → ([TimelineBar], [TimelineTransitionTelemetry], TimelineRuntime)
+    drainTimelineWithTelemetry now loops barsAcc telemetryAcc rt
+      | loops > 200 = error "timeline telemetry did not finish within expected iterations"
+      | otherwise =
+          let (batch, rt1) = popReadyBars now rt
+              (events, rt2) = popTransitionTelemetry rt1
+              barsAcc' = barsAcc <> batch
+              telemetryAcc' = telemetryAcc <> events
+          in if timelineRuntimeDone rt2
+               then (barsAcc', telemetryAcc', rt2)
+               else
+                 drainTimelineWithTelemetry
+                   (now + 100000)
+                   (loops + 1)
+                   barsAcc'
+                   telemetryAcc'
+                   rt2
+
 testTimelinePatternVariationIsDeterministic ∷ IO ()
 testTimelinePatternVariationIsDeterministic = do
   let yamlText =
@@ -583,6 +663,95 @@ testTimelineMoodTargetSteersTransposition = do
   assertBool
     "combat mood target should bias transposition upward vs ambient"
     (avgPitch barsCombat > avgPitch barsCalm + 0.5)
+
+testTimelineSectionMetadataSteersConductor ∷ IO ()
+testTimelineSectionMetadataSteersConductor = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: drone"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    mood: neutral"
+          , "    feel: plain"
+          , "  alpha:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    mood: ambient"
+          , "    feel: sparse slow"
+          , "  beta:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    mood: aggressive"
+          , "    feel: dense driving"
+          , "instruments:"
+          , "  pulse:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8"
+          , "    pattern_alpha: 0/62/1/0.8"
+          , "    pattern_beta: 0/67/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtimeCalm0 = setTimelineTargets (Just "calm") 0.4 (prepareTimelineRuntime testSampleRate 0 spec)
+      runtimeCombat0 = setTimelineTargets (Just "combat") 0.7 (prepareTimelineRuntime testSampleRate 0 spec)
+      barsCalm = takeTimelineBars 32 0 0 [] runtimeCalm0
+      barsCombat = takeTimelineBars 32 0 0 [] runtimeCombat0
+      alphaCount xs = length (filter ((== "alpha") . tbSectionName) xs)
+      betaCount xs = length (filter ((== "beta") . tbSectionName) xs)
+  assertBool "calm target should prefer ambient metadata sections" (alphaCount barsCalm > betaCount barsCalm)
+  assertBool "combat target should prefer aggressive metadata sections" (betaCount barsCombat > alphaCount barsCombat)
+  where
+    takeTimelineBars ∷ Int → Word64 → Int → [TimelineBar] → TimelineRuntime → [TimelineBar]
+    takeTimelineBars target now loops acc rt
+      | loops > 400 = acc
+      | length acc >= target = take target acc
+      | otherwise =
+          let (batch, rt') = popReadyBars now rt
+              acc' = acc <> batch
+          in takeTimelineBars target (now + 120000) (loops + 1) acc' rt'
+
+testTimelineSectionFeelSteersVariation ∷ IO ()
+testTimelineSectionFeelSteersVariation = do
+  let mkSpec feelLabel =
+        parseSongSpecText $
+          unlines
+            [ "song:"
+            , "  mode: cue"
+            , "  lookahead_bars: 4"
+            , "sections:"
+            , "  intro:"
+            , "    tempo_bpm: 120"
+            , "    beats_per_bar: 4"
+            , "    bars_per_phrase: 10"
+            , "    phrase_count: 1"
+            , "    mood: neutral"
+            , "    feel: " <> feelLabel
+            , "instruments:"
+            , "  rhythm:"
+            , "    instrument_id: 0"
+            , "    amp: 1"
+            , "    pan: 0"
+            , "    pattern_intro: 0/60/0.25/0.9,0.5/62/0.25/0.9,1/64/0.25/0.9,1.5/65/0.25/0.9,2/67/0.25/0.9,2.5/69/0.25/0.9,3/71/0.25/0.9,3.5/72/0.25/0.9"
+            ]
+  sparseSpec <- either (\err -> error ("parse sparse spec failed: " <> err)) pure (mkSpec "sparse ambient")
+  denseSpec <- either (\err -> error ("parse dense spec failed: " <> err)) pure (mkSpec "dense driving")
+  let runtimeSparse0 = setTimelineTargets Nothing 0.5 (prepareTimelineRuntime testSampleRate 0 sparseSpec)
+      runtimeDense0 = setTimelineTargets Nothing 0.5 (prepareTimelineRuntime testSampleRate 0 denseSpec)
+      (barsSparse, _doneSparse) = drainTimelineBarsForTest 0 0 [] runtimeSparse0
+      (barsDense, _doneDense) = drainTimelineBarsForTest 0 0 [] runtimeDense0
+      noteCount xs = sum (map (length . tbNotes) xs)
+  assertBool "dense section feel should yield more notes than sparse feel" (noteCount barsDense > noteCount barsSparse)
 
 drainTimelineBarsForTest ∷ Word64 → Int → [TimelineBar] → TimelineRuntime → ([TimelineBar], TimelineRuntime)
 drainTimelineBarsForTest now loops acc rt

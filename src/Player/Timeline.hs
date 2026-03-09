@@ -8,6 +8,7 @@ module Player.Timeline
   , SongSpec(..)
   , TimelineNote(..)
   , TimelineBar(..)
+  , TimelineTransitionTelemetry(..)
   , TimelineRuntime(..)
   , loadSongSpec
   , parseSongSpecText
@@ -16,6 +17,7 @@ module Player.Timeline
   , prepareTimelineRuntime
   , setTimelineTargets
   , popReadyBars
+  , popTransitionTelemetry
   , timelineRuntimeDone
   ) where
 
@@ -97,6 +99,21 @@ data TimelineBar = TimelineBar
   }
   deriving (Eq, Show)
 
+data TimelineTransitionTelemetry = TimelineTransitionTelemetry
+  { ttFromSectionName     ∷ !String
+  , ttToSectionName       ∷ !String
+  , ttReason              ∷ !String
+  , ttBoundaryBarIx       ∷ !Int
+  , ttBoundaryOffsetFrames ∷ !Word64
+  , ttBaseWeights         ∷ ![(String, Int)]
+  , ttFinalWeights        ∷ ![(String, Int)]
+  , ttMoodTarget          ∷ !(Maybe String)
+  , ttEnergyTarget        ∷ !Float
+  , ttPickTicket          ∷ !Int
+  , ttPickTotal           ∷ !Int
+  }
+  deriving (Eq, Show)
+
 data TimelineRuntime = TimelineRuntime
   { trBars               ∷ ![TimelineBar]
   , trStartFrame         ∷ !Word64
@@ -114,6 +131,7 @@ data TimelineRuntime = TimelineRuntime
   , trTransitionCount    ∷ !Int
   , trTargetMood         ∷ !(Maybe String)
   , trTargetEnergy       ∷ !Float
+  , trPendingTransitions ∷ ![TimelineTransitionTelemetry]
   , trDone               ∷ !Bool
   }
   deriving (Eq, Show)
@@ -216,11 +234,12 @@ prepareTimelineRuntime sampleRateHz startFrame spec =
       , trGeneratedBarCount = 0
       , trNextBarOffset = 0
       , trRngState = seed0
-      , trTransitionCount = 0
-      , trTargetMood = Nothing
-      , trTargetEnergy = 0.5
-      , trDone = M.null (sgSections spec)
-      }
+       , trTransitionCount = 0
+       , trTargetMood = Nothing
+       , trTargetEnergy = 0.5
+       , trPendingTransitions = []
+       , trDone = M.null (sgSections spec)
+       }
 
 setTimelineTargets ∷ Maybe String → Float → TimelineRuntime → TimelineRuntime
 setTimelineTargets mood energy rt =
@@ -249,6 +268,10 @@ popReadyBars now runtime = go [] (ensureGeneratedToHorizon now runtime)
 
 timelineRuntimeDone ∷ TimelineRuntime → Bool
 timelineRuntimeDone rt = trDone rt && trNextBarIx rt >= length (trBars rt)
+
+popTransitionTelemetry ∷ TimelineRuntime → ([TimelineTransitionTelemetry], TimelineRuntime)
+popTransitionTelemetry rt =
+  (reverse (trPendingTransitions rt), rt { trPendingTransitions = [] })
 
 ensureGeneratedToHorizon ∷ Word64 → TimelineRuntime → TimelineRuntime
 ensureGeneratedToHorizon now runtime = go runtime
@@ -285,6 +308,7 @@ appendGeneratedBar rt =
               (trMode rt)
               (trTargetEnergy rt)
               (trTargetMood rt)
+              sectionSpec
               (trGeneratedBarCount rt)
               (trRngState rt)
               (compileSectionNotes (trSampleRateHz rt) (trCurrentSectionName rt) sectionSpec (trInstruments rt))
@@ -326,15 +350,22 @@ advanceSection rt
           case trMode rt of
             SongModeCue -> rt { trDone = True, trCurrentSectionBar = 0 }
             SongModeDrone -> rt { trCurrentSectionBar = 0 }
-        Just (nextSection, nextSeed) ->
+        Just choice ->
           rt
-            { trCurrentSectionName = nextSection
+            { trCurrentSectionName = tcSectionName choice
             , trCurrentSectionBar = 0
-            , trRngState = nextSeed
+            , trRngState = tcNextSeed choice
             , trTransitionCount = trTransitionCount rt + 1
+            , trPendingTransitions = tcTelemetry choice : trPendingTransitions rt
             }
 
-pickNextSection ∷ TimelineRuntime → Maybe (String, Word64)
+data TransitionChoice = TransitionChoice
+  { tcSectionName ∷ !String
+  , tcNextSeed    ∷ !Word64
+  , tcTelemetry   ∷ !TimelineTransitionTelemetry
+  }
+
+pickNextSection ∷ TimelineRuntime → Maybe TransitionChoice
 pickNextSection rt =
   let available = M.keys (trSections rt)
       hasEnding = "ending" `elem` available
@@ -348,7 +379,34 @@ pickNextSection rt =
           then [("ending", 1)]
           else transitionCandidates (trMode rt) (trCurrentSectionName rt) available
       cands = applyRuntimeControlWeights rt cands0
-  in weightedPick (trRngState rt) cands
+      reason =
+        if forceEnding
+          then "forced-ending"
+          else "phrase-boundary-weighted"
+      boundaryBarIx = max 0 (trGeneratedBarCount rt - 1)
+      boundaryOffsetFrames = trNextBarOffset rt
+  in do
+       choice <- weightedPick (trRngState rt) cands
+       let telemetry =
+             TimelineTransitionTelemetry
+               { ttFromSectionName = trCurrentSectionName rt
+               , ttToSectionName = wcName choice
+               , ttReason = reason
+               , ttBoundaryBarIx = boundaryBarIx
+               , ttBoundaryOffsetFrames = boundaryOffsetFrames
+               , ttBaseWeights = cands0
+               , ttFinalWeights = cands
+               , ttMoodTarget = trTargetMood rt
+               , ttEnergyTarget = trTargetEnergy rt
+               , ttPickTicket = wcTicket choice
+               , ttPickTotal = wcTotal choice
+               }
+       pure
+         TransitionChoice
+           { tcSectionName = wcName choice
+           , tcNextSeed = wcNextSeed choice
+           , tcTelemetry = telemetry
+           }
 
 transitionCandidates ∷ SongMode → String → [String] → [(String, Int)]
 transitionCandidates mode current available =
@@ -388,15 +446,16 @@ scaleCandidateWeight ∷ TimelineRuntime → String → Int → Maybe (String, I
 scaleCandidateWeight rt sectionName baseW
   | baseW <= 0 = Nothing
   | otherwise =
-      let energyMult = energyBiasWeight (trTargetEnergy rt) sectionName
-          moodMult = moodBiasWeight (trTargetMood rt) sectionName
+      let sectionSpec = lookupSectionSpec rt sectionName
+          energyMult = energyBiasWeight (trTargetEnergy rt) sectionName sectionSpec
+          moodMult = moodBiasWeight (trTargetMood rt) sectionName sectionSpec
           raw = round (fromIntegral baseW * energyMult * moodMult) ∷ Int
           w' = max 1 raw
       in Just (sectionName, w')
 
-energyBiasWeight ∷ Float → String → Float
-energyBiasWeight targetEnergy sectionName =
-  let profile = sectionEnergyProfile sectionName
+energyBiasWeight ∷ Float → String → Maybe SectionSpec → Float
+energyBiasWeight targetEnergy sectionName sectionSpec =
+  let profile = sectionEnergyProfile sectionName sectionSpec
       target = clamp01 targetEnergy
       closeness = max 0 (1 - abs (target - profile))
       base = 0.2 + 4.8 * closeness * closeness
@@ -408,31 +467,56 @@ energyBiasWeight targetEnergy sectionName =
         | otherwise = 1
   in base * directional
 
-sectionEnergyProfile ∷ String → Float
-sectionEnergyProfile sectionName =
-  case sectionName of
-    "intro" -> 0.20
-    "verse" -> 0.55
-    "chorus" -> 0.90
-    "bridge" -> 0.40
-    "ending" -> 0.10
-    _ -> 0.50
+sectionEnergyProfile ∷ String → Maybe SectionSpec → Float
+sectionEnergyProfile sectionName sectionSpec =
+  let byName =
+        case sectionName of
+          "intro" -> 0.20
+          "verse" -> 0.55
+          "chorus" -> 0.90
+          "bridge" -> 0.40
+          "ending" -> 0.10
+          _ -> 0.50
+      hinted =
+        case sectionSpec of
+          Nothing -> Nothing
+          Just spec -> metadataEnergyHint (sectionDescriptorWords spec)
+  in case hinted of
+       Nothing -> byName
+       Just h -> byName * 0.35 + h * 0.65
 
-moodBiasWeight ∷ Maybe String → String → Float
-moodBiasWeight moodTarget sectionName =
-  case moodTarget of
-    Nothing -> 1
-    Just mood ->
-      case mood of
-        "combat" -> combatProfile sectionName
-        "aggressive" -> combatProfile sectionName
-        "intense" -> combatProfile sectionName
-        "calm" -> calmProfile sectionName
-        "ambient" -> calmProfile sectionName
-        "drone" -> calmProfile sectionName
-        "tense" -> tenseProfile sectionName
-        "suspense" -> tenseProfile sectionName
-        _ -> 1
+metadataEnergyHint ∷ [String] → Maybe Float
+metadataEnergyHint ws
+  | any (`elem` ws) ["aggressive", "intense", "combat", "driving", "heavy", "blast"] = Just 0.90
+  | any (`elem` ws) ["tense", "ominous", "suspense", "dark"] = Just 0.65
+  | any (`elem` ws) ["calm", "ambient", "drone", "slow", "sparse", "soft"] = Just 0.20
+  | any (`elem` ws) ["wide", "floating", "suspended", "dreamy"] = Just 0.40
+  | otherwise = Nothing
+
+moodBiasWeight ∷ Maybe String → String → Maybe SectionSpec → Float
+moodBiasWeight moodTarget sectionName sectionSpec =
+  let legacy =
+        case moodTarget of
+          Nothing -> 1
+          Just mood -> legacyMoodBias mood sectionName
+      metadata =
+        case (moodTarget, sectionSpec) of
+          (Just mood, Just spec) -> moodMetadataBias mood (sectionDescriptorWords spec)
+          _ -> 1
+  in legacy * 0.35 + metadata * 0.65
+
+legacyMoodBias ∷ String → String → Float
+legacyMoodBias mood sectionName =
+  case mood of
+    "combat" -> combatProfile sectionName
+    "aggressive" -> combatProfile sectionName
+    "intense" -> combatProfile sectionName
+    "calm" -> calmProfile sectionName
+    "ambient" -> calmProfile sectionName
+    "drone" -> calmProfile sectionName
+    "tense" -> tenseProfile sectionName
+    "suspense" -> tenseProfile sectionName
+    _ -> 1
   where
     combatProfile name =
       case name of
@@ -459,7 +543,48 @@ moodBiasWeight moodTarget sectionName =
         "ending" -> 0.8
         _ -> 1
 
-weightedPick ∷ Word64 → [(String, Int)] → Maybe (String, Word64)
+moodMetadataBias ∷ String → [String] → Float
+moodMetadataBias mood ws =
+  let isCombat = any (`elem` ws) ["aggressive", "intense", "combat", "driving", "heavy", "blast"]
+      isCalm = any (`elem` ws) ["calm", "ambient", "drone", "slow", "sparse", "soft"]
+      isTense = any (`elem` ws) ["tense", "ominous", "suspense", "dark", "suspended"]
+  in case mood of
+       "combat" -> if isCombat then 2.5 else if isCalm then 0.55 else 1
+       "aggressive" -> if isCombat then 2.5 else if isCalm then 0.55 else 1
+       "intense" -> if isCombat then 2.2 else if isCalm then 0.6 else 1
+       "calm" -> if isCalm then 2.5 else if isCombat then 0.55 else 1
+       "ambient" -> if isCalm then 2.5 else if isCombat then 0.55 else 1
+       "drone" -> if isCalm then 2.3 else if isCombat then 0.6 else 1
+       "tense" -> if isTense then 2.2 else if isCalm then 0.75 else 1
+       "suspense" -> if isTense then 2.2 else if isCalm then 0.75 else 1
+       _ -> 1
+
+lookupSectionSpec ∷ TimelineRuntime → String → Maybe SectionSpec
+lookupSectionSpec rt sectionName = M.lookup sectionName (trSections rt)
+
+sectionDescriptorWords ∷ SectionSpec → [String]
+sectionDescriptorWords spec =
+  nub (wordsLower (ssName spec) <> wordsLower (ssMood spec) <> wordsLower (ssFeel spec))
+
+wordsLower ∷ String → [String]
+wordsLower raw =
+  let mapped = map (\c -> if isWordChar c then toLower c else ' ') raw
+  in filter (not . null) (words mapped)
+
+isWordChar ∷ Char → Bool
+isWordChar c =
+  (c >= 'a' && c <= 'z')
+    || (c >= 'A' && c <= 'Z')
+    || (c >= '0' && c <= '9')
+
+data WeightedChoice = WeightedChoice
+  { wcName     ∷ !String
+  , wcNextSeed ∷ !Word64
+  , wcTicket   ∷ !Int
+  , wcTotal    ∷ !Int
+  }
+
+weightedPick ∷ Word64 → [(String, Int)] → Maybe WeightedChoice
 weightedPick _ [] = Nothing
 weightedPick seed weighted =
   let positive = filter ((> 0) . snd) weighted
@@ -468,8 +593,14 @@ weightedPick seed weighted =
   in if total <= 0
        then Nothing
        else
-         let ticket = fromIntegral (nextSeed `mod` fromIntegral total) ∷ Int
-         in Just (pick ticket positive, nextSeed)
+          let ticket = fromIntegral (nextSeed `mod` fromIntegral total) ∷ Int
+          in Just
+               WeightedChoice
+                 { wcName = pick ticket positive
+                 , wcNextSeed = nextSeed
+                 , wcTicket = ticket
+                 , wcTotal = total
+                 }
   where
     pick _ [] = ""
     pick n ((name, w) : xs)
@@ -483,11 +614,12 @@ varyBarNotes
   ∷ SongMode
   → Float
   → Maybe String
+  → SectionSpec
   → Int
   → Word64
   → [TimelineNote]
   → ([TimelineNote], Word64)
-varyBarNotes mode targetEnergy targetMood absoluteBarIx seed0 notes0
+varyBarNotes mode targetEnergy targetMood sectionSpec absoluteBarIx seed0 notes0
   | null notes0 = ([], nextConductorSeed seed0)
   | otherwise =
       let instrumentIds = nub (map tnInstrumentId notes0)
@@ -499,6 +631,7 @@ varyBarNotes mode targetEnergy targetMood absoluteBarIx seed0 notes0
                     mode
                     targetEnergy
                     targetMood
+                    sectionSpec
                     absoluteBarIx
                     canDropInstrument
                     (seedAcc `xor` fromIntegral (instrumentIdInt iid))
@@ -522,12 +655,13 @@ mutateInstrumentFromNotes
   ∷ SongMode
   → Float
   → Maybe String
+  → SectionSpec
   → Int
   → Bool
   → Word64
   → [TimelineNote]
   → ([TimelineNote], Word64)
-mutateInstrumentFromNotes mode targetEnergy targetMood absoluteBarIx canDrop seed0 notes
+mutateInstrumentFromNotes mode targetEnergy targetMood sectionSpec absoluteBarIx canDrop seed0 notes
   | null notes = ([], nextConductorSeed seed0)
   | otherwise =
       let seed1 = nextConductorSeed (seed0 `xor` fromIntegral absoluteBarIx)
@@ -539,24 +673,24 @@ mutateInstrumentFromNotes mode targetEnergy targetMood absoluteBarIx canDrop see
       in if shouldDrop
            then ([], nextConductorSeed seed1)
            else
-             let seed2 = nextConductorSeed seed1
-                 transposeSemis = chooseTranspose mode targetEnergy targetMood absoluteBarIx seed2
-                 seed3 = nextConductorSeed seed2
-                 density = densityThreshold mode targetEnergy absoluteBarIx seed3
-                 (keptRev, seedN) =
-                   foldl
-                     (selectMutatedNote density transposeSemis)
-                     ([], seed3)
-                     notes
-                 kept = reverse keptRev
-                 out =
-                   if null kept
-                     then
-                       case notes of
-                         [] -> []
-                         firstNote : _ -> [applyTranspose transposeSemis firstNote]
-                     else kept
-             in (out, seedN)
+              let seed2 = nextConductorSeed seed1
+                  transposeSemis = chooseTranspose mode targetEnergy targetMood sectionSpec absoluteBarIx seed2
+                  seed3 = nextConductorSeed seed2
+                  density = densityThreshold mode targetEnergy sectionSpec absoluteBarIx seed3
+                  (keptRev, seedN) =
+                    foldl
+                      (selectMutatedNote density transposeSemis)
+                      ([], seed3)
+                      notes
+                  kept = reverse keptRev
+                  out =
+                    if null kept
+                      then
+                        case notes of
+                          [] -> []
+                          firstNote : _ -> [applyTranspose transposeSemis firstNote]
+                      else kept
+              in (out, seedN)
 
 selectMutatedNote
   ∷ Float
@@ -582,8 +716,8 @@ dropoutThreshold mode energy =
     SongModeCue -> clamp01 (0.28 + (0.5 - clamp01 energy) * 0.24)
     SongModeDrone -> clamp01 (0.16 + (0.5 - clamp01 energy) * 0.16)
 
-densityThreshold ∷ SongMode → Float → Int → Word64 → Float
-densityThreshold mode targetEnergy absoluteBarIx seed =
+densityThreshold ∷ SongMode → Float → SectionSpec → Int → Word64 → Float
+densityThreshold mode targetEnergy sectionSpec absoluteBarIx seed =
   let base =
         case mode of
           SongModeCue -> 0.86
@@ -594,12 +728,13 @@ densityThreshold mode targetEnergy absoluteBarIx seed =
           7 -> -0.28
           _ -> 0
       energyBoost = (clamp01 targetEnergy - 0.5) * 0.35
+      feelBoost = sectionFeelDensityBias sectionSpec
       jitter = (rand01 seed - 0.5) * 0.08
-      raw = base + cycleNudge + energyBoost + jitter
+      raw = base + cycleNudge + energyBoost + feelBoost + jitter
   in max 0.25 (min 0.99 raw)
 
-chooseTranspose ∷ SongMode → Float → Maybe String → Int → Word64 → Int
-chooseTranspose mode targetEnergy targetMood absoluteBarIx seed =
+chooseTranspose ∷ SongMode → Float → Maybe String → SectionSpec → Int → Word64 → Int
+chooseTranspose mode targetEnergy targetMood sectionSpec absoluteBarIx seed =
   let opts =
         case mode of
           SongModeCue -> [0, 0, 2, -2, 3, -3, 5, -5]
@@ -621,13 +756,32 @@ chooseTranspose mode targetEnergy targetMood absoluteBarIx seed =
           Just "ambient" -> -2
           Just "drone" -> -2
           _ -> 0
-      total0 = seeded + barBias + energyMag + moodBias
+      metadataBias = sectionFeelTransposeBias sectionSpec
+      total0 = seeded + barBias + energyMag + moodBias + metadataBias
       total =
         case absoluteBarIx `mod` 8 of
           1 -> if total0 == 0 then 2 else total0
           5 -> if total0 == 0 then -2 else total0
           _ -> total0
   in max (-12) (min 12 total)
+
+sectionFeelDensityBias ∷ SectionSpec → Float
+sectionFeelDensityBias spec =
+  let ws = sectionDescriptorWords spec
+  in if any (`elem` ws) ["dense", "busy", "wall", "thick", "driving", "heavy", "aggressive"]
+       then 0.18
+       else if any (`elem` ws) ["sparse", "minimal", "slow", "spacious", "ambient", "drone", "calm"]
+              then -0.18
+              else 0
+
+sectionFeelTransposeBias ∷ SectionSpec → Int
+sectionFeelTransposeBias spec =
+  let ws = sectionDescriptorWords spec
+  in if any (`elem` ws) ["aggressive", "intense", "rising", "driving"]
+       then 1
+       else if any (`elem` ws) ["calm", "ambient", "drone", "slow", "descending"]
+              then -1
+              else 0
 
 applyTranspose ∷ Int → TimelineNote → TimelineNote
 applyTranspose semis note =

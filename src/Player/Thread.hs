@@ -45,9 +45,11 @@ import Player.Timeline
   ( SongSpec
   , TimelineBar(..)
   , TimelineNote(..)
+  , TimelineTransitionTelemetry
   , TimelineRuntime(..)
   , compileTimelineBars
   , loadSongSpec
+  , popTransitionTelemetry
   , popReadyBars
   , prepareTimelineRuntime
   , setTimelineTargets
@@ -112,6 +114,7 @@ data PlayerEvent
       }
   | PlayerEventTimelineStopped
   | PlayerEventTimelineFinished
+  | PlayerEventTimelineTransition !TimelineTransitionTelemetry
   | PlayerEventScheduled
       { peFrame ∷ !Word64
       , peAction ∷ !ScheduledAudioAction
@@ -391,13 +394,15 @@ pumpTimeline audioSys evQ playerStateRef = do
     Just runtime -> do
       now <- readTransportFrame audioSys
       let (readyBars, runtime') = popReadyBars now runtime
-      ps' <- foldM (scheduleTimelineBar audioSys evQ runtime') ps readyBars
-      if timelineRuntimeDone runtime'
+          (transitionTelemetry, runtime'') = popTransitionTelemetry runtime'
+      mapM_ (Q.writeQueue evQ . PlayerEventTimelineTransition) transitionTelemetry
+      ps' <- foldM (scheduleTimelineBar audioSys evQ runtime'') ps readyBars
+      if timelineRuntimeDone runtime''
         then do
           writeIORef playerStateRef ps' { pstTimeline = Nothing }
           Q.writeQueue evQ PlayerEventTimelineFinished
         else
-          writeIORef playerStateRef ps' { pstTimeline = Just runtime' }
+          writeIORef playerStateRef ps' { pstTimeline = Just runtime'' }
 
 scheduleTimelineBar
   ∷ AudioSystem

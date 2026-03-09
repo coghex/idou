@@ -37,6 +37,7 @@ The timeline parser supports:
 At runtime, `Player.Thread` now runs a conductor that advances sections at phrase boundaries using Haskell-defined weighted transitions (not YAML-defined transition graphs).
 The runtime also applies deterministic per-bar variation (density gating, transposition windows, and instrument-layer dropout) so repeated section patterns evolve without changing YAML.
 Live control is available via player messages: `PlayerSetMoodTarget`, `PlayerClearMoodTarget`, and `PlayerSetEnergyTarget`; these steer both section selection and variation intensity while the timeline is running.
+Transition observability is exposed via `PlayerEventTimelineTransition`, which reports section boundary transitions with from/to sections, reason, candidate weights (base + final), boundary timing, active mood/energy targets, and weighted-pick ticket info.
 
 Pattern note syntax is a comma-separated list of `beat/key/duration/velocity`, for example:
 
