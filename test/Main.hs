@@ -39,7 +39,13 @@ import Audio.Thread.Voice
   )
 import Audio.Types
 import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
-import Midi.Play.Util (pushHeldNote, popHeldNote, ticksToMicroseconds)
+import Midi.Play.Util
+  ( pushHeldNote
+  , popHeldNote
+  , enqueueDeferredRelease
+  , takeDeferredReleases
+  , ticksToMicroseconds
+  )
 import Engine.Core.Queue (newQueue)
 
 data TestCase = TestCase
@@ -93,6 +99,7 @@ testCases =
   , TestCase "midi-controller-state-clamps-and-resets" testMidiControllerStateClampsAndResets
   , TestCase "midi-controller-conversions-are-normalized" testMidiControllerConversionsAreNormalized
   , TestCase "midi-held-notes-release-oldest-instance-first" testMidiHeldNotesReleaseOldestInstanceFirst
+  , TestCase "midi-deferred-releases-preserve-noteoff-order" testMidiDeferredReleasesPreserveNoteOffOrder
   , TestCase "midi-tick-conversion-basic" testMidiTickConversionBasic
   , TestCase "midi-tick-conversion-rejects-zero-ppqn" testMidiTickConversionRejectsZeroPpqn
   , TestCase "poly-aftertouch-targets-matching-note-instance" testPolyAftertouchTargetsMatchingNoteInstance
@@ -352,6 +359,27 @@ testMidiHeldNotesReleaseOldestInstanceFirst = do
   assertEqual "first release should match first note-on" (Just firstId) released1
   assertEqual "second release should match second note-on" (Just secondId) released2
   assertBool "held stack should be empty after two pops" (M.null held4)
+
+testMidiDeferredReleasesPreserveNoteOffOrder ∷ IO ()
+testMidiDeferredReleasesPreserveNoteOffOrder = do
+  let firstId = NoteInstanceId 1
+      secondId = NoteInstanceId 2
+      held0 = M.empty
+      held1 = pushHeldNote 0 60 firstId held0
+      held2 = pushHeldNote 0 60 secondId held1
+      (released1, held3) = popHeldNote 0 60 held2
+      deferred1 =
+        case released1 of
+          Nothing -> M.empty
+          Just instId -> enqueueDeferredRelease 0 instId M.empty
+      (released2, _held4) = popHeldNote 0 60 held3
+      deferred2 =
+        case released2 of
+          Nothing -> deferred1
+          Just instId -> enqueueDeferredRelease 0 instId deferred1
+      (flushedIds, deferred3) = takeDeferredReleases 0 deferred2
+  assertEqual "deferred flush order should follow note-off order" [firstId, secondId] flushedIds
+  assertBool "channel deferred list should be removed after flush" (M.null deferred3)
 
 testMidiTickConversionBasic ∷ IO ()
 testMidiTickConversionBasic =

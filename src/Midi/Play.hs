@@ -23,7 +23,13 @@ import Audio.Types
   , NoteKey(..)
   , NoteInstanceId(..)
   )
-import Midi.Play.Util (pushHeldNote, popHeldNote, ticksToMicroseconds)
+import Midi.Play.Util
+  ( pushHeldNote
+  , popHeldNote
+  , enqueueDeferredRelease
+  , takeDeferredReleases
+  , ticksToMicroseconds
+  )
 import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
 
 import Midi.ZMidi.Core.ReadFile (readMidi)
@@ -232,7 +238,7 @@ playMidiFile chanMap sys fp = do
           Just instId -> do
             let sustainDown = M.findWithDefault False ch sustainMap
             if sustainDown
-              then pure (held', M.insertWith (++) ch [instId] deferred)
+              then pure (held', enqueueDeferredRelease ch instId deferred)
               else do
                 sendAudio sys $
                   AudioNoteOff
@@ -243,17 +249,19 @@ playMidiFile chanMap sys fp = do
 
     flushDeferred :: Int -> DeferredReleases -> IO DeferredReleases
     flushDeferred ch deferred =
-      case M.lookup ch deferred of
-        Nothing -> pure deferred
-        Just instIds -> do
-          let iid = channelToInstrument chanMap ch
-          forM_ instIds $ \instId ->
-            sendAudio sys $
-              AudioNoteOff
-                { instrumentId = iid
-                , noteInstanceId = instId
-                }
-          pure (M.delete ch deferred)
+      let (instIds, deferred') = takeDeferredReleases ch deferred
+      in
+        if null instIds
+          then pure deferred'
+          else do
+            let iid = channelToInstrument chanMap ch
+            forM_ instIds $ \instId ->
+              sendAudio sys $
+                AudioNoteOff
+                  { instrumentId = iid
+                  , noteInstanceId = instId
+                  }
+            pure deferred'
 
     dropHeldChannel :: Int -> HeldNotes -> HeldNotes
     dropHeldChannel ch = M.filterWithKey (\(ch', _) _ -> ch' /= ch)

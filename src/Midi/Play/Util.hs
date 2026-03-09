@@ -3,6 +3,8 @@
 module Midi.Play.Util
   ( pushHeldNote
   , popHeldNote
+  , enqueueDeferredRelease
+  , takeDeferredReleases
   , ticksToMicroseconds
   ) where
 
@@ -13,6 +15,7 @@ import qualified Data.Map.Strict as M
 import Audio.Types (NoteInstanceId)
 
 type HeldNotes = Map (Int, Int) [NoteInstanceId]
+type DeferredReleases = Map Int [NoteInstanceId]
 
 pushHeldNote ∷ Int → Int → NoteInstanceId → HeldNotes → HeldNotes
 pushHeldNote ch key instId =
@@ -29,6 +32,16 @@ popHeldNote ch key held =
               then M.delete (ch, key) held
               else M.insert (ch, key) rest held
       in (Just instId, held')
+
+enqueueDeferredRelease ∷ Int → NoteInstanceId → DeferredReleases → DeferredReleases
+enqueueDeferredRelease ch instId =
+  M.insertWith (flip (++)) ch [instId]
+
+takeDeferredReleases ∷ Int → DeferredReleases → ([NoteInstanceId], DeferredReleases)
+takeDeferredReleases ch deferred =
+  case M.lookup ch deferred of
+    Nothing -> ([], deferred)
+    Just instIds -> (instIds, M.delete ch deferred)
 
 ticksToMicroseconds ∷ Int → Int → Int → Int
 ticksToMicroseconds ppqn tempoUSPerQN dtTicks
