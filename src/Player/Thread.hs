@@ -32,13 +32,14 @@ import Audio.Types
   , AudioEvent
   , AudioMsg(..)
   , ClipId
-  , InstrumentId
+  , InstrumentId(..)
   , NoteInstanceId(..)
-  , NoteKey
+  , NoteKey(..)
   , ScheduledAudioAction(..)
   , sampleRate
   )
 import Audio.Envelope (ADSR)
+import Audio.Patch (gmDrumInstrument)
 import Engine.Core.Queue (Queue)
 import qualified Engine.Core.Queue as Q
 import Engine.Core.Thread (ThreadControl(..), ThreadState(..))
@@ -579,22 +580,27 @@ scheduleNotePair
   → TimelineNote
   → IO (Word64, Int)
 scheduleNotePair audioSys evQ barStart (nextInst, ix) note = do
+  let (schedIid, schedKey, drumKey) = remapScheduledDrumNote (tnInstrumentId note) (tnKey note)
+  case drumKey of
+    Nothing -> pure ()
+    Just key ->
+      sendAudio audioSys (AudioLoadInstrument schedIid (gmDrumInstrument key))
   let noteInst = NoteInstanceId nextInst
       noteOnFrame = barStart + tnOnOffsetFrames note
       noteOffFrame = barStart + tnOffOffsetFrames note
       onAction =
         ScheduledNoteOn
-          { saInstrumentId = tnInstrumentId note
+          { saInstrumentId = schedIid
           , saAmp = tnAmp note
           , saPan = tnPan note
-          , saNoteKey = tnKey note
+          , saNoteKey = schedKey
           , saNoteInstanceId = noteInst
           , saVelocity = tnVelocity note
           , saAdsrOverride = Nothing
           }
       offAction =
         ScheduledNoteOff
-          { saInstrumentId = tnInstrumentId note
+          { saInstrumentId = schedIid
           , saNoteInstanceId = noteInst
           }
   scheduleAudioActionAtFrame audioSys noteOnFrame onAction
@@ -602,6 +608,19 @@ scheduleNotePair audioSys evQ barStart (nextInst, ix) note = do
   Q.writeQueue evQ (PlayerEventScheduled noteOnFrame onAction)
   Q.writeQueue evQ (PlayerEventScheduled noteOffFrame offAction)
   pure (nextInst + 1, ix + 1)
+
+remapScheduledDrumNote ∷ InstrumentId → NoteKey → (InstrumentId, NoteKey, Maybe Int)
+remapScheduledDrumNote iid key =
+  case (iid, key) of
+    (InstrumentId 9, NoteKey drumKey) ->
+      (timelineDrumInstrumentId drumKey, NoteKey 60, Just drumKey)
+    _ ->
+      (iid, key, Nothing)
+
+timelineDrumInstrumentId ∷ Int → InstrumentId
+timelineDrumInstrumentId key =
+  -- Reserve upper MIDI-range instrument slots for per-key drum patches.
+  InstrumentId (128 + max 0 (min 127 key))
 
 drainAudioEvents ∷ AudioSystem → Queue PlayerEvent → IO ()
 drainAudioEvents audioSys evQ = do

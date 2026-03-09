@@ -51,6 +51,7 @@ data InstrumentPatternSpec = InstrumentPatternSpec
   , ipAmp         ∷ !Float
   , ipPan         ∷ !Float
   , ipPatterns    ∷ !(Map String [PatternNote])
+  , ipFills       ∷ !(Map String [PatternNote])
   }
   deriving (Eq, Show)
 
@@ -196,10 +197,17 @@ compileTimelineBars sampleRateHz spec = reverse barsRev
               phraseCount = max 1 (ssPhraseCount sectionSpec)
               barCount = barsPerPhrase * phraseCount
               barFrames = sectionBarFrames sampleRateHz sectionSpec
-              notes = compileSectionNotes sampleRateHz sectionName sectionSpec (sgInstruments spec)
               buildBar i =
                 let i64 = fromIntegral i ∷ Word64
                     absIx' = absIx + i
+                    notes =
+                      compileSectionNotes
+                        sampleRateHz
+                        sectionName
+                        sectionSpec
+                        (i `mod` barsPerPhrase)
+                        barsPerPhrase
+                        (sgInstruments spec)
                 in TimelineBar
                     { tbSectionName = sectionName
                     , tbAbsoluteBarIx = absIx'
@@ -308,10 +316,19 @@ appendGeneratedBar rt =
               (trMode rt)
               (trTargetEnergy rt)
               (trTargetMood rt)
-              sectionSpec
-              (trGeneratedBarCount rt)
-              (trRngState rt)
-              (compileSectionNotes (trSampleRateHz rt) (trCurrentSectionName rt) sectionSpec (trInstruments rt))
+               sectionSpec
+               (barIx `mod` barsPerPhrase)
+               barsPerPhrase
+               (trGeneratedBarCount rt)
+               (trRngState rt)
+               ( compileSectionNotes
+                   (trSampleRateHz rt)
+                   (trCurrentSectionName rt)
+                   sectionSpec
+                   (barIx `mod` barsPerPhrase)
+                   barsPerPhrase
+                   (trInstruments rt)
+               )
           bar =
             TimelineBar
               { tbSectionName = trCurrentSectionName rt
@@ -348,7 +365,15 @@ advanceSection rt
       case pickNextSection rt of
         Nothing ->
           case trMode rt of
-            SongModeCue -> rt { trDone = True, trCurrentSectionBar = 0 }
+            SongModeCue ->
+              if hasEndingSection (M.keys (trSections rt))
+                then
+                  rt
+                    { trCurrentSectionName = preferredEndingSectionName (M.keys (trSections rt))
+                    , trCurrentSectionBar = 0
+                    , trTransitionCount = trTransitionCount rt + 1
+                    }
+                else rt { trCurrentSectionBar = 0 }
             SongModeDrone -> rt { trCurrentSectionBar = 0 }
         Just choice ->
           rt
@@ -687,10 +712,12 @@ varyBarNotes
   → Maybe String
   → SectionSpec
   → Int
+  → Int
+  → Int
   → Word64
   → [TimelineNote]
   → ([TimelineNote], Word64)
-varyBarNotes mode targetEnergy targetMood sectionSpec absoluteBarIx seed0 notes0
+varyBarNotes mode targetEnergy targetMood sectionSpec barInPhrase barsPerPhrase absoluteBarIx seed0 notes0
   | null notes0 = ([], nextConductorSeed seed0)
   | otherwise =
       let instrumentIds = nub (map tnInstrumentId notes0)
@@ -703,6 +730,8 @@ varyBarNotes mode targetEnergy targetMood sectionSpec absoluteBarIx seed0 notes0
                     targetEnergy
                     targetMood
                     sectionSpec
+                    barInPhrase
+                    barsPerPhrase
                     iid
                     absoluteBarIx
                     canDropInstrument
@@ -728,13 +757,15 @@ mutateInstrumentFromNotes
   → Float
   → Maybe String
   → SectionSpec
+  → Int
+  → Int
   → InstrumentId
   → Int
   → Bool
   → Word64
   → [TimelineNote]
   → ([TimelineNote], Word64)
-mutateInstrumentFromNotes mode targetEnergy targetMood sectionSpec instrumentId absoluteBarIx canDrop seed0 notes
+mutateInstrumentFromNotes mode targetEnergy targetMood sectionSpec barInPhrase barsPerPhrase instrumentId absoluteBarIx canDrop seed0 notes
   | null notes = ([], nextConductorSeed seed0)
   | otherwise =
       let seed1 = nextConductorSeed (seed0 `xor` fromIntegral absoluteBarIx)
@@ -743,7 +774,7 @@ mutateInstrumentFromNotes mode targetEnergy targetMood sectionSpec instrumentId 
           shouldDrop =
             (not isDrums)
               && canDrop
-              && barDropEligible absoluteBarIx
+              && barDropEligible barInPhrase barsPerPhrase absoluteBarIx
               && dropRoll < dropoutThreshold mode targetEnergy sectionSpec
       in if shouldDrop
            then ([], nextConductorSeed seed1)
@@ -786,10 +817,11 @@ selectMutatedNote density transposeSemis (acc, seed0) note =
        then (applyTranspose transposeSemis note : acc, seed1)
        else (acc, seed1)
 
-barDropEligible ∷ Int → Bool
-barDropEligible absoluteBarIx =
+barDropEligible ∷ Int → Int → Int → Bool
+barDropEligible barInPhrase barsPerPhrase absoluteBarIx =
   let slot = absoluteBarIx `mod` 8
-  in slot == 6 || slot == 7
+      phraseEnd = barsPerPhrase > 0 && barInPhrase == (barsPerPhrase - 1)
+  in phraseEnd || slot == 6 || slot == 7
 
 dropoutThreshold ∷ SongMode → Float → SectionSpec → Float
 dropoutThreshold mode energy sectionSpec =
@@ -943,9 +975,11 @@ compileSectionNotes
   ∷ Word32
   → String
   → SectionSpec
+  → Int
+  → Int
   → [InstrumentPatternSpec]
   → [TimelineNote]
-compileSectionNotes sampleRateHz sectionName sectionSpec insts =
+compileSectionNotes sampleRateHz sectionName sectionSpec barInPhrase barsPerPhrase insts =
   let melodic = concatMap perInstrument insts
       hasDrums =
         any
@@ -954,7 +988,7 @@ compileSectionNotes sampleRateHz sectionName sectionSpec insts =
       fallbackDrums =
         if hasDrums
           then []
-          else compileFallbackDrumNotes sectionName sectionSpec framesPerBeat
+          else compileFallbackDrumNotes sectionName sectionSpec barInPhrase barsPerPhrase framesPerBeat
   in melodic <> fallbackDrums
   where
     framesPerBeat =
@@ -962,11 +996,20 @@ compileSectionNotes sampleRateHz sectionName sectionSpec insts =
         * 60
         / realToFrac (max 1 (ssTempoBpm sectionSpec))
     perInstrument inst =
-      let notes = M.findWithDefault [] sectionName (ipPatterns inst)
+      let beatNotes = M.findWithDefault [] sectionName (ipPatterns inst)
+          fillNotes = M.findWithDefault [] sectionName (ipFills inst)
+          useFill =
+            isDrumInstrumentId (ipInstrumentId inst)
+              && isPhraseBoundaryBar barInPhrase barsPerPhrase
+              && not (null fillNotes)
+          notes =
+            if useFill
+              then fillNotes
+              else beatNotes
       in map (compilePatternNote framesPerBeat inst) notes
 
-compileFallbackDrumNotes ∷ String → SectionSpec → Double → [TimelineNote]
-compileFallbackDrumNotes sectionName sectionSpec framesPerBeat =
+compileFallbackDrumNotes ∷ String → SectionSpec → Int → Int → Double → [TimelineNote]
+compileFallbackDrumNotes sectionName sectionSpec barInPhrase barsPerPhrase framesPerBeat =
   let inst =
         InstrumentPatternSpec
           { ipName = "auto-drums"
@@ -974,11 +1017,15 @@ compileFallbackDrumNotes sectionName sectionSpec framesPerBeat =
           , ipAmp = 1
           , ipPan = 0
           , ipPatterns = M.empty
+          , ipFills = M.empty
           }
       beats = max 1 (ssBeatsPerBar sectionSpec)
       sectionN = normalizeSectionName sectionName
+      phraseBoundary = isPhraseBoundaryBar barInPhrase barsPerPhrase
       kickBeats =
-        if sectionN == "intro" || isEndingSectionName sectionN
+        if phraseBoundary
+          then filter (< fromIntegral beats) [0, 1.5, 2.5]
+          else if sectionN == "intro" || isEndingSectionName sectionN
           then [0]
           else if sectionN == "bridge"
                  then [0]
@@ -987,7 +1034,7 @@ compileFallbackDrumNotes sectionName sectionSpec framesPerBeat =
                         else filter (< fromIntegral beats) [0, 2]
       snareBeats =
         if sectionN == "intro" || isEndingSectionName sectionN
-          then []
+          then if phraseBoundary then [fromIntegral (beats - 1)] else []
           else if beats >= 4
                  then [1, 3]
                  else [fromIntegral (beats - 1)]
@@ -1007,7 +1054,14 @@ compileFallbackDrumNotes sectionName sectionSpec framesPerBeat =
         map (\b -> mk b 36 0.25 0.9) kickBeats
           <> map (\b -> mk b 38 0.25 0.85) snareBeats
           <> map (\b -> mk b 42 0.12 (if sectionN == "chorus" then 0.58 else 0.45)) hatBeats
+          <> if phraseBoundary
+               then map (\b -> mk b 47 0.2 0.72) (filter (< fromIntegral beats) [fromIntegral beats - 1, fromIntegral beats - 0.5])
+               else []
   in map (compilePatternNote framesPerBeat inst) patternNotes
+
+isPhraseBoundaryBar ∷ Int → Int → Bool
+isPhraseBoundaryBar barInPhrase barsPerPhrase =
+  barsPerPhrase > 0 && barInPhrase == (barsPerPhrase - 1)
 
 beatGrid ∷ Float → Float → [Float]
 beatGrid step beats
@@ -1115,6 +1169,7 @@ parseInstruments sectionNames entries = do
       pan <- lookupFloatKeyDefault ["instruments", name, "pan"] 0 entries
       ensure (iid >= 0) ("instruments." <> name <> ".instrument_id must be >= 0")
       patterns <- mapM (parseSectionPattern name) sectionNames
+      fills <- mapM (parseSectionFillPattern name) sectionNames
       pure
         InstrumentPatternSpec
           { ipName = name
@@ -1122,11 +1177,22 @@ parseInstruments sectionNames entries = do
           , ipAmp = amp
           , ipPan = pan
           , ipPatterns = M.fromList patterns
+          , ipFills = M.fromList fills
           }
 
     parseSectionPattern instName sectionName = do
       let dottedPath = ["instruments", instName, "patterns", sectionName]
           prefixedPath = ["instruments", instName, "pattern_" <> sectionName]
+          raw =
+            case M.lookup dottedPath entries of
+              Just txt -> txt
+              Nothing -> lookupTextDefault prefixedPath "" entries
+      notes <- parsePatternNotes sectionName raw
+      pure (sectionName, notes)
+
+    parseSectionFillPattern instName sectionName = do
+      let dottedPath = ["instruments", instName, "fills", sectionName]
+          prefixedPath = ["instruments", instName, "fill_" <> sectionName]
           raw =
             case M.lookup dottedPath entries of
               Just txt -> txt

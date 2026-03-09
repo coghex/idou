@@ -36,6 +36,9 @@ The timeline parser supports:
 - `instruments.<name>` with `instrument_id`, optional `amp`, `pan`, and section patterns via either:
   - `patterns.<section>: ...`
   - `pattern_<section>: ...`
+  - optional drum fill patterns per section via either:
+    - `fills.<section>: ...`
+    - `fill_<section>: ...`
 
 At runtime, `Player.Thread` now runs a conductor that advances sections at phrase boundaries using Haskell-defined weighted transitions (not YAML-defined transition graphs).
 Cue-mode transition rules are structured for song form: `intro → verse`, then `verse/chorus/bridge → chorus|bridge|ending(outro)`, and timelines always resolve to an ending/outro section.
@@ -46,6 +49,8 @@ Runtime automation lanes are available via `PlayerAutomateEnergyNextBar` (with `
 Transition observability is exposed via `PlayerEventTimelineTransition`, which reports section boundary transitions with from/to sections, reason, candidate weights (base + final), boundary timing, active mood/energy targets, and weighted-pick ticket info.
 
 If a section has no explicit drum pattern, timeline generation now injects a fallback drum groove on instrument/channel 10 (`InstrumentId 9`) so tracks keep percussion by default.
+For drum instruments (channel/instrument 10, `InstrumentId 9`), fills are applied automatically on phrase-boundary bars when a section fill is defined.
+Timeline drum notes now load per-key GM drum patches at scheduling time, so kick/snare/hat/tom keys produce distinct drum timbres during timeline playback.
 
 Pattern note syntax is a comma-separated list of `beat/key/duration/velocity`, for example:
 

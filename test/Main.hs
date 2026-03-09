@@ -133,6 +133,8 @@ testCases =
   , TestCase "timeline-conductor-transitions-at-phrase-boundary" testTimelineConductorTransitionsAtPhraseBoundary
   , TestCase "timeline-pattern-variation-is-deterministic" testTimelinePatternVariationIsDeterministic
   , TestCase "timeline-transition-rules-are-structured" testTimelineTransitionRulesAreStructured
+  , TestCase "timeline-cue-without-ending-does-not-stop-early" testTimelineCueWithoutEndingDoesNotStopEarly
+  , TestCase "timeline-drum-fills-trigger-at-phrase-boundary" testTimelineDrumFillsTriggerAtPhraseBoundary
   , TestCase "timeline-default-drums-are-present" testTimelineDefaultDrumsArePresent
   , TestCase "timeline-chorus-stability-vs-bridge-variation" testTimelineChorusStabilityVsBridgeVariation
   , TestCase "timeline-energy-target-steers-density" testTimelineEnergyTargetSteersDensity
@@ -327,7 +329,7 @@ testTimelineLookaheadPopsReadyBars = do
           , "  mode: cue"
           , "  lookahead_bars: 2"
           , "sections:"
-          , "  intro:"
+          , "  ending:"
           , "    tempo_bpm: 120"
           , "    beats_per_bar: 4"
           , "    bars_per_phrase: 4"
@@ -337,7 +339,7 @@ testTimelineLookaheadPopsReadyBars = do
           , "    instrument_id: 0"
           , "    amp: 1"
           , "    pan: 0"
-          , "    pattern_intro: 0/60/0.5/1"
+          , "    pattern_ending: 0/60/0.5/1"
           ]
   spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
   let runtime0 = prepareTimelineRuntime testSampleRate 1000 spec
@@ -563,8 +565,8 @@ testTimelineTransitionRulesAreStructured = do
   assertEqual "song should always end on ending section" "ending" (last names)
   assertBool "cue timeline should complete" (timelineRuntimeDone runtimeFinal)
 
-testTimelineDefaultDrumsArePresent ∷ IO ()
-testTimelineDefaultDrumsArePresent = do
+testTimelineCueWithoutEndingDoesNotStopEarly ∷ IO ()
+testTimelineCueWithoutEndingDoesNotStopEarly = do
   let yamlText =
         unlines
           [ "song:"
@@ -574,6 +576,56 @@ testTimelineDefaultDrumsArePresent = do
           , "  intro:"
           , "    tempo_bpm: 120"
           , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  verse:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  chorus:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pulse:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8"
+          , "    pattern_verse: 0/62/1/0.8"
+          , "    pattern_chorus: 0/64/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      bars = takeTimelineBars 24 0 0 [] runtime0
+      hasVerse = any ((== "verse") . tbSectionName) bars
+      hasChorus = any ((== "chorus") . tbSectionName) bars
+  assertEqual "expected requested number of bars" 24 (length bars)
+  assertBool "should continue running without ending section" hasVerse
+  assertBool "should still transition within available sections" hasChorus
+  where
+    takeTimelineBars ∷ Int → Word64 → Int → [TimelineBar] → TimelineRuntime → [TimelineBar]
+    takeTimelineBars target now loops acc rt
+      | loops > 400 = acc
+      | length acc >= target = take target acc
+      | otherwise =
+          let (batch, rt') = popReadyBars now rt
+              acc' = acc <> batch
+          in takeTimelineBars target (now + 120000) (loops + 1) acc' rt'
+
+testTimelineDefaultDrumsArePresent ∷ IO ()
+testTimelineDefaultDrumsArePresent = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
           , "    bars_per_phrase: 4"
           , "    phrase_count: 1"
           , "instruments:"
@@ -581,7 +633,7 @@ testTimelineDefaultDrumsArePresent = do
           , "    instrument_id: 0"
           , "    amp: 1"
           , "    pan: 0"
-          , "    pattern_intro: 0/60/1/0.8"
+          , "    pattern_ending: 0/60/1/0.8"
           ]
   spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
   let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
@@ -592,6 +644,45 @@ testTimelineDefaultDrumsArePresent = do
           (tbNotes bar)
   assertBool "expected bars for default drum fallback test" (not (null bars))
   assertBool "every generated bar should include fallback drum notes" (all hasDrums bars)
+
+testTimelineDrumFillsTriggerAtPhraseBoundary ∷ IO ()
+testTimelineDrumFillsTriggerAtPhraseBoundary = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 4"
+          , "    phrase_count: 2"
+          , "instruments:"
+          , "  drums:"
+          , "    instrument_id: 9"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_ending: 0/36/0.25/0.9,2/38/0.25/0.9"
+          , "    fill_ending: 0/47/0.25/0.8,1/45/0.25/0.8,2/43/0.25/0.8,3/41/0.25/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (bars, _done) = drainTimelineBarsForTest 0 0 [] runtime0
+      hasKey key bar =
+        any
+          (\n ->
+             let NoteKey k = tnKey n
+             in k == key)
+          (tbNotes bar)
+      boundaryBars = filter (\b -> tbBarInPhrase b == 3) bars
+      nonBoundaryBars = filter (\b -> tbBarInPhrase b /= 3) bars
+  assertEqual "expected 8 bars from two 4-bar phrases" 8 (length bars)
+  assertEqual "expected two phrase-boundary bars" 2 (length boundaryBars)
+  assertBool "boundary bars should use fill tom notes" (all (hasKey 47) boundaryBars)
+  assertBool "boundary bars should not keep base kick note when fill is defined" (all (not . hasKey 36) boundaryBars)
+  assertBool "non-boundary bars should keep base beat notes" (all (hasKey 36) nonBoundaryBars)
+  assertBool "non-boundary bars should not contain fill tom note" (all (not . hasKey 47) nonBoundaryBars)
 
 testTimelineChorusStabilityVsBridgeVariation ∷ IO ()
 testTimelineChorusStabilityVsBridgeVariation = do
@@ -654,7 +745,7 @@ testTimelinePatternVariationIsDeterministic = do
           , "  mode: cue"
           , "  lookahead_bars: 4"
           , "sections:"
-          , "  intro:"
+          , "  ending:"
           , "    tempo_bpm: 120"
           , "    beats_per_bar: 4"
           , "    bars_per_phrase: 8"
@@ -664,12 +755,12 @@ testTimelinePatternVariationIsDeterministic = do
           , "    instrument_id: 0"
           , "    amp: 1"
           , "    pan: 0"
-          , "    pattern_intro: 0/60/0.5/0.9,1/62/0.5/0.9,2/64/0.5/0.9,3/65/0.5/0.9"
+          , "    pattern_ending: 0/60/0.5/0.9,1/62/0.5/0.9,2/64/0.5/0.9,3/65/0.5/0.9"
           , "  drone:"
           , "    instrument_id: 1"
           , "    amp: 0.8"
           , "    pan: -0.2"
-          , "    pattern_intro: 0/48/2/0.7,2/50/2/0.7"
+          , "    pattern_ending: 0/48/2/0.7,2/50/2/0.7"
           ]
   spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
   let baselineBars = compileTimelineBars testSampleRate spec
@@ -698,7 +789,7 @@ testTimelineEnergyTargetSteersDensity = do
           , "  mode: cue"
           , "  lookahead_bars: 4"
           , "sections:"
-          , "  intro:"
+          , "  ending:"
           , "    tempo_bpm: 120"
           , "    beats_per_bar: 4"
           , "    bars_per_phrase: 12"
@@ -708,12 +799,12 @@ testTimelineEnergyTargetSteersDensity = do
           , "    instrument_id: 0"
           , "    amp: 1"
           , "    pan: 0"
-          , "    pattern_intro: 0/60/0.25/0.9,0.5/62/0.25/0.9,1/64/0.25/0.9,1.5/65/0.25/0.9,2/67/0.25/0.9,2.5/69/0.25/0.9,3/71/0.25/0.9,3.5/72/0.25/0.9"
+          , "    pattern_ending: 0/60/0.25/0.9,0.5/62/0.25/0.9,1/64/0.25/0.9,1.5/65/0.25/0.9,2/67/0.25/0.9,2.5/69/0.25/0.9,3/71/0.25/0.9,3.5/72/0.25/0.9"
           , "  drone:"
           , "    instrument_id: 1"
           , "    amp: 0.7"
           , "    pan: -0.1"
-          , "    pattern_intro: 0/48/2/0.6,2/50/2/0.6"
+          , "    pattern_ending: 0/48/2/0.6,2/50/2/0.6"
           ]
   spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
   let runtimeLow0 = setTimelineTargets Nothing 0.1 (prepareTimelineRuntime testSampleRate 0 spec)
@@ -803,7 +894,7 @@ testTimelineMoodTargetSteersTransposition = do
           , "  mode: cue"
           , "  lookahead_bars: 4"
           , "sections:"
-          , "  intro:"
+          , "  ending:"
           , "    tempo_bpm: 120"
           , "    beats_per_bar: 4"
           , "    bars_per_phrase: 8"
@@ -813,7 +904,7 @@ testTimelineMoodTargetSteersTransposition = do
           , "    instrument_id: 0"
           , "    amp: 1"
           , "    pan: 0"
-          , "    pattern_intro: 0/60/1/0.8,1/62/1/0.8,2/64/1/0.8,3/65/1/0.8"
+          , "    pattern_ending: 0/60/1/0.8,1/62/1/0.8,2/64/1/0.8,3/65/1/0.8"
           ]
   spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
   let runtimeCalm0 = setTimelineTargets (Just "ambient") 0.5 (prepareTimelineRuntime testSampleRate 0 spec)
@@ -1000,7 +1091,7 @@ testTimelineSectionFeelSteersVariation = do
             , "  mode: cue"
             , "  lookahead_bars: 4"
             , "sections:"
-            , "  intro:"
+            , "  ending:"
             , "    tempo_bpm: 120"
             , "    beats_per_bar: 4"
             , "    bars_per_phrase: 10"
@@ -1012,7 +1103,7 @@ testTimelineSectionFeelSteersVariation = do
             , "    instrument_id: 0"
             , "    amp: 1"
             , "    pan: 0"
-            , "    pattern_intro: 0/60/0.25/0.9,0.5/62/0.25/0.9,1/64/0.25/0.9,1.5/65/0.25/0.9,2/67/0.25/0.9,2.5/69/0.25/0.9,3/71/0.25/0.9,3.5/72/0.25/0.9"
+            , "    pattern_ending: 0/60/0.25/0.9,0.5/62/0.25/0.9,1/64/0.25/0.9,1.5/65/0.25/0.9,2/67/0.25/0.9,2.5/69/0.25/0.9,3/71/0.25/0.9,3.5/72/0.25/0.9"
             ]
   sparseSpec <- either (\err -> error ("parse sparse spec failed: " <> err)) pure (mkSpec "sparse ambient")
   denseSpec <- either (\err -> error ("parse dense spec failed: " <> err)) pure (mkSpec "dense driving")
