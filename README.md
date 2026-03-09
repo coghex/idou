@@ -11,3 +11,9 @@ Run with:
 ```bash
 cabal run idou -- path/to/file.mid
 ```
+
+Optional runtime health telemetry:
+
+```bash
+cabal run idou -- --audio-health=verbose path/to/file.mid
+```

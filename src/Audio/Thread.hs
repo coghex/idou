@@ -5,6 +5,7 @@ module Audio.Thread
   ( startAudioSystem
   , stopAudioSystem
   , sendAudio
+  , AudioHealthVerbosity(..)
   , AudioSystem(..)
   ) where
 
@@ -40,11 +41,17 @@ data AudioSystem = AudioSystem
   , asRingBuffer ∷ !(Ptr MaRB)
   }
 
+data AudioHealthVerbosity
+  = AudioHealthOff
+  | AudioHealthNormal
+  | AudioHealthVerbose
+  deriving (Eq, Show)
+
 sendAudio ∷ AudioSystem → AudioMsg → IO ()
 sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
 
-startAudioSystem ∷ AudioConfig → IO AudioSystem
-startAudioSystem audioCfg = do
+startAudioSystem ∷ AudioConfig → AudioHealthVerbosity → IO AudioSystem
+startAudioSystem audioCfg healthVerbosity = do
   let ch  = 2 ∷ Word32
       sampleRate = acSampleRate audioCfg
       chunkFrames = acChunkFrames audioCfg
@@ -132,7 +139,7 @@ startAudioSystem audioCfg = do
             , stPitchBendSemis = pitchBendVec
             , stNow = 0
             }
-    st1 <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st0
+    (st1, _) <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st0
     stRef <- newIORef st1
 
     controlRef <- newIORef ThreadRunning
@@ -141,7 +148,7 @@ startAudioSystem audioCfg = do
     (`onException` cleanupStartedSystem) $ do
       startDevice dev
       tid <- forkIO $
-        runAudioLoop h controlRef stRef rb chunkFrames underrunRef
+        runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity
           `finally` putMVar doneVar ()
 
       let ts = ThreadState controlRef tid doneVar
@@ -212,30 +219,93 @@ runAudioLoop
   → Ptr MaRB
   → Int
   → IORef Word64
+  → AudioHealthVerbosity
   → IO ()
-runAudioLoop h controlRef stRef rb chunkFrames underrunRef = go 0
+runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity = go 0 0 0 emptyHealthStats
   where
-    go ∷ Word64 → IO ()
-    go lastPrinted = do
+    go ∷ Word64 → Word64 → Word64 → HealthStats → IO ()
+    go lastUnderruns lastPartialWrites lastZeroWrites health = do
       control <- readIORef controlRef
       case control of
         ThreadStopped -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
           writeIORef stRef st1
-        ThreadPaused  -> threadDelay 10000 >> go lastPrinted
+        ThreadPaused  -> threadDelay 10000 >> go lastUnderruns lastPartialWrites lastZeroWrites health
         ThreadRunning -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
-          st2 <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st1
+          (st2, rs) <- Audio.Thread.Render.renderIfNeeded rb chunkFrames st1
           writeIORef stRef st2
 
+          let health' = absorbRenderStats health rs
           u <- readIORef underrunRef
-          when (u /= lastPrinted) $
-            putStrLn ("[audio] underruns: " <> show u)
+          let partialNow = hsPartialWrites health'
+              zeroNow = hsZeroWrites health'
+              changed = u /= lastUnderruns || partialNow /= lastPartialWrites || zeroNow /= lastZeroWrites
+              shouldLog =
+                case healthVerbosity of
+                  AudioHealthOff -> False
+                  AudioHealthNormal -> changed
+                  AudioHealthVerbose ->
+                    changed || (hsLoopCount health' `mod` verboseReportEveryLoops == 0)
+
+          when shouldLog $
+            emitHealthLog h rb u health'
 
           threadDelay 1000
-          go (if u /= lastPrinted then u else lastPrinted)
+          go u partialNow zeroNow health'
+
+data HealthStats = HealthStats
+  { hsLoopCount     ∷ !Word64
+  , hsFramesMixed   ∷ !Word64
+  , hsFramesWritten ∷ !Word64
+  , hsPartialWrites ∷ !Word64
+  , hsZeroWrites    ∷ !Word64
+  } deriving (Eq, Show)
+
+emptyHealthStats ∷ HealthStats
+emptyHealthStats =
+  HealthStats
+    { hsLoopCount = 0
+    , hsFramesMixed = 0
+    , hsFramesWritten = 0
+    , hsPartialWrites = 0
+    , hsZeroWrites = 0
+    }
+
+verboseReportEveryLoops ∷ Word64
+verboseReportEveryLoops = 1000
+
+absorbRenderStats ∷ HealthStats → RenderStats → HealthStats
+absorbRenderStats hs rs =
+  hs
+    { hsLoopCount = hsLoopCount hs + 1
+    , hsFramesMixed = hsFramesMixed hs + fromIntegral (rsFramesMixed rs)
+    , hsFramesWritten = hsFramesWritten hs + fromIntegral (rsFramesWritten rs)
+    , hsPartialWrites = hsPartialWrites hs + fromIntegral (rsPartialWrites rs)
+    , hsZeroWrites = hsZeroWrites hs + fromIntegral (rsZeroWrites rs)
+    }
+
+emitHealthLog ∷ AudioHandle → Ptr MaRB → Word64 → HealthStats → IO ()
+emitHealthLog h rb underruns hs = do
+  qDepth <- Q.queueLength (audioQueue h)
+  availRead <- rbAvailableRead rb
+  availWrite <- rbAvailableWrite rb
+  let rbTotal = availRead + availWrite
+      rbFillPct ∷ Double
+      rbFillPct =
+        if rbTotal == 0
+          then 0
+          else (fromIntegral availRead * 100) / fromIntegral rbTotal
+  putStrLn $
+    "[audio][health] underruns=" <> show underruns
+      <> " qDepth=" <> show qDepth
+      <> " rbFill=" <> show (realToFrac rbFillPct ∷ Float) <> "%"
+      <> " mixed=" <> show (hsFramesMixed hs)
+      <> " written=" <> show (hsFramesWritten hs)
+      <> " partialWrites=" <> show (hsPartialWrites hs)
+      <> " zeroWrites=" <> show (hsZeroWrites hs)
 
 processMsgs ∷ AudioHandle → Ptr MaRB → AudioState → IO AudioState
 processMsgs h rb st = do

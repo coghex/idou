@@ -2,7 +2,8 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Audio.Thread.Render
-  ( renderIfNeeded
+  ( RenderStats(..)
+  , renderIfNeeded
   , renderChunkFrames
   ) where
 
@@ -47,24 +48,43 @@ stereoPan l r
 semitonesToRatio ∷ Float → Float
 semitonesToRatio semis = 2 ** (semis / 12)
 
-renderIfNeeded ∷ Ptr MaRB → Int → AudioState → IO AudioState
+data RenderStats = RenderStats
+  { rsFramesMixed   ∷ !Int
+  , rsFramesWritten ∷ !Int
+  , rsPartialWrites ∷ !Int
+  , rsZeroWrites    ∷ !Int
+  } deriving (Eq, Show)
+
+emptyRenderStats ∷ RenderStats
+emptyRenderStats = RenderStats 0 0 0 0
+
+renderIfNeeded ∷ Ptr MaRB → Int → AudioState → IO (AudioState, RenderStats)
 renderIfNeeded rb chunkFrames st0 = do
   if chunkFrames <= 0
     then error "renderIfNeeded: chunkFrames must be > 0"
     else do
       let targetFrames = stTargetBufferFrames st0
-          loop st = do
+          loop stats st = do
             availRead  <- rbAvailableRead rb
             availWrite <- rbAvailableWrite rb
             if availRead >= targetFrames || availWrite == 0
-              then pure st
+              then pure (st, stats)
               else do
                 let framesNow = min chunkFrames (fromIntegral availWrite)
                 (st', wroteFrames) <- renderChunkFrames rb framesNow st
+                let partialWrite = if wroteFrames < framesNow then 1 else 0
+                    zeroWrite = if wroteFrames <= 0 then 1 else 0
+                    stats' =
+                      RenderStats
+                        { rsFramesMixed = rsFramesMixed stats + framesNow
+                        , rsFramesWritten = rsFramesWritten stats + wroteFrames
+                        , rsPartialWrites = rsPartialWrites stats + partialWrite
+                        , rsZeroWrites = rsZeroWrites stats + zeroWrite
+                        }
                 if wroteFrames <= 0
-                  then pure st'
-                  else loop st'
-      loop st0
+                  then pure (st', stats')
+                  else loop stats' st'
+      loop emptyRenderStats st0
 
 renderChunkFrames ∷ Ptr MaRB → Int → AudioState → IO (AudioState, Int)
 renderChunkFrames rb framesNow st = do
