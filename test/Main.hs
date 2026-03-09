@@ -165,6 +165,8 @@ testCases =
   , TestCase "pink-noise-is-smoother-than-white" testPinkNoiseIsSmootherThanWhite
   , TestCase "noise-layer-envelope-shapes-amplitude" testNoiseLayerEnvelopeShapesAmplitude
   , TestCase "gm-drum-noise-layers-use-envelopes" testGmDrumNoiseLayersUseEnvelopes
+  , TestCase "gm-kick-uses-separate-body-and-attack-tuning" testGmKickUsesSeparateBodyAndAttackTuning
+  , TestCase "gm-crash-has-long-noise-tail" testGmCrashHasLongNoiseTail
   , TestCase "gm-program-map-varies-by-family" testGmProgramMapVariesByFamily
   , TestCase "gm-percussion-channel-ignores-program" testGmPercussionChannelIgnoresProgram
   , TestCase "gm-drum-map-varies-by-key-family" testGmDrumMapVariesByKeyFamily
@@ -1437,6 +1439,28 @@ testGmDrumNoiseLayersUseEnvelopes = do
   assertBool "hihat should use blended noise" (any (waveformIs isNoiseMix . olWaveform) (iOscs hat))
   assertBool "crash should use pink noise" (any (waveformIs (== WavePinkNoise) . olWaveform) (iOscs crash))
   assertBool "ride should use noise envelopes" (any noiseLayerHasEnvelope (iOscs ride))
+
+testGmKickUsesSeparateBodyAndAttackTuning ∷ IO ()
+testGmKickUsesSeparateBodyAndAttackTuning = do
+  let kick = gmDrumInstrument 36
+  case iOscs kick of
+    (bodyLayer : _bodyTopLayer : triggerNoiseLayer : attackLayer : _) -> do
+      let bodyTune = psSemitones (olPitch bodyLayer)
+          attackTune = psSemitones (olPitch attackLayer)
+      assertBool "kick body tuning should be low" (bodyTune < (-12))
+      assertBool "kick attack should be tuned above body" (attackTune > bodyTune + 20)
+      assertEqual "kick trigger should use white noise" WaveWhiteNoise (olWaveform triggerNoiseLayer)
+      assertBool "kick trigger should use a short envelope" (olAmpEnv triggerNoiseLayer /= Nothing)
+    _ ->
+      error "kick patch should expose body, trigger, and attack layers"
+
+testGmCrashHasLongNoiseTail ∷ IO ()
+testGmCrashHasLongNoiseTail = do
+  let crash = gmDrumInstrument 49
+      noiseLayers = filter (isNoiseWaveform . olWaveform) (iOscs crash)
+  assertBool "crash should use multiple noise layers" (length noiseLayers >= 3)
+  assertBool "crash should have a long release tail" (aReleaseSec (iAdsrDefault crash) > 0.8)
+  assertBool "crash should allow many overlapping hits" (iPolyMax crash >= 64)
 
 testGmProgramMapVariesByFamily ∷ IO ()
 testGmProgramMapVariesByFamily = do
