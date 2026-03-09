@@ -56,6 +56,20 @@ import Midi.Play.Util
   , ticksToMicroseconds
   )
 import Engine.Core.Queue (Queue, newQueue, tryReadQueue)
+import Player.Timeline
+  ( SongMode(..)
+  , TimelineBar(..)
+  , TimelineNote(..)
+  , compileTimelineBars
+  , parseSongSpecText
+  , popReadyBars
+  , prepareTimelineRuntime
+  , sgInstruments
+  , sgLookaheadBars
+  , sgMode
+  , sgSections
+  , timelineRuntimeDone
+  )
 import Sound.Miniaudio.Decode (DecodedAudio(..), decodeAudioFileStereoF32)
 import Sound.Miniaudio.RingBuffer (rbCreateF32, rbDestroy, rbReadF32)
 
@@ -99,6 +113,9 @@ testCases ∷ [TestCase]
 testCases =
   [ TestCase "audio-config-parses-yaml-shape" testAudioConfigParsesYamlShape
   , TestCase "audio-config-rejects-too-small-buffer" testAudioConfigRejectsTooSmallBuffer
+  , TestCase "timeline-song-spec-parses-yaml" testTimelineSongSpecParsesYaml
+  , TestCase "timeline-compiler-builds-cue-sections" testTimelineCompilerBuildsCueSections
+  , TestCase "timeline-lookahead-pops-ready-bars" testTimelineLookaheadPopsReadyBars
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
@@ -179,6 +196,129 @@ testAudioConfigRejectsTooSmallBuffer = do
       assertBool "expected capacity validation error" ("capacity_frames" `isInfixOf` err)
     Right cfg ->
       error ("expected config parse failure, got " <> show cfg)
+
+testTimelineSongSpecParsesYaml ∷ IO ()
+testTimelineSongSpecParsesYaml = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 3"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    beat_unit: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    mood: tense"
+          , "    feel: sparse"
+          , "  verse:"
+          , "    tempo_bpm: 100"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 2"
+          , "instruments:"
+          , "  bass:"
+          , "    instrument_id: 1"
+          , "    amp: 0.9"
+          , "    pan: -0.1"
+          , "    patterns:"
+          , "      intro: 0/36/1/0.8"
+          , "      verse: 0/40/0.5/0.7,2/43/0.5/0.7"
+          ]
+  case parseSongSpecText yamlText of
+    Left err ->
+      error ("expected timeline song spec to parse, got error: " <> err)
+    Right spec -> do
+      assertEqual "song mode" SongModeCue (sgMode spec)
+      assertEqual "lookahead bars" 3 (sgLookaheadBars spec)
+      assertEqual "section count" 2 (M.size (sgSections spec))
+      assertEqual "instrument count" 1 (length (sgInstruments spec))
+
+testTimelineCompilerBuildsCueSections ∷ IO ()
+testTimelineCompilerBuildsCueSections = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  verse:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  chorus:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  synth:"
+          , "    instrument_id: 2"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.9"
+          , "    pattern_verse: 0/62/1/0.9"
+          , "    pattern_chorus: 0/64/1/0.9"
+          , "    pattern_ending: 0/65/1/0.9"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars = compileTimelineBars testSampleRate spec
+      sections = map tbSectionName bars
+  assertEqual
+    "cue section order should repeat verse/chorus deterministically"
+    ["intro", "verse", "chorus", "verse", "chorus", "ending"]
+    sections
+  case bars of
+    firstBar : _ -> do
+      assertEqual "bar length at 120 bpm / 4 beats" 96000 (tbLengthFrames firstBar)
+      case tbNotes firstBar of
+        n0 : _ -> do
+          assertEqual "note should start at bar offset 0" 0 (tnOnOffsetFrames n0)
+          assertEqual "1 beat duration should map to quarter-note frames" 24000 (tnOffOffsetFrames n0)
+        [] ->
+          error "expected at least one note in first bar"
+    [] ->
+      error "expected compiled bars"
+
+testTimelineLookaheadPopsReadyBars ∷ IO ()
+testTimelineLookaheadPopsReadyBars = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 4"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pulse:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/0.5/1"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 = prepareTimelineRuntime testSampleRate 1000 spec
+      (batch1, runtime1) = popReadyBars 0 runtime0
+      (batch2, runtime2) = popReadyBars 100000 runtime1
+  assertEqual "first lookahead batch should include two bars" 2 (length batch1)
+  assertEqual "second lookahead batch should include remaining two bars" 2 (length batch2)
+  assertBool "runtime should be done after scheduling all bars" (timelineRuntimeDone runtime2)
 
 testEnvelopeReleaseReachesDone ∷ IO ()
 testEnvelopeReleaseReachesDone = do
