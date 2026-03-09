@@ -6,7 +6,7 @@ import Control.Exception (SomeException, bracket, evaluate, try)
 import Control.Monad (forM, unless, when)
 import qualified Data.ByteString.Lazy as BL
 import Data.ByteString.Builder
-import Data.List (find, intercalate, isInfixOf)
+import Data.List (find, intercalate, isInfixOf, nub)
 import qualified Data.Map.Strict as M
 import Data.Word (Word32, Word64)
 import Foreign.ForeignPtr (mallocForeignPtrArray)
@@ -132,6 +132,9 @@ testCases =
   , TestCase "timeline-lookahead-pops-ready-bars" testTimelineLookaheadPopsReadyBars
   , TestCase "timeline-conductor-transitions-at-phrase-boundary" testTimelineConductorTransitionsAtPhraseBoundary
   , TestCase "timeline-pattern-variation-is-deterministic" testTimelinePatternVariationIsDeterministic
+  , TestCase "timeline-transition-rules-are-structured" testTimelineTransitionRulesAreStructured
+  , TestCase "timeline-default-drums-are-present" testTimelineDefaultDrumsArePresent
+  , TestCase "timeline-chorus-stability-vs-bridge-variation" testTimelineChorusStabilityVsBridgeVariation
   , TestCase "timeline-energy-target-steers-density" testTimelineEnergyTargetSteersDensity
   , TestCase "timeline-energy-target-steers-conductor" testTimelineEnergyTargetSteersConductor
   , TestCase "timeline-mood-target-steers-transposition" testTimelineMoodTargetSteersTransposition
@@ -490,6 +493,159 @@ testTimelineTransitionTelemetryEmitsReasonAndWeights = do
                    telemetryAcc'
                    rt2
 
+testTimelineTransitionRulesAreStructured ∷ IO ()
+testTimelineTransitionRulesAreStructured = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  verse:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 2"
+          , "  chorus:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 2"
+          , "  bridge:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 2"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pulse:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8"
+          , "    pattern_verse: 0/62/1/0.8"
+          , "    pattern_chorus: 0/64/1/0.8"
+          , "    pattern_bridge: 0/65/1/0.8"
+          , "    pattern_ending: 0/67/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (bars, runtimeFinal) = drainTimelineBarsForTest 0 0 [] runtime0
+      names = map tbSectionName bars
+      transitions = filter (\(a, b) -> a /= b) (zip names (drop 1 names))
+      allowedFollowers prev =
+        case prev of
+          "intro" -> ["verse"]
+          "verse" -> ["chorus", "bridge", "ending"]
+          "chorus" -> ["chorus", "bridge", "ending"]
+          "bridge" -> ["chorus", "bridge", "ending"]
+          "ending" -> []
+          _ -> ["chorus", "bridge", "ending"]
+      legal (fromS, toS) = toS `elem` allowedFollowers fromS
+  assertBool "expected non-empty generated bars" (not (null bars))
+  case names of
+    a : b : _ -> do
+      assertEqual "song should start with intro" "intro" a
+      assertEqual "intro must transition to verse" "verse" b
+    _ -> error "expected at least two bars"
+  assertBool
+    "all section transitions should follow constrained transition rules"
+    (all legal transitions)
+  assertEqual "song should always end on ending section" "ending" (last names)
+  assertBool "cue timeline should complete" (timelineRuntimeDone runtimeFinal)
+
+testTimelineDefaultDrumsArePresent ∷ IO ()
+testTimelineDefaultDrumsArePresent = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 4"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pad:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (bars, _done) = drainTimelineBarsForTest 0 0 [] runtime0
+      hasDrums bar =
+        any
+          (\n -> case tnInstrumentId n of InstrumentId iid -> iid == 9)
+          (tbNotes bar)
+  assertBool "expected bars for default drum fallback test" (not (null bars))
+  assertBool "every generated bar should include fallback drum notes" (all hasDrums bars)
+
+testTimelineChorusStabilityVsBridgeVariation ∷ IO ()
+testTimelineChorusStabilityVsBridgeVariation = do
+  let mkSpec sectionName =
+        parseSongSpecText $
+          unlines
+            [ "song:"
+            , "  mode: cue"
+            , "  lookahead_bars: 4"
+            , "sections:"
+            , "  " <> sectionName <> ":"
+            , "    tempo_bpm: 120"
+            , "    beats_per_bar: 4"
+            , "    bars_per_phrase: 12"
+            , "    phrase_count: 1"
+            , "instruments:"
+            , "  lead:"
+            , "    instrument_id: 0"
+            , "    amp: 1"
+            , "    pan: 0"
+            , "    pattern_" <> sectionName <> ": 0/60/0.5/0.9,1/62/0.5/0.9,2/64/0.5/0.9,3/65/0.5/0.9"
+            ]
+  chorusSpec <- either (\err -> error ("chorus parse failed: " <> err)) pure (mkSpec "chorus")
+  bridgeSpec <- either (\err -> error ("bridge parse failed: " <> err)) pure (mkSpec "bridge")
+  let chorusBars = takeTimelineBars 24 0 0 [] (prepareTimelineRuntime testSampleRate 0 chorusSpec)
+      bridgeBars = takeTimelineBars 24 0 0 [] (prepareTimelineRuntime testSampleRate 0 bridgeSpec)
+      melodicSignature bar =
+        [ (k, velBucket)
+        | n <- tbNotes bar
+        , let isLead =
+                case tnInstrumentId n of
+                  InstrumentId iid -> iid == 0
+        , isLead
+        , let NoteKey k = tnKey n
+        , let velBucket = floor (tnVelocity n * 100) :: Int
+        ]
+      uniqueCount xs = length (nub xs)
+      chorusVariety = uniqueCount (map melodicSignature chorusBars)
+      bridgeVariety = uniqueCount (map melodicSignature bridgeBars)
+  assertBool "expected chorus bars" (not (null chorusBars))
+  assertBool "expected bridge bars" (not (null bridgeBars))
+  assertBool
+    "bridge sections should vary more than chorus sections"
+    (bridgeVariety > chorusVariety)
+  where
+    takeTimelineBars ∷ Int → Word64 → Int → [TimelineBar] → TimelineRuntime → [TimelineBar]
+    takeTimelineBars target now loops acc rt
+      | loops > 400 = acc
+      | length acc >= target = take target acc
+      | otherwise =
+          let (batch, rt') = popReadyBars now rt
+              acc' = acc <> batch
+          in takeTimelineBars target (now + 120000) (loops + 1) acc' rt'
+
 testTimelinePatternVariationIsDeterministic ∷ IO ()
 testTimelinePatternVariationIsDeterministic = do
   let yamlText =
@@ -785,38 +941,46 @@ testTimelineSectionMetadataSteersConductor = do
           , "    phrase_count: 1"
           , "    mood: neutral"
           , "    feel: plain"
-          , "  alpha:"
+          , "  verse:"
           , "    tempo_bpm: 120"
           , "    beats_per_bar: 4"
           , "    bars_per_phrase: 1"
           , "    phrase_count: 1"
-          , "    mood: ambient"
-          , "    feel: sparse slow"
-          , "  beta:"
+          , "    mood: neutral"
+          , "    feel: plain"
+          , "  chorus:"
           , "    tempo_bpm: 120"
           , "    beats_per_bar: 4"
           , "    bars_per_phrase: 1"
           , "    phrase_count: 1"
           , "    mood: aggressive"
           , "    feel: dense driving"
+          , "  bridge:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    mood: ambient"
+          , "    feel: sparse slow"
           , "instruments:"
           , "  pulse:"
           , "    instrument_id: 0"
           , "    amp: 1"
           , "    pan: 0"
           , "    pattern_intro: 0/60/1/0.8"
-          , "    pattern_alpha: 0/62/1/0.8"
-          , "    pattern_beta: 0/67/1/0.8"
+          , "    pattern_verse: 0/62/1/0.8"
+          , "    pattern_chorus: 0/67/1/0.8"
+          , "    pattern_bridge: 0/64/1/0.8"
           ]
   spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
   let runtimeCalm0 = setTimelineTargets (Just "calm") 0.4 (prepareTimelineRuntime testSampleRate 0 spec)
       runtimeCombat0 = setTimelineTargets (Just "combat") 0.7 (prepareTimelineRuntime testSampleRate 0 spec)
       barsCalm = takeTimelineBars 32 0 0 [] runtimeCalm0
       barsCombat = takeTimelineBars 32 0 0 [] runtimeCombat0
-      alphaCount xs = length (filter ((== "alpha") . tbSectionName) xs)
-      betaCount xs = length (filter ((== "beta") . tbSectionName) xs)
-  assertBool "calm target should prefer ambient metadata sections" (alphaCount barsCalm > betaCount barsCalm)
-  assertBool "combat target should prefer aggressive metadata sections" (betaCount barsCombat > alphaCount barsCombat)
+      chorusCount xs = length (filter ((== "chorus") . tbSectionName) xs)
+      bridgeCount xs = length (filter ((== "bridge") . tbSectionName) xs)
+  assertBool "calm target should prefer ambient metadata sections" (bridgeCount barsCalm > chorusCount barsCalm)
+  assertBool "combat target should prefer aggressive metadata sections" (chorusCount barsCombat > bridgeCount barsCombat)
   where
     takeTimelineBars ∷ Int → Word64 → Int → [TimelineBar] → TimelineRuntime → [TimelineBar]
     takeTimelineBars target now loops acc rt

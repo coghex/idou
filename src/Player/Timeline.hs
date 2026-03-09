@@ -342,7 +342,7 @@ appendGeneratedBar rt =
 
 advanceSection ∷ TimelineRuntime → TimelineRuntime
 advanceSection rt
-  | trMode rt == SongModeCue && trCurrentSectionName rt == "ending" =
+  | isEndingSectionName (trCurrentSectionName rt) =
       rt { trDone = True, trCurrentSectionBar = 0 }
   | otherwise =
       case pickNextSection rt of
@@ -368,15 +368,16 @@ data TransitionChoice = TransitionChoice
 pickNextSection ∷ TimelineRuntime → Maybe TransitionChoice
 pickNextSection rt =
   let available = M.keys (trSections rt)
-      hasEnding = "ending" `elem` available
+      hasEnding = hasEndingSection available
       forceEnding =
-        trMode rt == SongModeCue
-          && hasEnding
-          && trTransitionCount rt >= 6
-          && trCurrentSectionName rt /= "ending"
+        hasEnding
+          &&
+          trCurrentSectionName rt /= preferredEndingSectionName available
+          &&
+          trTransitionCount rt >= forceEndingAfterTransitions (trMode rt)
       cands0 =
         if forceEnding
-          then [("ending", 1)]
+          then [(preferredEndingSectionName available, 1)]
           else transitionCandidates (trMode rt) (trCurrentSectionName rt) available
       cands = applyRuntimeControlWeights rt cands0
       reason =
@@ -408,31 +409,101 @@ pickNextSection rt =
            , tcTelemetry = telemetry
            }
 
+forceEndingAfterTransitions ∷ SongMode → Int
+forceEndingAfterTransitions mode =
+  case mode of
+    SongModeCue -> 6
+    SongModeDrone -> 16
+
 transitionCandidates ∷ SongMode → String → [String] → [(String, Int)]
 transitionCandidates mode current available =
-  let scripted =
-        case mode of
-          SongModeCue ->
-            case current of
-              "intro" -> [("verse", 10), ("chorus", 2), ("bridge", 1), ("ending", 1)]
-              "verse" -> [("chorus", 8), ("verse", 3), ("bridge", 3), ("ending", 2)]
-              "chorus" -> [("verse", 5), ("bridge", 3), ("chorus", 2), ("ending", 4)]
-              "bridge" -> [("chorus", 7), ("verse", 3), ("ending", 3)]
-              "ending" -> []
-              _ -> [("verse", 5), ("chorus", 5), ("bridge", 2), ("ending", 2)]
-          SongModeDrone ->
-            case current of
-              "intro" -> [("verse", 6), ("bridge", 4), ("chorus", 2)]
-              "verse" -> [("verse", 7), ("bridge", 4), ("chorus", 3), ("ending", 1)]
-              "chorus" -> [("chorus", 5), ("verse", 5), ("bridge", 3), ("ending", 1)]
-              "bridge" -> [("bridge", 5), ("verse", 4), ("chorus", 4), ("ending", 1)]
-              "ending" -> [("verse", 4), ("bridge", 4), ("chorus", 3)]
-              _ -> [("verse", 5), ("chorus", 4), ("bridge", 4), ("ending", 1)]
+  let endingName = preferredEndingSectionName available
+      scripted =
+        if isIntroSectionName current
+          then
+            [("verse", 100)]
+          else
+            if isEndingSectionName current
+              then []
+              else
+                if isVerseSectionName current
+                  then
+                    case mode of
+                      SongModeCue -> [("chorus", 7), ("bridge", 3), (endingName, 1)]
+                      SongModeDrone -> [("chorus", 5), ("bridge", 4), (endingName, 1)]
+                  else
+                    if isChorusSectionName current
+                      then
+                        case mode of
+                          SongModeCue -> [("chorus", 8), ("bridge", 3), (endingName, 2)]
+                          SongModeDrone -> [("chorus", 9), ("bridge", 4), (endingName, 1)]
+                      else
+                        if isBridgeSectionName current
+                          then
+                            case mode of
+                              SongModeCue -> [("chorus", 6), ("bridge", 2), (endingName, 2)]
+                              SongModeDrone -> [("chorus", 6), ("bridge", 3), (endingName, 1)]
+                          else
+                            case mode of
+                              SongModeCue -> [("verse", 7), ("chorus", 4), ("bridge", 3), (endingName, 2)]
+                              SongModeDrone -> [("verse", 6), ("chorus", 5), ("bridge", 4), (endingName, 1)]
       filtered = filter (\(name, w) -> w > 0 && name `elem` available) scripted
-      fallback = filter (/= current) available
+      fallback = fallbackCandidates current available
   in if null filtered
-       then map (\name -> (name, 1)) fallback
+       then fallback
        else filtered
+
+fallbackCandidates ∷ String → [String] → [(String, Int)]
+fallbackCandidates current available
+  | isIntroSectionName current =
+      let verse = filter isVerseSectionName available
+          body =
+            filter
+              (\name -> not (isIntroSectionName name) && not (isEndingSectionName name))
+              available
+          ending = filter isEndingSectionName available
+      in map (\name -> (name, 1)) (if null verse then if null body then ending else body else verse)
+  | isEndingSectionName current = []
+  | otherwise =
+      let permitted = filter (\name -> isChorusSectionName name || isBridgeSectionName name || isEndingSectionName name) available
+      in if null permitted
+           then map (\name -> (name, 1)) (filter (/= current) available)
+           else map (\name -> (name, 1)) permitted
+
+hasEndingSection ∷ [String] → Bool
+hasEndingSection = any isEndingSectionName
+
+preferredEndingSectionName ∷ [String] → String
+preferredEndingSectionName available
+  | "ending" `elem` available = "ending"
+  | "outro" `elem` available = "outro"
+  | otherwise =
+      case filter isEndingSectionName available of
+        x : _ -> x
+        [] ->
+          case available of
+            x : _ -> x
+            [] -> "ending"
+
+isIntroSectionName ∷ String → Bool
+isIntroSectionName name = normalizeSectionName name == "intro"
+
+isVerseSectionName ∷ String → Bool
+isVerseSectionName name = normalizeSectionName name == "verse"
+
+isChorusSectionName ∷ String → Bool
+isChorusSectionName name = normalizeSectionName name == "chorus"
+
+isBridgeSectionName ∷ String → Bool
+isBridgeSectionName name = normalizeSectionName name == "bridge"
+
+isEndingSectionName ∷ String → Bool
+isEndingSectionName name =
+  let n = normalizeSectionName name
+  in n == "ending" || n == "outro"
+
+normalizeSectionName ∷ String → String
+normalizeSectionName = map toLower . trim
 
 applyRuntimeControlWeights ∷ TimelineRuntime → [(String, Int)] → [(String, Int)]
 applyRuntimeControlWeights rt cands =
@@ -632,6 +703,7 @@ varyBarNotes mode targetEnergy targetMood sectionSpec absoluteBarIx seed0 notes0
                     targetEnergy
                     targetMood
                     sectionSpec
+                    iid
                     absoluteBarIx
                     canDropInstrument
                     (seedAcc `xor` fromIntegral (instrumentIdInt iid))
@@ -656,41 +728,50 @@ mutateInstrumentFromNotes
   → Float
   → Maybe String
   → SectionSpec
+  → InstrumentId
   → Int
   → Bool
   → Word64
   → [TimelineNote]
   → ([TimelineNote], Word64)
-mutateInstrumentFromNotes mode targetEnergy targetMood sectionSpec absoluteBarIx canDrop seed0 notes
+mutateInstrumentFromNotes mode targetEnergy targetMood sectionSpec instrumentId absoluteBarIx canDrop seed0 notes
   | null notes = ([], nextConductorSeed seed0)
   | otherwise =
       let seed1 = nextConductorSeed (seed0 `xor` fromIntegral absoluteBarIx)
           dropRoll = rand01 seed1
+          isDrums = isDrumInstrumentId instrumentId
           shouldDrop =
-            canDrop
+            (not isDrums)
+              && canDrop
               && barDropEligible absoluteBarIx
-              && dropRoll < dropoutThreshold mode targetEnergy
+              && dropRoll < dropoutThreshold mode targetEnergy sectionSpec
       in if shouldDrop
            then ([], nextConductorSeed seed1)
            else
-              let seed2 = nextConductorSeed seed1
-                  transposeSemis = chooseTranspose mode targetEnergy targetMood sectionSpec absoluteBarIx seed2
-                  seed3 = nextConductorSeed seed2
-                  density = densityThreshold mode targetEnergy sectionSpec absoluteBarIx seed3
-                  (keptRev, seedN) =
-                    foldl
-                      (selectMutatedNote density transposeSemis)
-                      ([], seed3)
-                      notes
-                  kept = reverse keptRev
-                  out =
-                    if null kept
-                      then
-                        case notes of
-                          [] -> []
-                          firstNote : _ -> [applyTranspose transposeSemis firstNote]
-                      else kept
-              in (out, seedN)
+               let seed2 = nextConductorSeed seed1
+                   transposeSemis =
+                     if isDrums
+                       then 0
+                       else chooseTranspose mode targetEnergy targetMood sectionSpec absoluteBarIx seed2
+                   seed3 = nextConductorSeed seed2
+                   density =
+                     if isDrums
+                       then 1
+                       else densityThreshold mode targetEnergy sectionSpec absoluteBarIx seed3
+                   (keptRev, seedN) =
+                     foldl
+                       (selectMutatedNote density transposeSemis)
+                       ([], seed3)
+                       notes
+                   kept = reverse keptRev
+                   out =
+                     if null kept
+                       then
+                         case notes of
+                           [] -> []
+                           firstNote : _ -> [applyTranspose transposeSemis firstNote]
+                       else kept
+               in (out, seedN)
 
 selectMutatedNote
   ∷ Float
@@ -710,11 +791,19 @@ barDropEligible absoluteBarIx =
   let slot = absoluteBarIx `mod` 8
   in slot == 6 || slot == 7
 
-dropoutThreshold ∷ SongMode → Float → Float
-dropoutThreshold mode energy =
-  case mode of
-    SongModeCue -> clamp01 (0.28 + (0.5 - clamp01 energy) * 0.24)
-    SongModeDrone -> clamp01 (0.16 + (0.5 - clamp01 energy) * 0.16)
+dropoutThreshold ∷ SongMode → Float → SectionSpec → Float
+dropoutThreshold mode energy sectionSpec =
+  let sectionNudge =
+        if isChorusSection sectionSpec
+          then -0.18
+          else if isBridgeSection sectionSpec
+                 then 0.12
+                 else 0
+      base =
+        case mode of
+          SongModeCue -> 0.28 + (0.5 - clamp01 energy) * 0.24
+          SongModeDrone -> 0.16 + (0.5 - clamp01 energy) * 0.16
+  in clamp01 (base + sectionNudge)
 
 densityThreshold ∷ SongMode → Float → SectionSpec → Int → Word64 → Float
 densityThreshold mode targetEnergy sectionSpec absoluteBarIx seed =
@@ -722,14 +811,26 @@ densityThreshold mode targetEnergy sectionSpec absoluteBarIx seed =
         case mode of
           SongModeCue -> 0.86
           SongModeDrone -> 0.94
-      cycleNudge =
+      cycleNudge0 =
         case absoluteBarIx `mod` 8 of
           3 -> -0.20
           7 -> -0.28
           _ -> 0
+      cycleNudge =
+        if isChorusSection sectionSpec
+          then cycleNudge0 * 0.2
+          else if isBridgeSection sectionSpec
+                 then cycleNudge0 * 1.25
+                 else cycleNudge0
       energyBoost = (clamp01 targetEnergy - 0.5) * 0.35
       feelBoost = sectionFeelDensityBias sectionSpec
-      jitter = (rand01 seed - 0.5) * 0.08
+      jitterScale =
+        if isChorusSection sectionSpec
+          then 0.02
+          else if isBridgeSection sectionSpec
+                 then 0.12
+                 else 0.08
+      jitter = (rand01 seed - 0.5) * jitterScale
       raw = base + cycleNudge + energyBoost + feelBoost + jitter
   in max 0.25 (min 0.99 raw)
 
@@ -740,12 +841,26 @@ chooseTranspose mode targetEnergy targetMood sectionSpec absoluteBarIx seed =
           SongModeCue -> [0, 0, 2, -2, 3, -3, 5, -5]
           SongModeDrone -> [0, 0, 0, 1, -1, 2, -2]
       ix = fromIntegral (seed `mod` fromIntegral (length opts))
-      seeded = opts !! ix
+      seeded0 = opts !! ix
+      seeded =
+        if isChorusSection sectionSpec
+          then
+            case seeded0 of
+              n | n > 1 -> 1
+              n | n < -1 -> -1
+              _ -> seeded0
+          else
+            if isBridgeSection sectionSpec
+              then seeded0 + if rand01 (nextConductorSeed seed) > 0.5 then 1 else -1
+              else seeded0
       barBias =
-        case absoluteBarIx `mod` 8 of
-          1 -> 2
-          5 -> -2
-          _ -> 0
+        if isChorusSection sectionSpec
+          then 0
+          else
+            case absoluteBarIx `mod` 8 of
+              1 -> 2
+              5 -> -2
+              _ -> 0
       energyMag = floor (clamp01 targetEnergy * 2) :: Int
       moodBias =
         case targetMood of
@@ -768,20 +883,36 @@ chooseTranspose mode targetEnergy targetMood sectionSpec absoluteBarIx seed =
 sectionFeelDensityBias ∷ SectionSpec → Float
 sectionFeelDensityBias spec =
   let ws = sectionDescriptorWords spec
-  in if any (`elem` ws) ["dense", "busy", "wall", "thick", "driving", "heavy", "aggressive"]
-       then 0.18
-       else if any (`elem` ws) ["sparse", "minimal", "slow", "spacious", "ambient", "drone", "calm"]
-              then -0.18
-              else 0
+      sectionBias =
+        if isChorusSection spec
+          then 0.08
+          else if isBridgeSection spec
+                 then -0.10
+                 else 0
+      metadataBias =
+        if any (`elem` ws) ["dense", "busy", "wall", "thick", "driving", "heavy", "aggressive"]
+          then 0.18
+          else if any (`elem` ws) ["sparse", "minimal", "slow", "spacious", "ambient", "drone", "calm"]
+                 then -0.18
+                 else 0
+  in sectionBias + metadataBias
 
 sectionFeelTransposeBias ∷ SectionSpec → Int
 sectionFeelTransposeBias spec =
   let ws = sectionDescriptorWords spec
-  in if any (`elem` ws) ["aggressive", "intense", "rising", "driving"]
-       then 1
-       else if any (`elem` ws) ["calm", "ambient", "drone", "slow", "descending"]
-              then -1
-              else 0
+      sectionBias =
+        if isChorusSection spec
+          then 0
+          else if isBridgeSection spec
+                 then 1
+                 else 0
+      metadataBias =
+        if any (`elem` ws) ["aggressive", "intense", "rising", "driving"]
+          then 1
+          else if any (`elem` ws) ["calm", "ambient", "drone", "slow", "descending"]
+                 then -1
+                 else 0
+  in sectionBias + metadataBias
 
 applyTranspose ∷ Int → TimelineNote → TimelineNote
 applyTranspose semis note =
@@ -815,7 +946,16 @@ compileSectionNotes
   → [InstrumentPatternSpec]
   → [TimelineNote]
 compileSectionNotes sampleRateHz sectionName sectionSpec insts =
-  concatMap perInstrument insts
+  let melodic = concatMap perInstrument insts
+      hasDrums =
+        any
+          (\n -> isDrumInstrumentId (tnInstrumentId n))
+          melodic
+      fallbackDrums =
+        if hasDrums
+          then []
+          else compileFallbackDrumNotes sectionName sectionSpec framesPerBeat
+  in melodic <> fallbackDrums
   where
     framesPerBeat =
       (fromIntegral sampleRateHz ∷ Double)
@@ -824,6 +964,66 @@ compileSectionNotes sampleRateHz sectionName sectionSpec insts =
     perInstrument inst =
       let notes = M.findWithDefault [] sectionName (ipPatterns inst)
       in map (compilePatternNote framesPerBeat inst) notes
+
+compileFallbackDrumNotes ∷ String → SectionSpec → Double → [TimelineNote]
+compileFallbackDrumNotes sectionName sectionSpec framesPerBeat =
+  let inst =
+        InstrumentPatternSpec
+          { ipName = "auto-drums"
+          , ipInstrumentId = InstrumentId 9
+          , ipAmp = 1
+          , ipPan = 0
+          , ipPatterns = M.empty
+          }
+      beats = max 1 (ssBeatsPerBar sectionSpec)
+      sectionN = normalizeSectionName sectionName
+      kickBeats =
+        if sectionN == "intro" || isEndingSectionName sectionN
+          then [0]
+          else if sectionN == "bridge"
+                 then [0]
+                 else if sectionN == "chorus"
+                        then filter (< fromIntegral beats) [0, 1.5, 2]
+                        else filter (< fromIntegral beats) [0, 2]
+      snareBeats =
+        if sectionN == "intro" || isEndingSectionName sectionN
+          then []
+          else if beats >= 4
+                 then [1, 3]
+                 else [fromIntegral (beats - 1)]
+      hatStep =
+        if sectionN == "chorus"
+          then 0.5
+          else 1
+      hatBeats = beatGrid hatStep (fromIntegral beats)
+      mk beat key dur vel =
+        PatternNote
+          { pnBeatOffset = beat
+          , pnNoteKey = NoteKey key
+          , pnDuration = dur
+          , pnVelocity = vel
+          }
+      patternNotes =
+        map (\b -> mk b 36 0.25 0.9) kickBeats
+          <> map (\b -> mk b 38 0.25 0.85) snareBeats
+          <> map (\b -> mk b 42 0.12 (if sectionN == "chorus" then 0.58 else 0.45)) hatBeats
+  in map (compilePatternNote framesPerBeat inst) patternNotes
+
+beatGrid ∷ Float → Float → [Float]
+beatGrid step beats
+  | step <= 0 = []
+  | otherwise = takeWhile (< beats) [0, step ..]
+
+isDrumInstrumentId ∷ InstrumentId → Bool
+isDrumInstrumentId iid =
+  case iid of
+    InstrumentId n -> n == 9
+
+isChorusSection ∷ SectionSpec → Bool
+isChorusSection spec = isChorusSectionName (ssName spec)
+
+isBridgeSection ∷ SectionSpec → Bool
+isBridgeSection spec = isBridgeSectionName (ssName spec)
 
 compilePatternNote ∷ Double → InstrumentPatternSpec → PatternNote → TimelineNote
 compilePatternNote framesPerBeat inst note =
