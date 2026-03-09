@@ -11,6 +11,8 @@ module Audio.Types
 
   , Waveform(..)
   , InstrumentId(..)
+  , ClipId(..)
+  , AudioBus(..)
   , Instrument(..)
   , PitchSpec(..)
   , SyncSpec(..)
@@ -55,6 +57,14 @@ data Waveform
 
 newtype InstrumentId = InstrumentId Int
   deriving (Eq, Ord, Show)
+
+newtype ClipId = ClipId Int
+  deriving (Eq, Ord, Show)
+
+data AudioBus
+  = AudioBusMusic
+  | AudioBusSfx
+  deriving (Eq, Show)
 
 data PitchSpec = PitchSpec
   { psOctaves   ∷ !Int
@@ -190,6 +200,37 @@ data AudioMsg
       , freqHz  ∷ !Float
       , durSec  ∷ !Float
       , adsr    ∷ !ADSR
+      }
+
+  | AudioLoadClip
+      { clipId       ∷ !ClipId
+      , clipChannels ∷ !Int
+      , clipSamples  ∷ ![Float]
+      }
+
+  | AudioUnloadClip
+      { clipId       ∷ !ClipId
+      }
+
+  | AudioPlayClip
+      { clipId   ∷ !ClipId
+      , clipBus  ∷ !AudioBus
+      , clipGain ∷ !Float
+      , clipPan  ∷ !Float
+      , clipLoop ∷ !Bool
+      }
+
+  | AudioStopClip
+      { clipId   ∷ !ClipId
+      }
+
+  | AudioStopBus
+      { audioBus ∷ !AudioBus
+      }
+
+  | AudioSetBusGain
+      { audioBus ∷ !AudioBus
+      , busGain  ∷ !Float
       }
 
   | AudioNoteOn

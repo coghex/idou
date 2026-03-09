@@ -2,6 +2,8 @@
 
 module Audio.Thread.Types
   ( Voice(..)
+  , ClipAsset(..)
+  , ClipSource(..)
   , AudioState(..)
   , AudioUserData(..)
   , clamp01
@@ -15,8 +17,9 @@ import Foreign.C (CFloat)
 import Foreign.ForeignPtr (ForeignPtr)
 
 import qualified Data.Vector.Mutable as MV
+import qualified Data.Vector.Unboxed as VU
 
-import Audio.Types (InstrumentId, Instrument, ModRoute, NoteKey, NoteInstanceId)
+import Audio.Types (InstrumentId, Instrument, ModRoute, NoteKey, NoteInstanceId, ClipId, AudioBus)
 import Audio.Envelope (ADSR, EnvState)
 import Audio.Oscillator (Osc)
 import Audio.Filter (FilterState)
@@ -65,9 +68,29 @@ data Voice = Voice
   , vLfo1Phase  ∷ !Float
   }
 
+data ClipAsset = ClipAsset
+  { caChannels ∷ !Int
+  , caFrames   ∷ !Int
+  , caSamples  ∷ !(VU.Vector Float)
+  }
+
+data ClipSource = ClipSource
+  { csClipId   ∷ !ClipId
+  , csBus      ∷ !AudioBus
+  , csGainL    ∷ !Float
+  , csGainR    ∷ !Float
+  , csFramePos ∷ !Int
+  , csLoop     ∷ !Bool
+  }
+
 data AudioState = AudioState
   { stVoices         ∷ !(MV.IOVector Voice)
   , stActiveCount    ∷ !Int
+  , stClipAssets     ∷ !(MV.IOVector (Maybe ClipAsset))
+  , stClipSources    ∷ !(MV.IOVector ClipSource)
+  , stClipActiveCount ∷ !Int
+  , stBusMusicGain   ∷ !Float
+  , stBusSfxGain     ∷ !Float
   , stMixBuf         ∷ !(ForeignPtr CFloat)
   , stSampleRate     ∷ !Word32
   , stTargetBufferFrames ∷ !Word32

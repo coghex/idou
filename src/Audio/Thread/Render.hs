@@ -12,6 +12,7 @@ import Foreign
 import Foreign.C
 
 import qualified Data.Vector.Mutable as MV
+import qualified Data.Vector.Unboxed as VU
 
 import Audio.Envelope
 import Audio.Filter
@@ -21,7 +22,7 @@ import Sound.Miniaudio.RingBuffer
 import Audio.Thread.Types
 import Audio.Thread.InstrumentTable (MidiControls(..), lookupMidiControls, lookupVibrato)
 import Audio.Thread.Voice (panGains)
-import Audio.Types (ModRoute(..), ModSrc(..), ModDst(..))
+import Audio.Types (AudioBus(..), ClipId(..), ModRoute(..), ModSrc(..), ModDst(..))
 
 defaultModWheelLfoRateHz ∷ Float
 defaultModWheelLfoRateHz = 5
@@ -93,7 +94,8 @@ renderChunkFrames rb framesNow st = do
         samples = framesNow * 2
         bytes = samples * sizeOf (undefined ∷ CFloat)
     fillBytes out 0 bytes
-    mixVoices (fromIntegral (stSampleRate st)) framesNow out st
+    stVoicesMixed <- mixVoices (fromIntegral (stSampleRate st)) framesNow out st
+    mixClipSources framesNow out stVoicesMixed
 
   wroteFrames <- withForeignPtr (stMixBuf st') $ \out0 -> do
     let out = castPtr out0 ∷ Ptr CFloat
@@ -145,6 +147,84 @@ mixVoices srF chunkFrames out st0 = do
                 loop i st { stActiveCount = lastIx }
               else MV.write vec i v' >> loop (i+1) st
   loop 0 st0
+
+mixClipSources ∷ Int → Ptr CFloat → AudioState → IO AudioState
+mixClipSources chunkFrames out st0 = do
+  let srcVec = stClipSources st0
+      removeAt i st =
+        let lastIx = stClipActiveCount st - 1
+        in if i /= lastIx
+             then MV.read srcVec lastIx >>= MV.write srcVec i >> pure st { stClipActiveCount = lastIx }
+             else pure st { stClipActiveCount = lastIx }
+      loop i st
+        | i >= stClipActiveCount st = pure st
+        | otherwise = do
+            src <- MV.read srcVec i
+            mAsset <- lookupClipAsset (csClipId src) st
+            case mAsset of
+              Nothing -> removeAt i st >>= loop i
+              Just asset -> do
+                (src', done) <- mixOneClip chunkFrames out st asset src
+                if done
+                  then removeAt i st >>= loop i
+                  else MV.write srcVec i src' >> loop (i + 1) st
+  loop 0 st0
+
+lookupClipAsset ∷ ClipId → AudioState → IO (Maybe ClipAsset)
+lookupClipAsset (ClipId clipIx) st = do
+  let assets = stClipAssets st
+  if clipIx < 0 || clipIx >= MV.length assets
+    then pure Nothing
+    else MV.read assets clipIx
+
+busGainFor ∷ AudioState → AudioBus → Float
+busGainFor st bus =
+  case bus of
+    AudioBusMusic -> stBusMusicGain st
+    AudioBusSfx -> stBusSfxGain st
+
+mixOneClip ∷ Int → Ptr CFloat → AudioState → ClipAsset → ClipSource → IO (ClipSource, Bool)
+mixOneClip chunkFrames out st asset src0 = do
+  let channels = caChannels asset
+      frames = caFrames asset
+      samples = caSamples asset
+      busGain = busGainFor st (csBus src0)
+      gainL = csGainL src0 * busGain
+      gainR = csGainR src0 * busGain
+      loopSrc = csLoop src0
+      go frameIx framePos
+        | frameIx >= chunkFrames =
+            pure (framePos, False)
+        | framePos >= frames =
+            if loopSrc
+              then go frameIx 0
+              else pure (framePos, True)
+        | otherwise = do
+            let sampleIx = framePos * channels
+                (xL, xR) =
+                  case channels of
+                    1 ->
+                      let x = VU.unsafeIndex samples sampleIx
+                      in (x, x)
+                    _ ->
+                      ( VU.unsafeIndex samples sampleIx
+                      , VU.unsafeIndex samples (sampleIx + 1)
+                      )
+                writePtr = out `advancePtr` (frameIx * 2)
+                sL = realToFrac (xL * gainL) ∷ CFloat
+                sR = realToFrac (xR * gainR) ∷ CFloat
+            curL <- peek writePtr
+            curR <- peek (writePtr `advancePtr` 1)
+            poke writePtr (curL + sL)
+            poke (writePtr `advancePtr` 1) (curR + sR)
+            go (frameIx + 1) (framePos + 1)
+
+  if channels <= 0 || frames <= 0 || VU.null samples
+    then pure (src0, True)
+    else do
+      (framePos', done') <- go 0 (csFramePos src0)
+      let doneNow = done' || (not loopSrc && framePos' >= frames)
+      pure (src0 { csFramePos = framePos' }, doneNow)
 
 mixOneVoice ∷ Float → Int → Ptr CFloat → Float → Float → Float → Float → Float → Float → Float → AudioState → Voice → IO Voice
 mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouch bendRatio vibRateHz vibDepthCents st v0 = do

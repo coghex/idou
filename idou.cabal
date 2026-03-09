@@ -74,6 +74,7 @@ test-suite idou-tests
                     Midi.Control
                     Audio.Types
                     Audio.Thread.Types
+                    Audio.Thread.Render
                     Audio.Thread.Voice
                     Audio.Thread.InstrumentTable
                     Audio.Envelope

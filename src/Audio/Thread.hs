@@ -18,8 +18,9 @@ import Foreign hiding (void)
 import Foreign.C
 
 import qualified Data.Vector.Mutable as MV
+import qualified Data.Vector.Unboxed as VU
 
-import Audio.Config (AudioConfig(..), AudioBufferConfig(..))
+import Audio.Config (AudioConfig(..), AudioBufferConfig(..), AudioTelemetryConfig(..))
 import Engine.Core.Thread
 import Engine.Core.Queue as Q
 import Audio.Types
@@ -56,6 +57,7 @@ startAudioSystem audioCfg healthVerbosity = do
       sampleRate = acSampleRate audioCfg
       chunkFrames = acChunkFrames audioCfg
       bufferCfg = acBuffer audioCfg
+      telemetryCfg = acTelemetry audioCfg
       rbCapacityFrames = abCapacityFrames bufferCfg
       targetBufferFrames = fromIntegral (chunkFrames * abTargetChunks bufferCfg) ∷ Word32
       maxVoices = acMaxVoices audioCfg
@@ -100,6 +102,8 @@ startAudioSystem audioCfg healthVerbosity = do
 
   (`onException` cleanupInitializedDevice) $ do
     voicesVec <- MV.new maxVoices
+    clipAssetVec <- MV.replicate 1024 Nothing
+    clipSourceVec <- MV.new maxVoices
     instVec <- MV.replicate 256 Nothing
     glideVec <- MV.replicate 256 0
     legFiltRetrigVec <- MV.replicate 256 False
@@ -120,6 +124,11 @@ startAudioSystem audioCfg healthVerbosity = do
           AudioState
             { stVoices = voicesVec
             , stActiveCount = 0
+            , stClipAssets = clipAssetVec
+            , stClipSources = clipSourceVec
+            , stClipActiveCount = 0
+            , stBusMusicGain = 1
+            , stBusSfxGain = 1
             , stMixBuf = mixBuf
             , stSampleRate = sampleRate
             , stTargetBufferFrames = targetBufferFrames
@@ -148,7 +157,7 @@ startAudioSystem audioCfg healthVerbosity = do
     (`onException` cleanupStartedSystem) $ do
       startDevice dev
       tid <- forkIO $
-        runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity
+        runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg
           `finally` putMVar doneVar ()
 
       let ts = ThreadState controlRef tid doneVar
@@ -220,18 +229,23 @@ runAudioLoop
   → Int
   → IORef Word64
   → AudioHealthVerbosity
+  → AudioTelemetryConfig
   → IO ()
-runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity = go 0 0 0 emptyHealthStats
+runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg =
+  go 0 0 0 0 emptyHealthStats
   where
-    go ∷ Word64 → Word64 → Word64 → HealthStats → IO ()
-    go lastUnderruns lastPartialWrites lastZeroWrites health = do
+    verboseEveryLoops = fromIntegral (atVerboseReportEveryLoops telemetryCfg) ∷ Word64
+    partialWriteThreshold = fromIntegral (atPartialWriteAlertThreshold telemetryCfg) ∷ Word64
+
+    go ∷ Word64 → Word64 → Word64 → Word64 → HealthStats → IO ()
+    go lastUnderruns lastPartialWrites lastZeroWrites lastVerboseLogLoop health = do
       control <- readIORef controlRef
       case control of
         ThreadStopped -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
           writeIORef stRef st1
-        ThreadPaused  -> threadDelay 10000 >> go lastUnderruns lastPartialWrites lastZeroWrites health
+        ThreadPaused  -> threadDelay 10000 >> go lastUnderruns lastPartialWrites lastZeroWrites lastVerboseLogLoop health
         ThreadRunning -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
@@ -242,19 +256,27 @@ runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity = go 
           u <- readIORef underrunRef
           let partialNow = hsPartialWrites health'
               zeroNow = hsZeroWrites health'
-              changed = u /= lastUnderruns || partialNow /= lastPartialWrites || zeroNow /= lastZeroWrites
+              partialDelta = partialNow - lastPartialWrites
+              zeroDelta = zeroNow - lastZeroWrites
+              changed = u /= lastUnderruns || zeroDelta > 0 || partialDelta >= partialWriteThreshold
+              verboseTick = verboseEveryLoops > 0 && hsLoopCount health' - lastVerboseLogLoop >= verboseEveryLoops
               shouldLog =
                 case healthVerbosity of
                   AudioHealthOff -> False
                   AudioHealthNormal -> changed
                   AudioHealthVerbose ->
-                    changed || (hsLoopCount health' `mod` verboseReportEveryLoops == 0)
+                    changed || verboseTick
 
           when shouldLog $
             emitHealthLog h rb u health'
 
+          let (nextUnderruns, nextPartialWrites, nextZeroWrites, nextVerboseLogLoop) =
+                if shouldLog
+                  then (u, partialNow, zeroNow, hsLoopCount health')
+                  else (lastUnderruns, lastPartialWrites, lastZeroWrites, lastVerboseLogLoop)
+
           threadDelay 1000
-          go u partialNow zeroNow health'
+          go nextUnderruns nextPartialWrites nextZeroWrites nextVerboseLogLoop health'
 
 data HealthStats = HealthStats
   { hsLoopCount     ∷ !Word64
@@ -273,9 +295,6 @@ emptyHealthStats =
     , hsPartialWrites = 0
     , hsZeroWrites = 0
     }
-
-verboseReportEveryLoops ∷ Word64
-verboseReportEveryLoops = 1000
 
 absorbRenderStats ∷ HealthStats → RenderStats → HealthStats
 absorbRenderStats hs rs =
@@ -314,8 +333,10 @@ processMsgs h rb st = do
     Nothing -> pure st
     Just msg ->
       case msg of
-        AudioShutdown -> rbReset rb >> pure st { stActiveCount = 0 }
-        AudioStopAll  -> rbReset rb >> processMsgs h rb st { stActiveCount = 0 }
+        AudioShutdown ->
+          rbReset rb >> pure st { stActiveCount = 0, stClipActiveCount = 0 }
+        AudioStopAll  ->
+          rbReset rb >> processMsgs h rb st { stActiveCount = 0, stClipActiveCount = 0 }
 
         AudioLoadInstrument iid inst ->
           setInstrument iid inst st >>= processMsgs h rb
@@ -340,6 +361,24 @@ processMsgs h rb st = do
         AudioNoteOffInstrument iid -> releaseInstrumentAllVoices iid st >>= processMsgs h rb
         AudioPlayBeep a p f d e -> addBeepVoice h st a p f d e >>= processMsgs h rb
 
+        AudioLoadClip cid channels samples ->
+          loadClipAsset cid channels samples st >>= processMsgs h rb
+
+        AudioUnloadClip cid ->
+          unloadClipAsset cid st >>= processMsgs h rb
+
+        AudioPlayClip cid bus gain pan loop ->
+          addClipSource cid bus gain pan loop st >>= processMsgs h rb
+
+        AudioStopClip cid ->
+          stopClipSourcesByClip cid st >>= processMsgs h rb
+
+        AudioStopBus bus ->
+          stopClipSourcesByBus bus st >>= processMsgs h rb
+
+        AudioSetBusGain bus gain ->
+          setBusGain bus gain st >>= processMsgs h rb
+
         -- UPDATED: MIDI-native NoteOn/NoteOff
         AudioNoteOn iid a p key instId vel eOverride ->
           addInstrumentNote h st iid a p key instId vel eOverride >>= processMsgs h rb
@@ -349,3 +388,101 @@ processMsgs h rb st = do
 
         AudioSetNoteAftertouch iid instId aft ->
           setInstrumentNoteAftertouch iid instId aft st >>= processMsgs h rb
+
+loadClipAsset ∷ ClipId → Int → [Float] → AudioState → IO AudioState
+loadClipAsset (ClipId clipIx) channels samples st = do
+  let assets = stClipAssets st
+  if clipIx < 0 || clipIx >= MV.length assets || channels <= 0
+    then pure st
+    else do
+      let sampleVec = VU.fromList samples
+          sampleCount = VU.length sampleVec
+          alignedCount = sampleCount - (sampleCount `mod` channels)
+          alignedSamples = VU.take alignedCount sampleVec
+          frameCount =
+            if channels > 0
+              then alignedCount `div` channels
+              else 0
+      if frameCount <= 0
+        then MV.write assets clipIx Nothing >> pure st
+        else do
+          let clip = ClipAsset channels frameCount alignedSamples
+          MV.write assets clipIx (Just clip)
+          pure st
+
+unloadClipAsset ∷ ClipId → AudioState → IO AudioState
+unloadClipAsset (ClipId clipIx) st = do
+  let assets = stClipAssets st
+  if clipIx < 0 || clipIx >= MV.length assets
+    then pure st
+    else MV.write assets clipIx Nothing >> stopClipSourcesByClip (ClipId clipIx) st
+
+addClipSource ∷ ClipId → AudioBus → Float → Float → Bool → AudioState → IO AudioState
+addClipSource cid bus gain pan loop st = do
+  mAsset <- lookupClipAsset cid st
+  case mAsset of
+    Nothing -> pure st
+    Just _ -> do
+      let active = stClipActiveCount st
+          sources = stClipSources st
+          cap = MV.length sources
+      if active >= cap
+        then pure st
+        else do
+          let (gainL, gainR) = panGains (max 0 gain) pan
+              src =
+                ClipSource
+                  { csClipId = cid
+                  , csBus = bus
+                  , csGainL = gainL
+                  , csGainR = gainR
+                  , csFramePos = 0
+                  , csLoop = loop
+                  }
+          MV.write sources active src
+          pure st { stClipActiveCount = active + 1 }
+
+stopClipSourcesByClip ∷ ClipId → AudioState → IO AudioState
+stopClipSourcesByClip cid st = do
+  let vec = stClipSources st
+      go i st'
+        | i >= stClipActiveCount st' = pure st'
+        | otherwise = do
+            src <- MV.read vec i
+            if csClipId src == cid
+              then do
+                let lastIx = stClipActiveCount st' - 1
+                when (i /= lastIx) $
+                  MV.read vec lastIx >>= MV.write vec i
+                go i st' { stClipActiveCount = lastIx }
+              else go (i + 1) st'
+  go 0 st
+
+stopClipSourcesByBus ∷ AudioBus → AudioState → IO AudioState
+stopClipSourcesByBus bus st = do
+  let vec = stClipSources st
+      go i st'
+        | i >= stClipActiveCount st' = pure st'
+        | otherwise = do
+            src <- MV.read vec i
+            if csBus src == bus
+              then do
+                let lastIx = stClipActiveCount st' - 1
+                when (i /= lastIx) $
+                  MV.read vec lastIx >>= MV.write vec i
+                go i st' { stClipActiveCount = lastIx }
+              else go (i + 1) st'
+  go 0 st
+
+lookupClipAsset ∷ ClipId → AudioState → IO (Maybe ClipAsset)
+lookupClipAsset (ClipId clipIx) st = do
+  let assets = stClipAssets st
+  if clipIx < 0 || clipIx >= MV.length assets
+    then pure Nothing
+    else MV.read assets clipIx
+
+setBusGain ∷ AudioBus → Float → AudioState → IO AudioState
+setBusGain bus gain st =
+  case bus of
+    AudioBusMusic -> pure st { stBusMusicGain = clamp01 gain }
+    AudioBusSfx -> pure st { stBusSfxGain = clamp01 gain }

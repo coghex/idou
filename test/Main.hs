@@ -2,21 +2,25 @@
 
 module Main where
 
-import Control.Exception (SomeException, evaluate, try)
+import Control.Exception (SomeException, bracket, evaluate, try)
 import Control.Monad (forM, unless, when)
 import Data.List (find, intercalate, isInfixOf)
 import qualified Data.Map.Strict as M
 import Data.Word (Word32)
 import Foreign.ForeignPtr (mallocForeignPtrArray)
+import Foreign.Marshal.Array (allocaArray, peekArray)
+import Foreign.C (CFloat)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
 
 import qualified Data.Vector.Mutable as MV
+import qualified Data.Vector.Unboxed as VU
 
-import Audio.Config (AudioBufferConfig(..), AudioConfig(..), parseAudioConfigText)
+import Audio.Config (AudioBufferConfig(..), AudioConfig(..), AudioTelemetryConfig(..), parseAudioConfigText)
 import Audio.Envelope
 import Audio.Oscillator (Osc(..), oscInitSeeded, oscStep)
 import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmDrumInstrument, gmProgramInstrument, gmPercussionChannel)
+import Audio.Thread.Render (renderChunkFrames)
 import Audio.Thread.InstrumentTable
   ( MidiControls(..)
   , lookupMidiControls
@@ -29,7 +33,7 @@ import Audio.Thread.InstrumentTable
   , setModWheel
   , setPitchBend
   )
-import Audio.Thread.Types (AudioState(..), Voice(..))
+import Audio.Thread.Types (AudioState(..), ClipAsset(..), ClipSource(..), Voice(..))
 import Audio.Thread.Voice
   ( addInstrumentNote
   , applyInstrumentToActiveVoices
@@ -47,6 +51,7 @@ import Midi.Play.Util
   , ticksToMicroseconds
   )
 import Engine.Core.Queue (newQueue)
+import Sound.Miniaudio.RingBuffer (rbCreateF32, rbDestroy, rbReadF32)
 
 data TestCase = TestCase
   { tcName   ∷ String
@@ -112,6 +117,8 @@ testCases =
   , TestCase "gm-percussion-channel-ignores-program" testGmPercussionChannelIgnoresProgram
   , TestCase "gm-drum-map-varies-by-key-family" testGmDrumMapVariesByKeyFamily
   , TestCase "instrument-load-keeps-active-voice-until-live-apply" testInstrumentLoadKeepsActiveVoiceUntilLiveApply
+  , TestCase "clip-one-shot-auto-releases-source" testClipOneShotAutoReleasesSource
+  , TestCase "clip-music-bus-gain-zero-mutes-output" testClipMusicBusGainZeroMutesOutput
   ]
 
 testAudioConfigParsesYamlShape ∷ IO ()
@@ -135,6 +142,11 @@ testAudioConfigParsesYamlShape = do
               AudioBufferConfig
                 { abCapacityFrames = 2048
                 , abTargetChunks = 8
+                }
+          , acTelemetry =
+              AudioTelemetryConfig
+                { atVerboseReportEveryLoops = 1000
+                , atPartialWriteAlertThreshold = 1
                 }
           }
   assertEqual "parsed audio config" (Right expected) (parseAudioConfigText yamlText)
@@ -538,6 +550,56 @@ testInstrumentLoadKeepsActiveVoiceUntilLiveApply = do
   assertEqual "live apply updates snapshot routes" routesB (vModRoutes voiceLive)
   assertEqual "live apply updates waveform" WaveSaw (oWaveform oscLive)
 
+testClipOneShotAutoReleasesSource ∷ IO ()
+testClipOneShotAutoReleasesSource = do
+  st0 <- mkTestState
+  let clip = ClipAsset 1 4 (VU.fromList [0.5, -0.5, 0.25, -0.25])
+      src =
+        ClipSource
+          { csClipId = ClipId 0
+          , csBus = AudioBusSfx
+          , csGainL = 1
+          , csGainR = 1
+          , csFramePos = 0
+          , csLoop = False
+          }
+  MV.write (stClipAssets st0) 0 (Just clip)
+  MV.write (stClipSources st0) 0 src
+  let st1 = st0 { stClipActiveCount = 1 }
+  bracket (rbCreateF32 64 2) rbDestroy $ \rb -> do
+    (st2, wrote) <- renderChunkFrames rb 8 st1
+    assertEqual "clip chunk write count" 8 wrote
+    assertEqual "one-shot should release source after end" 0 (stClipActiveCount st2)
+
+testClipMusicBusGainZeroMutesOutput ∷ IO ()
+testClipMusicBusGainZeroMutesOutput = do
+  st0 <- mkTestState
+  let clip = ClipAsset 1 1 (VU.fromList [1])
+      src =
+        ClipSource
+          { csClipId = ClipId 0
+          , csBus = AudioBusMusic
+          , csGainL = 1
+          , csGainR = 1
+          , csFramePos = 0
+          , csLoop = False
+          }
+  MV.write (stClipAssets st0) 0 (Just clip)
+  MV.write (stClipSources st0) 0 src
+  let st1 =
+        st0
+          { stClipActiveCount = 1
+          , stBusMusicGain = 0
+          }
+  bracket (rbCreateF32 16 2) rbDestroy $ \rb -> do
+    (_st2, _wrote) <- renderChunkFrames rb 1 st1
+    allocaArray 2 $ \buf -> do
+      got <- rbReadF32 rb buf 1
+      assertEqual "ring buffer should contain one frame" 1 (fromIntegral got ∷ Int)
+      [l, r] <- peekArray 2 buf
+      assertNear "left output should be muted by bus gain" 0 (realToFrac (l ∷ CFloat))
+      assertNear "right output should be muted by bus gain" 0 (realToFrac (r ∷ CFloat))
+
 mkTestHandle ∷ IO AudioHandle
 mkTestHandle = do
   q <- newQueue
@@ -550,6 +612,8 @@ mkTestHandle = do
 mkTestState ∷ IO AudioState
 mkTestState = do
   voices <- MV.new 8
+  clipAssetVec <- MV.replicate 1024 Nothing
+  clipSourceVec <- MV.new 8
   mixBuf <- mallocForeignPtrArray (256 * 2)
   instVec <- MV.replicate 256 Nothing
   glideVec <- MV.replicate 256 0
@@ -568,6 +632,11 @@ mkTestState = do
   pure AudioState
     { stVoices = voices
     , stActiveCount = 0
+    , stClipAssets = clipAssetVec
+    , stClipSources = clipSourceVec
+    , stClipActiveCount = 0
+    , stBusMusicGain = 1
+    , stBusSfxGain = 1
     , stMixBuf = mixBuf
     , stSampleRate = testSampleRate
     , stTargetBufferFrames = 2048
