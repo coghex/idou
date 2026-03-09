@@ -28,33 +28,34 @@ executable idou
   hs-source-dirs:   app
                   , src
   main-is:          Main.hs
-  other-modules:  Audio.Config
-                  Audio.Patch
-                  Sound.Miniaudio
-                  Sound.Miniaudio.Decode
-                  Sound.Miniaudio.RingBuffer
-                  Engine.Core.Thread
-                  Engine.Core.Queue
-                  Audio.Types
-                  Audio.Thread
-                   Audio.Thread.Types
-                   Audio.Thread.Render
-                   Audio.Thread.Voice
-                   Audio.Thread.InstrumentTable
-                   Player.Thread
-                   Player.Timeline
-                   Audio.Envelope
-                   Audio.Oscillator
-                   Audio.Filter
-                  Audio.Filter.Types
-                  Audio.Filter.Biquad
-                  Midi.Control
-                  Midi.Play
-                  Midi.Play.Util
-                  Midi.ZMidi.Core.Datatypes
-                  Midi.ZMidi.Core.ReadFile
-                  Midi.ZMidi.Core.Internal.ExtraTypes
-                  Midi.ZMidi.Core.Internal.ParserMonad
+  other-modules:    Audio.Config
+                    Audio.Patch
+                    Sound.Miniaudio
+                    Sound.Miniaudio.Decode
+                    Sound.Miniaudio.RingBuffer
+                    Engine.Core.Thread
+                    Engine.Core.Queue
+                    Audio.Types
+                    Audio.Thread
+                    Audio.Thread.Types
+                    Audio.Thread.Render
+                    Audio.Thread.Voice
+                    Audio.Thread.InstrumentTable
+                    Player.Automation
+                    Player.Thread
+                    Player.Timeline
+                    Audio.Envelope
+                    Audio.Oscillator
+                    Audio.Filter
+                    Audio.Filter.Types
+                    Audio.Filter.Biquad
+                    Midi.Control
+                    Midi.Play
+                    Midi.Play.Util
+                    Midi.ZMidi.Core.Datatypes
+                    Midi.ZMidi.Core.ReadFile
+                    Midi.ZMidi.Core.Internal.ExtraTypes
+                    Midi.ZMidi.Core.Internal.ParserMonad
   build-depends:    base >=4.14 && <5
                 ,   bytestring
                 ,   idou
@@ -77,14 +78,15 @@ test-suite idou-tests
                     Engine.Core.Queue
                     Midi.Control
                     Audio.Types
-                     Audio.Thread.Types
-                     Audio.Thread.Render
-                     Audio.Thread.Voice
-                     Audio.Thread.InstrumentTable
-                     Player.Timeline
-                     Audio.Envelope
-                     Audio.Oscillator
-                     Audio.Filter
+                    Audio.Thread.Types
+                    Audio.Thread.Render
+                    Audio.Thread.Voice
+                    Audio.Thread.InstrumentTable
+                    Player.Automation
+                    Player.Timeline
+                    Audio.Envelope
+                    Audio.Oscillator
+                    Audio.Filter
                     Audio.Filter.Types
                     Audio.Filter.Biquad
                     Sound.Miniaudio.RingBuffer

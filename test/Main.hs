@@ -56,6 +56,16 @@ import Midi.Play.Util
   , ticksToMicroseconds
   )
 import Engine.Core.Queue (Queue, newQueue, tryReadQueue)
+import Player.Automation
+  ( AutomationCurve(..)
+  , EnergyLaneEvent(..)
+  , MoodLaneEvent(..)
+  , barFramesForTransport
+  , scheduleEnergyLaneNextBar
+  , scheduleMoodLaneNextBar
+  , stepEnergyLane
+  , stepMoodLane
+  )
 import Player.Timeline
   ( SongMode(..)
   , TimelineBar(..)
@@ -128,6 +138,8 @@ testCases =
   , TestCase "timeline-section-metadata-steers-conductor" testTimelineSectionMetadataSteersConductor
   , TestCase "timeline-section-feel-steers-variation" testTimelineSectionFeelSteersVariation
   , TestCase "timeline-transition-telemetry-emits-reason-and-weights" testTimelineTransitionTelemetryEmitsReasonAndWeights
+  , TestCase "automation-energy-lane-ramps-and-completes" testAutomationEnergyLaneRampsAndCompletes
+  , TestCase "automation-mood-lane-switches-at-end" testAutomationMoodLaneSwitchesAtEnd
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
@@ -663,6 +675,100 @@ testTimelineMoodTargetSteersTransposition = do
   assertBool
     "combat mood target should bias transposition upward vs ambient"
     (avgPitch barsCombat > avgPitch barsCalm + 0.5)
+
+testAutomationEnergyLaneRampsAndCompletes ∷ IO ()
+testAutomationEnergyLaneRampsAndCompletes = do
+  let now = 12345
+      sampleRateHz = testSampleRate
+      beatsPerBar = 4
+      bpm = 120
+      lane0 =
+        scheduleEnergyLaneNextBar
+          now
+          sampleRateHz
+          beatsPerBar
+          bpm
+          0.2
+          0.8
+          2
+          AutomationLinear
+      barFrames = barFramesForTransport sampleRateHz beatsPerBar bpm
+      startFrame = ((now `div` barFrames) + 1) * barFrames
+      beforeFrame = max 0 (startFrame - 1)
+      midFrame = startFrame + barFrames
+      endFrame = startFrame + 2 * barFrames
+
+      (v0, mLane1, ev0) = stepEnergyLane beforeFrame lane0
+  assertEqual "before start has no target update" Nothing v0
+  assertEqual "before start has no events" [] ev0
+
+  lane1 <- maybe (error "expected lane before start") pure mLane1
+  let (v1, mLane2, ev1) = stepEnergyLane startFrame lane1
+  assertEqual "start frame emits initial value" (Just 0.2) v1
+  assertEqual
+    "start frame emits started event"
+    [EnergyLaneStarted startFrame endFrame 0.2 0.8 AutomationLinear]
+    ev1
+
+  lane2 <- maybe (error "expected lane at start") pure mLane2
+  let (v2, mLane3, ev2) = stepEnergyLane midFrame lane2
+  assertBool "midpoint should ramp up" (maybe False (\x -> x > 0.49 && x < 0.51) v2)
+  assertEqual "midpoint should not emit more events" [] ev2
+
+  lane3 <- maybe (error "expected lane at midpoint") pure mLane3
+  let (v3, mLane4, ev3) = stepEnergyLane endFrame lane3
+  assertEqual "end frame reaches final target" (Just 0.8) v3
+  assertEqual
+    "end frame emits completion event"
+    [EnergyLaneCompleted endFrame 0.8]
+    ev3
+  assertEqual "lane should complete and clear" Nothing mLane4
+
+testAutomationMoodLaneSwitchesAtEnd ∷ IO ()
+testAutomationMoodLaneSwitchesAtEnd = do
+  let now = 5000
+      sampleRateHz = testSampleRate
+      beatsPerBar = 4
+      bpm = 120
+      lane0 =
+        scheduleMoodLaneNextBar
+          now
+          sampleRateHz
+          beatsPerBar
+          bpm
+          (Just "ambient")
+          (Just "combat")
+          3
+      barFrames = barFramesForTransport sampleRateHz beatsPerBar bpm
+      startFrame = ((now `div` barFrames) + 1) * barFrames
+      endFrame = startFrame + 3 * barFrames
+      beforeFrame = max 0 (startFrame - 1)
+
+      (m0, mLane1, ev0) = stepMoodLane beforeFrame lane0
+  assertEqual "before start should not update mood" Nothing m0
+  assertEqual "before start has no mood events" [] ev0
+
+  lane1 <- maybe (error "expected mood lane before start") pure mLane1
+  let (m1, mLane2, ev1) = stepMoodLane startFrame lane1
+  assertEqual "start frame should not switch mood yet" Nothing m1
+  assertEqual
+    "start frame emits started event"
+    [MoodLaneStarted startFrame endFrame (Just "ambient") (Just "combat")]
+    ev1
+
+  lane2 <- maybe (error "expected mood lane after start") pure mLane2
+  let (m2, mLane3, ev2) = stepMoodLane (endFrame - 1) lane2
+  assertEqual "mood should remain unchanged before end" Nothing m2
+  assertEqual "no extra event before end" [] ev2
+
+  lane3 <- maybe (error "expected mood lane before end") pure mLane3
+  let (m3, mLane4, ev3) = stepMoodLane endFrame lane3
+  assertEqual "end frame should switch to target mood" (Just (Just "combat")) m3
+  assertEqual
+    "end frame emits mood completion"
+    [MoodLaneCompleted endFrame (Just "combat")]
+    ev3
+  assertEqual "mood lane should complete and clear" Nothing mLane4
 
 testTimelineSectionMetadataSteersConductor ∷ IO ()
 testTimelineSectionMetadataSteersConductor = do

@@ -1,7 +1,8 @@
 {-# LANGUAGE Strict, UnicodeSyntax #-}
 
 module Player.Thread
-  ( PlayerMsg(..)
+  ( AutomationCurve(..)
+  , PlayerMsg(..)
   , PlayerEvent(..)
   , PlayerSystem(..)
   , nextBarFrame
@@ -41,6 +42,18 @@ import Audio.Envelope (ADSR)
 import Engine.Core.Queue (Queue)
 import qualified Engine.Core.Queue as Q
 import Engine.Core.Thread (ThreadControl(..), ThreadState(..))
+import Player.Automation
+  ( AutomationCurve(..)
+  , EnergyLane
+  , EnergyLaneEvent(..)
+  , MoodLane
+  , MoodLaneEvent(..)
+  , barFramesForTransport
+  , scheduleEnergyLaneNextBar
+  , scheduleMoodLaneNextBar
+  , stepEnergyLane
+  , stepMoodLane
+  )
 import Player.Timeline
   ( SongSpec
   , TimelineBar(..)
@@ -73,6 +86,17 @@ data PlayerMsg
   | PlayerSetEnergyTarget
       { pmEnergyTarget ∷ !Float
       }
+  | PlayerAutomateEnergyNextBar
+      { pmAutoEnergyTarget ∷ !Float
+      , pmAutoEnergyBars ∷ !Int
+      , pmAutoEnergyCurve ∷ !AutomationCurve
+      }
+  | PlayerAutomateMoodNextBar
+      { pmAutoMoodTarget ∷ !String
+      , pmAutoMoodBars ∷ !Int
+      }
+  | PlayerCancelEnergyAutomation
+  | PlayerCancelMoodAutomation
   | PlayerLoadSongTimeline
       { pmSongPath ∷ !FilePath
       }
@@ -115,6 +139,29 @@ data PlayerEvent
   | PlayerEventTimelineStopped
   | PlayerEventTimelineFinished
   | PlayerEventTimelineTransition !TimelineTransitionTelemetry
+  | PlayerEventEnergyAutomationStarted
+      { peEnergyAutoStartFrame ∷ !Word64
+      , peEnergyAutoEndFrame ∷ !Word64
+      , peEnergyAutoFrom ∷ !Float
+      , peEnergyAutoTo ∷ !Float
+      , peEnergyAutoCurve ∷ !AutomationCurve
+      }
+  | PlayerEventEnergyAutomationCompleted
+      { peEnergyAutoEndFrame ∷ !Word64
+      , peEnergyAutoFinal ∷ !Float
+      }
+  | PlayerEventMoodAutomationStarted
+      { peMoodAutoStartFrame ∷ !Word64
+      , peMoodAutoEndFrame ∷ !Word64
+      , peMoodAutoFrom ∷ !(Maybe String)
+      , peMoodAutoTo ∷ !(Maybe String)
+      }
+  | PlayerEventMoodAutomationCompleted
+      { peMoodAutoEndFrame ∷ !Word64
+      , peMoodAutoFinal ∷ !(Maybe String)
+      }
+  | PlayerEventEnergyAutomationCanceled
+  | PlayerEventMoodAutomationCanceled
   | PlayerEventScheduled
       { peFrame ∷ !Word64
       , peAction ∷ !ScheduledAudioAction
@@ -126,6 +173,8 @@ data PlayerState = PlayerState
   , pstTempoBpm    ∷ !Float
   , pstMoodTarget  ∷ !(Maybe String)
   , pstEnergyTarget ∷ !Float
+  , pstEnergyLane  ∷ !(Maybe EnergyLane)
+  , pstMoodLane    ∷ !(Maybe MoodLane)
   , pstSongSpec    ∷ !(Maybe SongSpec)
   , pstTimeline    ∷ !(Maybe TimelineRuntime)
   , pstNextNoteInst ∷ !Word64
@@ -142,7 +191,7 @@ startPlayerThread audioSys = do
   msgQ <- Q.newQueue
   evQ <- Q.newQueue
   controlRef <- newIORef ThreadRunning
-  playerStateRef <- newIORef (PlayerState 4 120 Nothing 0.5 Nothing Nothing 1)
+  playerStateRef <- newIORef (PlayerState 4 120 Nothing 0.5 Nothing Nothing Nothing Nothing 1)
   doneVar <- newEmptyMVar
   tid <- forkIO $
     runPlayerLoop audioSys msgQ evQ controlRef playerStateRef `finally` putMVar doneVar ()
@@ -217,16 +266,56 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           let mood' = normalizeMoodTarget moodRaw
           modifyIORef'
             playerStateRef
-            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = mood' }))
+            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = mood', pstMoodLane = Nothing }))
         PlayerClearMoodTarget ->
           modifyIORef'
             playerStateRef
-            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = Nothing }))
+            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = Nothing, pstMoodLane = Nothing }))
         PlayerSetEnergyTarget energy ->
           let energy' = clamp01 energy
           in modifyIORef'
                playerStateRef
-               (\s -> applyLiveTimelineTargets (s { pstEnergyTarget = energy' }))
+               (\s -> applyLiveTimelineTargets (s { pstEnergyTarget = energy', pstEnergyLane = Nothing }))
+        PlayerAutomateEnergyNextBar target bars curve -> do
+          ps <- readIORef playerStateRef
+          now <- readTransportFrame audioSys
+          let lane =
+                scheduleEnergyLaneNextBar
+                  now
+                  (sampleRate (asHandle audioSys))
+                  (pstBeatsPerBar ps)
+                  (pstTempoBpm ps)
+                  (pstEnergyTarget ps)
+                  target
+                  bars
+                  curve
+          modifyIORef' playerStateRef (\s -> s { pstEnergyLane = Just lane })
+        PlayerAutomateMoodNextBar moodRaw bars -> do
+          ps <- readIORef playerStateRef
+          now <- readTransportFrame audioSys
+          let target = normalizeMoodTarget moodRaw
+              lane =
+                scheduleMoodLaneNextBar
+                  now
+                  (sampleRate (asHandle audioSys))
+                  (pstBeatsPerBar ps)
+                  (pstTempoBpm ps)
+                  (pstMoodTarget ps)
+                  target
+                  bars
+          modifyIORef' playerStateRef (\s -> s { pstMoodLane = Just lane })
+        PlayerCancelEnergyAutomation -> do
+          ps <- readIORef playerStateRef
+          modifyIORef' playerStateRef (\s -> s { pstEnergyLane = Nothing })
+          case pstEnergyLane ps of
+            Nothing -> pure ()
+            Just _ -> Q.writeQueue evQ PlayerEventEnergyAutomationCanceled
+        PlayerCancelMoodAutomation -> do
+          ps <- readIORef playerStateRef
+          modifyIORef' playerStateRef (\s -> s { pstMoodLane = Nothing })
+          case pstMoodLane ps of
+            Nothing -> pure ()
+            Just _ -> Q.writeQueue evQ PlayerEventMoodAutomationCanceled
         PlayerLoadSongTimeline path -> do
           loaded <- loadSongSpec path
           case loaded of
@@ -388,11 +477,13 @@ pumpTimeline
   → IORef PlayerState
   → IO ()
 pumpTimeline audioSys evQ playerStateRef = do
-  ps <- readIORef playerStateRef
+  now <- readTransportFrame audioSys
+  ps0 <- readIORef playerStateRef
+  ps <- advanceAutomationLanes now evQ ps0
+  writeIORef playerStateRef ps
   case pstTimeline ps of
     Nothing -> pure ()
     Just runtime -> do
-      now <- readTransportFrame audioSys
       let (readyBars, runtime') = popReadyBars now runtime
           (transitionTelemetry, runtime'') = popTransitionTelemetry runtime'
       mapM_ (Q.writeQueue evQ . PlayerEventTimelineTransition) transitionTelemetry
@@ -403,6 +494,62 @@ pumpTimeline audioSys evQ playerStateRef = do
           Q.writeQueue evQ PlayerEventTimelineFinished
         else
           writeIORef playerStateRef ps' { pstTimeline = Just runtime'' }
+
+advanceAutomationLanes ∷ Word64 → Queue PlayerEvent → PlayerState → IO PlayerState
+advanceAutomationLanes now evQ ps0 = do
+  let (ps1, energyEvents) = applyEnergyAutomation now ps0
+      (ps2, moodEvents) = applyMoodAutomation now ps1
+      ps3 = applyLiveTimelineTargets ps2
+  mapM_ (Q.writeQueue evQ) (energyEvents <> moodEvents)
+  pure ps3
+
+applyEnergyAutomation ∷ Word64 → PlayerState → (PlayerState, [PlayerEvent])
+applyEnergyAutomation now ps =
+  case pstEnergyLane ps of
+    Nothing -> (ps, [])
+    Just lane ->
+      let (mTarget, mLane, laneEvents) = stepEnergyLane now lane
+          target' =
+            case mTarget of
+              Nothing -> pstEnergyTarget ps
+              Just x -> x
+          ps' =
+            ps
+              { pstEnergyTarget = target'
+              , pstEnergyLane = mLane
+              }
+      in (ps', map toPlayerEnergyEvent laneEvents)
+  where
+    toPlayerEnergyEvent laneEvent =
+      case laneEvent of
+        EnergyLaneStarted startF endF fromE toE curve ->
+          PlayerEventEnergyAutomationStarted startF endF fromE toE curve
+        EnergyLaneCompleted endF finalE ->
+          PlayerEventEnergyAutomationCompleted endF finalE
+
+applyMoodAutomation ∷ Word64 → PlayerState → (PlayerState, [PlayerEvent])
+applyMoodAutomation now ps =
+  case pstMoodLane ps of
+    Nothing -> (ps, [])
+    Just lane ->
+      let (mTarget, mLane, laneEvents) = stepMoodLane now lane
+          target' =
+            case mTarget of
+              Nothing -> pstMoodTarget ps
+              Just mood -> mood
+          ps' =
+            ps
+              { pstMoodTarget = target'
+              , pstMoodLane = mLane
+              }
+      in (ps', map toPlayerMoodEvent laneEvents)
+  where
+    toPlayerMoodEvent laneEvent =
+      case laneEvent of
+        MoodLaneStarted startF endF fromM toM ->
+          PlayerEventMoodAutomationStarted startF endF fromM toM
+        MoodLaneCompleted endF finalM ->
+          PlayerEventMoodAutomationCompleted endF finalM
 
 scheduleTimelineBar
   ∷ AudioSystem
@@ -465,13 +612,6 @@ drainAudioEvents audioSys evQ = do
 
 nextBarFrame ∷ Word64 → Word32 → Int → Float → Word64
 nextBarFrame now sampleRateHz beatsPerBar bpm =
-  let beats = max 1 beatsPerBar
-      tempo = max 1 bpm
-      framesPerBarD =
-        (fromIntegral sampleRateHz ∷ Double)
-          * 60
-          * fromIntegral beats
-          / realToFrac tempo
-      framesPerBar = max 1 (floor framesPerBarD ∷ Integer)
+  let framesPerBar = fromIntegral (barFramesForTransport sampleRateHz beatsPerBar bpm) ∷ Integer
       nowI = fromIntegral now ∷ Integer
   in fromIntegral (((nowI `div` framesPerBar) + 1) * framesPerBar)
