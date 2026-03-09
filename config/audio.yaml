@@ -5,3 +5,6 @@ audio:
   buffer:
     capacity_frames: 8192
     target_chunks: 8
+  telemetry:
+    verbose_report_every_loops: 1000
+    partial_write_alert_threshold: 1

@@ -5,7 +5,8 @@ module Main where
 import Control.Concurrent (forkIO)
 import Control.Exception (bracket)
 import Control.Monad (forM_)
-import Data.List (stripPrefix)
+import Data.Char (toLower)
+import Data.List (isSuffixOf, stripPrefix)
 import System.Environment (getArgs)
 import System.Exit (exitSuccess)
 import System.IO
@@ -21,16 +22,13 @@ main ∷ IO ()
 main = do
   args <- getArgs
   case parseCliArgs args of
-    Right (healthVerbosity, midiPath) -> do
+    Right (healthVerbosity, inputPath) -> do
       audioCfg <- loadAudioConfig audioConfigPath
       bracket (startAudioSystem audioCfg healthVerbosity) stopAudioSystem $ \sys -> do
         -- Preload instruments 0..15 (MIDI channels) with the same patch for now.
         preloadChannels sys
 
-        -- Start MIDI playback in a separate thread.
-        _ <- forkIO $ playMidiFile defaultChannelMap sys midiPath
-
-        putStrLn $ "Playing MIDI file: " <> midiPath
+        playInput sys inputPath
         putStrLn "Press q to quit."
         withRawStdin $ waitForQuit sys
 
@@ -72,9 +70,25 @@ parseCliArgs = go AudioHealthNormal Nothing
 usageText ∷ String
 usageText =
   unlines
-    [ "usage: idou [--audio-health|--audio-health=off|--audio-health=normal|--audio-health=verbose] <file.mid>"
+    [ "usage: idou [--audio-health|--audio-health=off|--audio-health=normal|--audio-health=verbose] <file.mid|file.midi|file.wav>"
     , "  --audio-health defaults to normal and reports runtime health on anomalies."
     ]
+
+playInput ∷ AudioSystem → FilePath → IO ()
+playInput sys inputPath
+  | hasExt ".mid" inputPath || hasExt ".midi" inputPath = do
+      _ <- forkIO $ playMidiFile defaultChannelMap sys inputPath
+      putStrLn $ "Playing MIDI file: " <> inputPath
+  | hasExt ".wav" inputPath = do
+      let clip = ClipId 0
+      loadClipFromFile sys clip inputPath
+      sendAudio sys (AudioPlayClip clip AudioBusMusic 1 0 False)
+      putStrLn $ "Playing WAV file: " <> inputPath
+  | otherwise =
+      ioError (userError ("Unsupported input file type: " <> inputPath <> "\n" <> usageText))
+
+hasExt ∷ String → FilePath → Bool
+hasExt ext path = ext `isSuffixOf` map toLower path
 
 preloadChannels ∷ AudioSystem → IO ()
 preloadChannels sys = do
@@ -94,9 +108,7 @@ waitForQuit sys = do
         c <- hGetChar stdin
         case c of
           'q' -> do
-            -- release everything on quit
-            forM_ [0..15] $ \ch ->
-              sendAudio sys (AudioNoteOffInstrument (InstrumentId ch))
+            sendAudio sys AudioStopAll
             putStrLn "\nQuit."
             exitSuccess
           _ -> loop

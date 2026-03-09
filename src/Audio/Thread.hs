@@ -5,6 +5,7 @@ module Audio.Thread
   ( startAudioSystem
   , stopAudioSystem
   , sendAudio
+  , loadClipFromFile
   , AudioHealthVerbosity(..)
   , AudioSystem(..)
   ) where
@@ -25,6 +26,7 @@ import Engine.Core.Thread
 import Engine.Core.Queue as Q
 import Audio.Types
 import Sound.Miniaudio
+import Sound.Miniaudio.Decode
 import Sound.Miniaudio.RingBuffer
 
 import Audio.Thread.Types
@@ -50,6 +52,17 @@ data AudioHealthVerbosity
 
 sendAudio ∷ AudioSystem → AudioMsg → IO ()
 sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
+
+loadClipFromFile ∷ AudioSystem → ClipId → FilePath → IO ()
+loadClipFromFile sys clip path = do
+  decoded <- decodeAudioFileStereoF32 path
+  sendAudio
+    sys
+    (AudioLoadClip
+      { clipId = clip
+      , clipChannels = daChannels decoded
+      , clipSamples = daSamples decoded
+      })
 
 startAudioSystem ∷ AudioConfig → AudioHealthVerbosity → IO AudioSystem
 startAudioSystem audioCfg healthVerbosity = do

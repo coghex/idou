@@ -3,6 +3,7 @@
 module Audio.Config
   ( AudioConfig(..)
   , AudioBufferConfig(..)
+  , AudioTelemetryConfig(..)
   , audioConfigPath
   , defaultAudioConfig
   , loadAudioConfig
@@ -26,6 +27,12 @@ data AudioConfig = AudioConfig
   , acChunkFrames ∷ !Int
   , acMaxVoices   ∷ !Int
   , acBuffer      ∷ !AudioBufferConfig
+  , acTelemetry   ∷ !AudioTelemetryConfig
+  } deriving (Eq, Show)
+
+data AudioTelemetryConfig = AudioTelemetryConfig
+  { atVerboseReportEveryLoops   ∷ !Int
+  , atPartialWriteAlertThreshold ∷ !Int
   } deriving (Eq, Show)
 
 audioConfigPath ∷ FilePath
@@ -41,6 +48,11 @@ defaultAudioConfig =
         AudioBufferConfig
           { abCapacityFrames = 8192
           , abTargetChunks = 8
+          }
+    , acTelemetry =
+        AudioTelemetryConfig
+          { atVerboseReportEveryLoops = 1000
+          , atPartialWriteAlertThreshold = 1
           }
     }
 
@@ -62,6 +74,16 @@ parseAudioConfigText contents = do
   maxVoices <- lookupIntKey ["audio", "max_voices"] entries
   capacityFrames <- lookupWord32Key ["audio", "buffer", "capacity_frames"] entries
   targetChunks <- lookupIntKey ["audio", "buffer", "target_chunks"] entries
+  verboseEvery <-
+    lookupIntKeyDefault
+      ["audio", "telemetry", "verbose_report_every_loops"]
+      (atVerboseReportEveryLoops (acTelemetry defaultAudioConfig))
+      entries
+  partialWriteThreshold <-
+    lookupIntKeyDefault
+      ["audio", "telemetry", "partial_write_alert_threshold"]
+      (atPartialWriteAlertThreshold (acTelemetry defaultAudioConfig))
+      entries
   let cfg =
         AudioConfig
           { acSampleRate = sampleRate
@@ -72,19 +94,33 @@ parseAudioConfigText contents = do
                 { abCapacityFrames = capacityFrames
                 , abTargetChunks = targetChunks
                 }
+          , acTelemetry =
+              AudioTelemetryConfig
+                { atVerboseReportEveryLoops = verboseEvery
+                , atPartialWriteAlertThreshold = partialWriteThreshold
+                }
           }
   validateAudioConfig cfg
 
 type FlatYaml = Map [String] String
 
-allowedLeafKeys ∷ [[String]]
-allowedLeafKeys =
+requiredLeafKeys ∷ [[String]]
+requiredLeafKeys =
   [ ["audio", "sample_rate"]
   , ["audio", "chunk_frames"]
   , ["audio", "max_voices"]
   , ["audio", "buffer", "capacity_frames"]
   , ["audio", "buffer", "target_chunks"]
   ]
+
+optionalLeafKeys ∷ [[String]]
+optionalLeafKeys =
+  [ ["audio", "telemetry", "verbose_report_every_loops"]
+  , ["audio", "telemetry", "partial_write_alert_threshold"]
+  ]
+
+allowedLeafKeys ∷ [[String]]
+allowedLeafKeys = requiredLeafKeys <> optionalLeafKeys
 
 parseFlatYaml ∷ String → Either String FlatYaml
 parseFlatYaml contents = snd <$> foldl step (Right ([], M.empty)) (zip [1 :: Int ..] (lines contents))
@@ -140,7 +176,7 @@ rejectUnexpectedKeys ∷ FlatYaml → Either String ()
 rejectUnexpectedKeys entries = do
   let keys = M.keys entries
       unexpected = filter (`notElem` allowedLeafKeys) keys
-      missing = filter (`M.notMember` entries) allowedLeafKeys
+      missing = filter (`M.notMember` entries) requiredLeafKeys
   ensure (null unexpected) ("unexpected config keys: " <> intercalate ", " (map renderPath unexpected))
   ensure (null missing) ("missing config keys: " <> intercalate ", " (map renderPath missing))
 
@@ -156,6 +192,12 @@ lookupWord32Key key entries = do
   n <- lookupIntKey key entries
   ensure (n >= 0) ("value for " <> renderPath key <> " must be non-negative")
   pure (fromIntegral n)
+
+lookupIntKeyDefault ∷ [String] → Int → FlatYaml → Either String Int
+lookupIntKeyDefault key fallback entries =
+  case M.lookup key entries of
+    Nothing -> pure fallback
+    Just _ -> lookupIntKey key entries
 
 lookupKey ∷ [String] → FlatYaml → Either String String
 lookupKey key entries =
@@ -175,6 +217,9 @@ validateAudioConfig cfg = do
   ensure
     (fromIntegral targetFrames <= abCapacityFrames bufferCfg)
     "audio.buffer.capacity_frames must be at least chunk_frames * target_chunks"
+  let telemetryCfg = acTelemetry cfg
+  ensure (atVerboseReportEveryLoops telemetryCfg > 0) "audio.telemetry.verbose_report_every_loops must be greater than 0"
+  ensure (atPartialWriteAlertThreshold telemetryCfg > 0) "audio.telemetry.partial_write_alert_threshold must be greater than 0"
   pure cfg
 
 ensure ∷ Bool → String → Either String ()

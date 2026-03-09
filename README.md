@@ -10,6 +10,7 @@ Run with:
 
 ```bash
 cabal run idou -- path/to/file.mid
+cabal run idou -- path/to/file.wav
 ```
 
 Optional runtime health telemetry:
@@ -17,3 +18,7 @@ Optional runtime health telemetry:
 ```bash
 cabal run idou -- --audio-health=verbose path/to/file.mid
 ```
+
+Telemetry behavior can be tuned in `config/audio.yaml` under `audio.telemetry`:
+- `verbose_report_every_loops`
+- `partial_write_alert_threshold`

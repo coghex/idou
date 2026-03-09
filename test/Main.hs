@@ -4,14 +4,18 @@ module Main where
 
 import Control.Exception (SomeException, bracket, evaluate, try)
 import Control.Monad (forM, unless, when)
+import qualified Data.ByteString.Lazy as BL
+import Data.ByteString.Builder
 import Data.List (find, intercalate, isInfixOf)
 import qualified Data.Map.Strict as M
 import Data.Word (Word32)
 import Foreign.ForeignPtr (mallocForeignPtrArray)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.C (CFloat)
+import System.Directory (getTemporaryDirectory, removeFile)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
+import System.IO (openBinaryTempFile, hClose)
 
 import qualified Data.Vector.Mutable as MV
 import qualified Data.Vector.Unboxed as VU
@@ -51,6 +55,7 @@ import Midi.Play.Util
   , ticksToMicroseconds
   )
 import Engine.Core.Queue (newQueue)
+import Sound.Miniaudio.Decode (DecodedAudio(..), decodeAudioFileStereoF32)
 import Sound.Miniaudio.RingBuffer (rbCreateF32, rbDestroy, rbReadF32)
 
 data TestCase = TestCase
@@ -119,6 +124,7 @@ testCases =
   , TestCase "instrument-load-keeps-active-voice-until-live-apply" testInstrumentLoadKeepsActiveVoiceUntilLiveApply
   , TestCase "clip-one-shot-auto-releases-source" testClipOneShotAutoReleasesSource
   , TestCase "clip-music-bus-gain-zero-mutes-output" testClipMusicBusGainZeroMutesOutput
+  , TestCase "wav-decoder-loads-stereo-f32" testWavDecoderLoadsStereoF32
   ]
 
 testAudioConfigParsesYamlShape ∷ IO ()
@@ -599,6 +605,61 @@ testClipMusicBusGainZeroMutesOutput = do
       [l, r] <- peekArray 2 buf
       assertNear "left output should be muted by bus gain" 0 (realToFrac (l ∷ CFloat))
       assertNear "right output should be muted by bus gain" 0 (realToFrac (r ∷ CFloat))
+
+testWavDecoderLoadsStereoF32 ∷ IO ()
+testWavDecoderLoadsStereoF32 =
+  withTempWav [0, 32767, -32768, 16384] $ \path -> do
+    decoded <- decodeAudioFileStereoF32 path
+    assertEqual "decoded target channels" 2 (daChannels decoded)
+    assertEqual "decoded frame count" 4 (daFrames decoded)
+    let samples = daSamples decoded
+    assertEqual "decoded sample count" 8 (length samples)
+    assertNear "mono to stereo duplicates L/R 0" (samples !! 0) (samples !! 1)
+    assertNear "mono to stereo duplicates L/R 1" (samples !! 2) (samples !! 3)
+    assertNear "zero sample remains zero" 0 (samples !! 0)
+    assertBool "max positive sample is normalized near 1" (samples !! 2 > 0.99)
+    assertBool "negative sample is preserved" (samples !! 4 < -0.99)
+
+withTempWav ∷ [Int] → (FilePath → IO a) → IO a
+withTempWav monoSamples action = do
+  tmpDir <- getTemporaryDirectory
+  bracket (openBinaryTempFile tmpDir "idou-wav-loader-test.wav") cleanup $ \(path, h) -> do
+    BL.hPut h (mkWav16Mono 48000 monoSamples)
+    hClose h
+    action path
+  where
+    cleanup (path, h) = do
+      catchIgnore (hClose h)
+      catchIgnore (removeFile path)
+
+catchIgnore ∷ IO () → IO ()
+catchIgnore io = do
+  _ <- try io ∷ IO (Either SomeException ())
+  pure ()
+
+mkWav16Mono ∷ Word32 → [Int] → BL.ByteString
+mkWav16Mono sampleRate samples =
+  toLazyByteString $
+    string8 "RIFF"
+      <> word32LE riffChunkSize
+      <> string8 "WAVE"
+      <> string8 "fmt "
+      <> word32LE 16
+      <> word16LE 1
+      <> word16LE 1
+      <> word32LE sampleRate
+      <> word32LE byteRate
+      <> word16LE blockAlign
+      <> word16LE 16
+      <> string8 "data"
+      <> word32LE dataBytes
+      <> mconcat (map (int16LE . fromIntegral) samples)
+  where
+    sampleCount = length samples
+    dataBytes = fromIntegral (sampleCount * 2) ∷ Word32
+    riffChunkSize = 36 + dataBytes
+    blockAlign = 2
+    byteRate = sampleRate * fromIntegral blockAlign
 
 mkTestHandle ∷ IO AudioHandle
 mkTestHandle = do
