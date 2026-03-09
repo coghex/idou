@@ -65,6 +65,7 @@ import Player.Timeline
   , parseSongSpecText
   , popReadyBars
   , prepareTimelineRuntime
+  , setTimelineTargets
   , sgInstruments
   , sgLookaheadBars
   , sgMode
@@ -119,6 +120,9 @@ testCases =
   , TestCase "timeline-lookahead-pops-ready-bars" testTimelineLookaheadPopsReadyBars
   , TestCase "timeline-conductor-transitions-at-phrase-boundary" testTimelineConductorTransitionsAtPhraseBoundary
   , TestCase "timeline-pattern-variation-is-deterministic" testTimelinePatternVariationIsDeterministic
+  , TestCase "timeline-energy-target-steers-density" testTimelineEnergyTargetSteersDensity
+  , TestCase "timeline-energy-target-steers-conductor" testTimelineEnergyTargetSteersConductor
+  , TestCase "timeline-mood-target-steers-transposition" testTimelineMoodTargetSteersTransposition
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
@@ -437,6 +441,148 @@ testTimelinePatternVariationIsDeterministic = do
         (tbNotes runtime0 /= tbNotes base0 || any (\b -> tbNotes b /= tbNotes base0) barsA)
     _ ->
       error "expected non-empty baseline/runtime bars for variation test"
+
+testTimelineEnergyTargetSteersDensity ∷ IO ()
+testTimelineEnergyTargetSteersDensity = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 4"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 12"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  rhythm:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/0.25/0.9,0.5/62/0.25/0.9,1/64/0.25/0.9,1.5/65/0.25/0.9,2/67/0.25/0.9,2.5/69/0.25/0.9,3/71/0.25/0.9,3.5/72/0.25/0.9"
+          , "  drone:"
+          , "    instrument_id: 1"
+          , "    amp: 0.7"
+          , "    pan: -0.1"
+          , "    pattern_intro: 0/48/2/0.6,2/50/2/0.6"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtimeLow0 = setTimelineTargets Nothing 0.1 (prepareTimelineRuntime testSampleRate 0 spec)
+      runtimeHigh0 = setTimelineTargets Nothing 0.9 (prepareTimelineRuntime testSampleRate 0 spec)
+      (barsLow, _doneLow) = drainTimelineBarsForTest 0 0 [] runtimeLow0
+      (barsHigh, _doneHigh) = drainTimelineBarsForTest 0 0 [] runtimeHigh0
+      noteCount bars = sum (map (length . tbNotes) bars)
+  assertBool
+    "higher energy target should increase total scheduled note density"
+    (noteCount barsHigh > noteCount barsLow)
+
+testTimelineEnergyTargetSteersConductor ∷ IO ()
+testTimelineEnergyTargetSteersConductor = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: drone"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  verse:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  chorus:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "  bridge:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pulse:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8"
+          , "    pattern_verse: 0/62/1/0.8"
+          , "    pattern_chorus: 0/64/1/0.8"
+          , "    pattern_bridge: 0/65/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtimeLow0 = setTimelineTargets Nothing 0.1 (prepareTimelineRuntime testSampleRate 0 spec)
+      runtimeHigh0 = setTimelineTargets Nothing 0.9 (prepareTimelineRuntime testSampleRate 0 spec)
+      barsLow = takeTimelineBars 48 0 0 [] runtimeLow0
+      barsHigh = takeTimelineBars 48 0 0 [] runtimeHigh0
+  assertBool
+    "high energy target should bias conductor to higher-energy sections"
+    (avgEnergy barsHigh > avgEnergy barsLow + 0.03)
+  where
+    avgEnergy ∷ [TimelineBar] → Float
+    avgEnergy bars =
+      let xs = map (sectionEnergy . tbSectionName) (drop 1 bars)
+      in if null xs then 0 else sum xs / fromIntegral (length xs)
+
+    sectionEnergy name =
+      case name of
+        "intro" -> 0.2
+        "verse" -> 0.55
+        "chorus" -> 0.9
+        "bridge" -> 0.4
+        "ending" -> 0.1
+        _ -> 0.5
+
+    takeTimelineBars ∷ Int → Word64 → Int → [TimelineBar] → TimelineRuntime → [TimelineBar]
+    takeTimelineBars target now loops acc rt
+      | loops > 400 = acc
+      | length acc >= target = take target acc
+      | otherwise =
+          let (batch, rt') = popReadyBars now rt
+              acc' = acc <> batch
+          in takeTimelineBars target (now + 120000) (loops + 1) acc' rt'
+
+testTimelineMoodTargetSteersTransposition ∷ IO ()
+testTimelineMoodTargetSteersTransposition = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 4"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 8"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  lead:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8,1/62/1/0.8,2/64/1/0.8,3/65/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtimeCalm0 = setTimelineTargets (Just "ambient") 0.5 (prepareTimelineRuntime testSampleRate 0 spec)
+      runtimeCombat0 = setTimelineTargets (Just "combat") 0.5 (prepareTimelineRuntime testSampleRate 0 spec)
+      (barsCalm, _doneCalm) = drainTimelineBarsForTest 0 0 [] runtimeCalm0
+      (barsCombat, _doneCombat) = drainTimelineBarsForTest 0 0 [] runtimeCombat0
+      avgPitch bars =
+        let keys =
+              [ fromIntegral k ∷ Float
+              | b <- bars
+              , n <- tbNotes b
+              , let NoteKey k = tnKey n
+              ]
+        in if null keys then 0 else sum keys / fromIntegral (length keys)
+  assertBool
+    "combat mood target should bias transposition upward vs ambient"
+    (avgPitch barsCombat > avgPitch barsCalm + 0.5)
 
 drainTimelineBarsForTest ∷ Word64 → Int → [TimelineBar] → TimelineRuntime → ([TimelineBar], TimelineRuntime)
 drainTimelineBarsForTest now loops acc rt

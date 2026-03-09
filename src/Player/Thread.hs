@@ -15,6 +15,7 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally)
 import Control.Monad (foldM)
+import Data.Char (isSpace, toLower)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Word (Word32, Word64)
 
@@ -49,6 +50,7 @@ import Player.Timeline
   , loadSongSpec
   , popReadyBars
   , prepareTimelineRuntime
+  , setTimelineTargets
   , timelineRuntimeDone
   )
 
@@ -61,6 +63,13 @@ data PlayerMsg
       }
   | PlayerSetTempoBpm
       { pmTempoBpm ∷ !Float
+      }
+  | PlayerSetMoodTarget
+      { pmMoodTarget ∷ !String
+      }
+  | PlayerClearMoodTarget
+  | PlayerSetEnergyTarget
+      { pmEnergyTarget ∷ !Float
       }
   | PlayerLoadSongTimeline
       { pmSongPath ∷ !FilePath
@@ -112,6 +121,8 @@ data PlayerEvent
 data PlayerState = PlayerState
   { pstBeatsPerBar ∷ !Int
   , pstTempoBpm    ∷ !Float
+  , pstMoodTarget  ∷ !(Maybe String)
+  , pstEnergyTarget ∷ !Float
   , pstSongSpec    ∷ !(Maybe SongSpec)
   , pstTimeline    ∷ !(Maybe TimelineRuntime)
   , pstNextNoteInst ∷ !Word64
@@ -128,7 +139,7 @@ startPlayerThread audioSys = do
   msgQ <- Q.newQueue
   evQ <- Q.newQueue
   controlRef <- newIORef ThreadRunning
-  playerStateRef <- newIORef (PlayerState 4 120 Nothing Nothing 1)
+  playerStateRef <- newIORef (PlayerState 4 120 Nothing 0.5 Nothing Nothing 1)
   doneVar <- newEmptyMVar
   tid <- forkIO $
     runPlayerLoop audioSys msgQ evQ controlRef playerStateRef `finally` putMVar doneVar ()
@@ -199,6 +210,20 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           let bpm' = max 1 bpm
           modifyIORef' playerStateRef (\s -> s { pstTempoBpm = bpm' })
           sendAudio audioSys (AudioSetTransportBpm bpm')
+        PlayerSetMoodTarget moodRaw -> do
+          let mood' = normalizeMoodTarget moodRaw
+          modifyIORef'
+            playerStateRef
+            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = mood' }))
+        PlayerClearMoodTarget ->
+          modifyIORef'
+            playerStateRef
+            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = Nothing }))
+        PlayerSetEnergyTarget energy ->
+          let energy' = clamp01 energy
+          in modifyIORef'
+               playerStateRef
+               (\s -> applyLiveTimelineTargets (s { pstEnergyTarget = energy' }))
         PlayerLoadSongTimeline path -> do
           loaded <- loadSongSpec path
           case loaded of
@@ -238,10 +263,14 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
                       (pstBeatsPerBar ps)
                       (pstTempoBpm ps)
                   runtime =
-                    prepareTimelineRuntime
-                      (sampleRate (asHandle audioSys))
-                      frame
-                      spec
+                    setTimelineTargets
+                      (pstMoodTarget ps)
+                      (pstEnergyTarget ps)
+                      ( prepareTimelineRuntime
+                          (sampleRate (asHandle audioSys))
+                          frame
+                          spec
+                      )
                   estimatedBars = max 1 (length (compileTimelineBars (sampleRate (asHandle audioSys)) spec))
               modifyIORef' playerStateRef (\s -> s { pstTimeline = Just runtime })
               Q.writeQueue evQ (PlayerEventTimelineStarted frame estimatedBars)
@@ -317,6 +346,38 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           scheduleAudioActionAtFrame audioSys frame action
           Q.writeQueue evQ (PlayerEventScheduled frame action)
       processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef
+
+applyLiveTimelineTargets ∷ PlayerState → PlayerState
+applyLiveTimelineTargets ps =
+  case pstTimeline ps of
+    Nothing -> ps
+    Just timeline ->
+      ps
+        { pstTimeline =
+            Just
+              ( setTimelineTargets
+                  (pstMoodTarget ps)
+                  (pstEnergyTarget ps)
+                  timeline
+              )
+        }
+
+normalizeMoodTarget ∷ String → Maybe String
+normalizeMoodTarget raw =
+  let m = map toLower (trim raw)
+  in if null m then Nothing else Just m
+
+trim ∷ String → String
+trim = dropWhileEnd isSpace . dropWhile isSpace
+
+dropWhileEnd ∷ (Char → Bool) → String → String
+dropWhileEnd p = reverse . dropWhile p . reverse
+
+clamp01 ∷ Float → Float
+clamp01 x
+  | x < 0 = 0
+  | x > 1 = 1
+  | otherwise = x
 
 pumpTimeline
   ∷ AudioSystem
