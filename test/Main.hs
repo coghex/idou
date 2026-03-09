@@ -118,6 +118,7 @@ testCases =
   , TestCase "timeline-compiler-builds-cue-sections" testTimelineCompilerBuildsCueSections
   , TestCase "timeline-lookahead-pops-ready-bars" testTimelineLookaheadPopsReadyBars
   , TestCase "timeline-conductor-transitions-at-phrase-boundary" testTimelineConductorTransitionsAtPhraseBoundary
+  , TestCase "timeline-pattern-variation-is-deterministic" testTimelinePatternVariationIsDeterministic
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
@@ -392,6 +393,60 @@ testTimelineConductorTransitionsAtPhraseBoundary = do
         go name n (x : xs)
           | tbSectionName x == name = go name (n + 1) xs
           | otherwise = (name, n) : go (tbSectionName x) 1 xs
+
+testTimelinePatternVariationIsDeterministic ∷ IO ()
+testTimelinePatternVariationIsDeterministic = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 4"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 8"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  rhythm:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/0.5/0.9,1/62/0.5/0.9,2/64/0.5/0.9,3/65/0.5/0.9"
+          , "  drone:"
+          , "    instrument_id: 1"
+          , "    amp: 0.8"
+          , "    pan: -0.2"
+          , "    pattern_intro: 0/48/2/0.7,2/50/2/0.7"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let baselineBars = compileTimelineBars testSampleRate spec
+      runtimeA0 = prepareTimelineRuntime testSampleRate 0 spec
+      runtimeB0 = prepareTimelineRuntime testSampleRate 0 spec
+      runtimeC0 = prepareTimelineRuntime testSampleRate 1337 spec
+      (barsA, doneA) = drainTimelineBarsForTest 0 0 [] runtimeA0
+      (barsB, _doneB) = drainTimelineBarsForTest 0 0 [] runtimeB0
+      (barsC, _doneC) = drainTimelineBarsForTest 0 0 [] runtimeC0
+  assertBool "runtime should finish after intro section" (timelineRuntimeDone doneA)
+  assertEqual "deterministic seed should produce identical mutated bars" barsA barsB
+  assertBool "different seed should alter mutated bars" (barsA /= barsC)
+  case (baselineBars, barsA) of
+    (base0 : _, runtime0 : _) -> do
+      assertBool
+        "variation layer should mutate note stream vs baseline compiler"
+        (tbNotes runtime0 /= tbNotes base0 || any (\b -> tbNotes b /= tbNotes base0) barsA)
+    _ ->
+      error "expected non-empty baseline/runtime bars for variation test"
+
+drainTimelineBarsForTest ∷ Word64 → Int → [TimelineBar] → TimelineRuntime → ([TimelineBar], TimelineRuntime)
+drainTimelineBarsForTest now loops acc rt
+  | loops > 400 = error "timeline runtime did not finish within expected iterations"
+  | otherwise =
+      let (batch, rt') = popReadyBars now rt
+          acc' = acc <> batch
+      in if timelineRuntimeDone rt'
+           then (acc', rt')
+           else drainTimelineBarsForTest (now + 120000) (loops + 1) acc' rt'
 
 testEnvelopeReleaseReachesDone ∷ IO ()
 testEnvelopeReleaseReachesDone = do

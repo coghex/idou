@@ -19,6 +19,7 @@ module Player.Timeline
   ) where
 
 import Data.Char (isSpace, toLower)
+import Data.Bits (xor)
 import Data.List (nub, sortOn)
 import Data.Map.Strict (Map)
 import Data.Word (Word32, Word64)
@@ -266,6 +267,12 @@ appendGeneratedBar rt =
           phraseCount = max 1 (ssPhraseCount sectionSpec)
           sectionBarCount = barsPerPhrase * phraseCount
           barIx = trCurrentSectionBar rt
+          (variedNotes, nextBarSeed) =
+            varyBarNotes
+              (trMode rt)
+              (trGeneratedBarCount rt)
+              (trRngState rt)
+              (compileSectionNotes (trSampleRateHz rt) (trCurrentSectionName rt) sectionSpec (trInstruments rt))
           bar =
             TimelineBar
               { tbSectionName = trCurrentSectionName rt
@@ -277,7 +284,7 @@ appendGeneratedBar rt =
               , tbBeatUnit = ssBeatUnit sectionSpec
               , tbStartOffsetFrames = trNextBarOffset rt
               , tbLengthFrames = barFrames
-              , tbNotes = compileSectionNotes (trSampleRateHz rt) (trCurrentSectionName rt) sectionSpec (trInstruments rt)
+              , tbNotes = variedNotes
               }
           nextOffset = trNextBarOffset rt + barFrames
           nextBarInSection = barIx + 1
@@ -288,6 +295,7 @@ appendGeneratedBar rt =
               { trBars = trBars rt <> [bar]
               , trGeneratedBarCount = trGeneratedBarCount rt + 1
               , trNextBarOffset = nextOffset
+              , trRngState = nextBarSeed
               }
       in if not finishedSection
            then rtBase { trCurrentSectionBar = nextBarInSection }
@@ -371,6 +379,152 @@ weightedPick seed weighted =
 
 nextConductorSeed ∷ Word64 → Word64
 nextConductorSeed x = x * 6364136223846793005 + 1442695040888963407
+
+varyBarNotes
+  ∷ SongMode
+  → Int
+  → Word64
+  → [TimelineNote]
+  → ([TimelineNote], Word64)
+varyBarNotes mode absoluteBarIx seed0 notes0
+  | null notes0 = ([], nextConductorSeed seed0)
+  | otherwise =
+      let instrumentIds = nub (map tnInstrumentId notes0)
+          canDropInstrument = length instrumentIds > 1
+          mutateOne (groupsAcc, seedAcc) iid =
+            let source = filter (\n -> tnInstrumentId n == iid) notes0
+                (group', seedN') =
+                  mutateInstrumentFromNotes
+                    mode
+                    absoluteBarIx
+                    canDropInstrument
+                    (seedAcc `xor` fromIntegral (instrumentIdInt iid))
+                    source
+            in (group' : groupsAcc, seedN')
+          (groups, seedN) = foldl mutateOne ([], seed0) instrumentIds
+          merged = concat (reverse groups)
+          fallback =
+            case instrumentIds of
+              [] -> []
+              iid : _ ->
+                take 1 (filter (\n -> tnInstrumentId n == iid) notes0)
+          out =
+            if null merged
+              then fallback
+              else merged
+      in (sortOn (\n -> (tnOnOffsetFrames n, instrumentIdInt (tnInstrumentId n))) out, seedN)
+
+-- Internal helper that applies mutation to one instrument's notes.
+mutateInstrumentFromNotes
+  ∷ SongMode
+  → Int
+  → Bool
+  → Word64
+  → [TimelineNote]
+  → ([TimelineNote], Word64)
+mutateInstrumentFromNotes mode absoluteBarIx canDrop seed0 notes
+  | null notes = ([], nextConductorSeed seed0)
+  | otherwise =
+      let seed1 = nextConductorSeed (seed0 `xor` fromIntegral absoluteBarIx)
+          dropRoll = rand01 seed1
+          shouldDrop = canDrop && barDropEligible absoluteBarIx && dropRoll < dropoutThreshold mode
+      in if shouldDrop
+           then ([], nextConductorSeed seed1)
+           else
+             let seed2 = nextConductorSeed seed1
+                 transposeSemis = chooseTranspose mode absoluteBarIx seed2
+                 seed3 = nextConductorSeed seed2
+                 density = densityThreshold mode absoluteBarIx seed3
+                 (keptRev, seedN) =
+                   foldl
+                     (selectMutatedNote density transposeSemis)
+                     ([], seed3)
+                     notes
+                 kept = reverse keptRev
+                 out =
+                   if null kept
+                     then
+                       case notes of
+                         [] -> []
+                         firstNote : _ -> [applyTranspose transposeSemis firstNote]
+                     else kept
+             in (out, seedN)
+
+selectMutatedNote
+  ∷ Float
+  → Int
+  → ([TimelineNote], Word64)
+  → TimelineNote
+  → ([TimelineNote], Word64)
+selectMutatedNote density transposeSemis (acc, seed0) note =
+  let seed1 = nextConductorSeed seed0
+      keep = rand01 seed1 <= density
+  in if keep
+       then (applyTranspose transposeSemis note : acc, seed1)
+       else (acc, seed1)
+
+barDropEligible ∷ Int → Bool
+barDropEligible absoluteBarIx =
+  let slot = absoluteBarIx `mod` 8
+  in slot == 6 || slot == 7
+
+dropoutThreshold ∷ SongMode → Float
+dropoutThreshold mode =
+  case mode of
+    SongModeCue -> 0.28
+    SongModeDrone -> 0.16
+
+densityThreshold ∷ SongMode → Int → Word64 → Float
+densityThreshold mode absoluteBarIx seed =
+  let base =
+        case mode of
+          SongModeCue -> 0.86
+          SongModeDrone -> 0.94
+      cycleNudge =
+        case absoluteBarIx `mod` 8 of
+          3 -> -0.20
+          7 -> -0.28
+          _ -> 0
+      jitter = (rand01 seed - 0.5) * 0.08
+      raw = base + cycleNudge + jitter
+  in max 0.25 (min 0.99 raw)
+
+chooseTranspose ∷ SongMode → Int → Word64 → Int
+chooseTranspose mode absoluteBarIx seed =
+  let opts =
+        case mode of
+          SongModeCue -> [0, 0, 2, -2, 3, -3, 5, -5]
+          SongModeDrone -> [0, 0, 0, 1, -1, 2, -2]
+      ix = fromIntegral (seed `mod` fromIntegral (length opts))
+      seeded = opts !! ix
+      barBias =
+        case absoluteBarIx `mod` 8 of
+          1 -> 2
+          5 -> -2
+          _ -> 0
+      total0 = seeded + barBias
+      total =
+        case absoluteBarIx `mod` 8 of
+          1 -> if total0 == 0 then 2 else total0
+          5 -> if total0 == 0 then -2 else total0
+          _ -> total0
+  in max (-12) (min 12 total)
+
+applyTranspose ∷ Int → TimelineNote → TimelineNote
+applyTranspose semis note =
+  let NoteKey k = tnKey note
+      k' = max 0 (min 127 (k + semis))
+  in note { tnKey = NoteKey k' }
+
+rand01 ∷ Word64 → Float
+rand01 seed =
+  let bucket = fromIntegral (seed `mod` 10000) ∷ Float
+  in bucket / 10000
+
+instrumentIdInt ∷ InstrumentId → Int
+instrumentIdInt iid =
+  case iid of
+    InstrumentId n -> n
 
 initialSectionName ∷ SongSpec → String
 initialSectionName spec =
