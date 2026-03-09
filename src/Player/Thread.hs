@@ -242,15 +242,9 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
                       (sampleRate (asHandle audioSys))
                       frame
                       spec
-                  barCount = length (trBars runtime)
-              if barCount <= 0
-                then
-                  Q.writeQueue
-                    evQ
-                    (PlayerEventTimelineLoadFailed "<runtime>" "loaded song has no timeline bars")
-                else do
-                  modifyIORef' playerStateRef (\s -> s { pstTimeline = Just runtime })
-                  Q.writeQueue evQ (PlayerEventTimelineStarted frame barCount)
+                  estimatedBars = max 1 (length (compileTimelineBars (sampleRate (asHandle audioSys)) spec))
+              modifyIORef' playerStateRef (\s -> s { pstTimeline = Just runtime })
+              Q.writeQueue evQ (PlayerEventTimelineStarted frame estimatedBars)
         PlayerStopSongTimeline -> do
           modifyIORef' playerStateRef (\s -> s { pstTimeline = Nothing })
           Q.writeQueue evQ PlayerEventTimelineStopped

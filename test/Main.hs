@@ -8,7 +8,7 @@ import qualified Data.ByteString.Lazy as BL
 import Data.ByteString.Builder
 import Data.List (find, intercalate, isInfixOf)
 import qualified Data.Map.Strict as M
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Foreign.ForeignPtr (mallocForeignPtrArray)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.C (CFloat)
@@ -60,6 +60,7 @@ import Player.Timeline
   ( SongMode(..)
   , TimelineBar(..)
   , TimelineNote(..)
+  , TimelineRuntime
   , compileTimelineBars
   , parseSongSpecText
   , popReadyBars
@@ -116,6 +117,7 @@ testCases =
   , TestCase "timeline-song-spec-parses-yaml" testTimelineSongSpecParsesYaml
   , TestCase "timeline-compiler-builds-cue-sections" testTimelineCompilerBuildsCueSections
   , TestCase "timeline-lookahead-pops-ready-bars" testTimelineLookaheadPopsReadyBars
+  , TestCase "timeline-conductor-transitions-at-phrase-boundary" testTimelineConductorTransitionsAtPhraseBoundary
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
   , TestCase "mono-adsr-override-on-new-voice" testMonoAdsrOverrideOnNewVoice
   , TestCase "mono-legato-reuses-voice-and-updates-override" testMonoLegatoReusesVoiceAndUpdatesOverride
@@ -319,6 +321,77 @@ testTimelineLookaheadPopsReadyBars = do
   assertEqual "first lookahead batch should include two bars" 2 (length batch1)
   assertEqual "second lookahead batch should include remaining two bars" 2 (length batch2)
   assertBool "runtime should be done after scheduling all bars" (timelineRuntimeDone runtime2)
+
+testTimelineConductorTransitionsAtPhraseBoundary ∷ IO ()
+testTimelineConductorTransitionsAtPhraseBoundary = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 3"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "  verse:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "  chorus:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pad:"
+          , "    instrument_id: 0"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    pattern_intro: 0/60/1/0.8"
+          , "    pattern_verse: 0/62/1/0.8"
+          , "    pattern_chorus: 0/64/1/0.8"
+          , "    pattern_ending: 0/65/1/0.8"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (bars, runtimeFinal) = drainTimelineBars 0 0 [] runtime0
+      sectionRuns = runLengthsBySection bars
+  assertBool "conductor should emit at least one bar" (not (null bars))
+  case bars of
+    [] -> error "expected bars from conductor"
+    firstBar : _ -> assertEqual "first section should be intro" "intro" (tbSectionName firstBar)
+  assertEqual "last section should resolve to ending in cue mode" "ending" (tbSectionName (last bars))
+  assertBool
+    "phrase-boundary transitions should preserve even-length section runs"
+    (all (even . snd) sectionRuns)
+  assertBool "conductor runtime should finish in cue mode" (timelineRuntimeDone runtimeFinal)
+  where
+    drainTimelineBars ∷ Word64 → Int → [TimelineBar] → TimelineRuntime → ([TimelineBar], TimelineRuntime)
+    drainTimelineBars now loops acc rt
+      | loops > 200 = error "timeline conductor did not finish within expected iterations"
+      | otherwise =
+          let (batch, rt') = popReadyBars now rt
+              acc' = acc <> batch
+          in if timelineRuntimeDone rt'
+               then (acc', rt')
+               else drainTimelineBars (now + 100000) (loops + 1) acc' rt'
+
+    runLengthsBySection ∷ [TimelineBar] → [(String, Int)]
+    runLengthsBySection [] = []
+    runLengthsBySection (b : bs) = go (tbSectionName b) 1 bs
+      where
+        go name n [] = [(name, n)]
+        go name n (x : xs)
+          | tbSectionName x == name = go name (n + 1) xs
+          | otherwise = (name, n) : go (tbSectionName x) 1 xs
 
 testEnvelopeReleaseReachesDone ∷ IO ()
 testEnvelopeReleaseReachesDone = do

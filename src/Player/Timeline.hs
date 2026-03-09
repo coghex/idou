@@ -95,10 +95,21 @@ data TimelineBar = TimelineBar
   deriving (Eq, Show)
 
 data TimelineRuntime = TimelineRuntime
-  { trBars          ∷ ![TimelineBar]
-  , trStartFrame    ∷ !Word64
-  , trLookaheadBars ∷ !Int
-  , trNextBarIx     ∷ !Int
+  { trBars               ∷ ![TimelineBar]
+  , trStartFrame         ∷ !Word64
+  , trLookaheadBars      ∷ !Int
+  , trNextBarIx          ∷ !Int
+  , trSampleRateHz       ∷ !Word32
+  , trMode               ∷ !SongMode
+  , trSections           ∷ !(Map String SectionSpec)
+  , trInstruments        ∷ ![InstrumentPatternSpec]
+  , trCurrentSectionName ∷ !String
+  , trCurrentSectionBar  ∷ !Int
+  , trGeneratedBarCount  ∷ !Int
+  , trNextBarOffset      ∷ !Word64
+  , trRngState           ∷ !Word64
+  , trTransitionCount    ∷ !Int
+  , trDone               ∷ !Bool
   }
   deriving (Eq, Show)
 
@@ -184,15 +195,28 @@ compileTimelineBars sampleRateHz spec = reverse barsRev
 
 prepareTimelineRuntime ∷ Word32 → Word64 → SongSpec → TimelineRuntime
 prepareTimelineRuntime sampleRateHz startFrame spec =
-  TimelineRuntime
-    { trBars = compileTimelineBars sampleRateHz spec
-    , trStartFrame = startFrame
-    , trLookaheadBars = max 1 (sgLookaheadBars spec)
-    , trNextBarIx = 0
-    }
+  let firstSection = initialSectionName spec
+      seed0 = startFrame * 0x9E3779B97F4A7C15 + fromIntegral (length (sgSections spec))
+  in TimelineRuntime
+      { trBars = []
+      , trStartFrame = startFrame
+      , trLookaheadBars = max 1 (sgLookaheadBars spec)
+      , trNextBarIx = 0
+      , trSampleRateHz = sampleRateHz
+      , trMode = sgMode spec
+      , trSections = sgSections spec
+      , trInstruments = sgInstruments spec
+      , trCurrentSectionName = firstSection
+      , trCurrentSectionBar = 0
+      , trGeneratedBarCount = 0
+      , trNextBarOffset = 0
+      , trRngState = seed0
+      , trTransitionCount = 0
+      , trDone = M.null (sgSections spec)
+      }
 
 popReadyBars ∷ Word64 → TimelineRuntime → ([TimelineBar], TimelineRuntime)
-popReadyBars now runtime = go [] runtime
+popReadyBars now runtime = go [] (ensureGeneratedToHorizon now runtime)
   where
     go acc rt =
       case nextBar rt of
@@ -210,7 +234,152 @@ popReadyBars now runtime = go [] runtime
                  (reverse acc, rt)
 
 timelineRuntimeDone ∷ TimelineRuntime → Bool
-timelineRuntimeDone rt = trNextBarIx rt >= length (trBars rt)
+timelineRuntimeDone rt = trDone rt && trNextBarIx rt >= length (trBars rt)
+
+ensureGeneratedToHorizon ∷ Word64 → TimelineRuntime → TimelineRuntime
+ensureGeneratedToHorizon now runtime = go runtime
+  where
+    go rt
+      | trDone rt = rt
+      | trStartFrame rt + trNextBarOffset rt > generationHorizon now rt = rt
+      | otherwise = go (appendGeneratedBar rt)
+
+generationHorizon ∷ Word64 → TimelineRuntime → Word64
+generationHorizon now rt =
+  let barFrames = currentSectionBarFrames rt
+  in now + fromIntegral (trLookaheadBars rt) * barFrames
+
+currentSectionBarFrames ∷ TimelineRuntime → Word64
+currentSectionBarFrames rt =
+  case M.lookup (trCurrentSectionName rt) (trSections rt) of
+    Nothing -> 1
+    Just sectionSpec -> sectionBarFrames (trSampleRateHz rt) sectionSpec
+
+appendGeneratedBar ∷ TimelineRuntime → TimelineRuntime
+appendGeneratedBar rt =
+  case M.lookup (trCurrentSectionName rt) (trSections rt) of
+    Nothing ->
+      rt { trDone = True }
+    Just sectionSpec ->
+      let barFrames = sectionBarFrames (trSampleRateHz rt) sectionSpec
+          barsPerPhrase = max 1 (ssBarsPerPhrase sectionSpec)
+          phraseCount = max 1 (ssPhraseCount sectionSpec)
+          sectionBarCount = barsPerPhrase * phraseCount
+          barIx = trCurrentSectionBar rt
+          bar =
+            TimelineBar
+              { tbSectionName = trCurrentSectionName rt
+              , tbAbsoluteBarIx = trGeneratedBarCount rt
+              , tbPhraseIx = barIx `div` barsPerPhrase
+              , tbBarInPhrase = barIx `mod` barsPerPhrase
+              , tbTempoBpm = ssTempoBpm sectionSpec
+              , tbBeatsPerBar = ssBeatsPerBar sectionSpec
+              , tbBeatUnit = ssBeatUnit sectionSpec
+              , tbStartOffsetFrames = trNextBarOffset rt
+              , tbLengthFrames = barFrames
+              , tbNotes = compileSectionNotes (trSampleRateHz rt) (trCurrentSectionName rt) sectionSpec (trInstruments rt)
+              }
+          nextOffset = trNextBarOffset rt + barFrames
+          nextBarInSection = barIx + 1
+          phraseBoundary = nextBarInSection `mod` barsPerPhrase == 0
+          finishedSection = phraseBoundary && nextBarInSection >= sectionBarCount
+          rtBase =
+            rt
+              { trBars = trBars rt <> [bar]
+              , trGeneratedBarCount = trGeneratedBarCount rt + 1
+              , trNextBarOffset = nextOffset
+              }
+      in if not finishedSection
+           then rtBase { trCurrentSectionBar = nextBarInSection }
+           else advanceSection rtBase
+
+advanceSection ∷ TimelineRuntime → TimelineRuntime
+advanceSection rt
+  | trMode rt == SongModeCue && trCurrentSectionName rt == "ending" =
+      rt { trDone = True, trCurrentSectionBar = 0 }
+  | otherwise =
+      case pickNextSection rt of
+        Nothing ->
+          case trMode rt of
+            SongModeCue -> rt { trDone = True, trCurrentSectionBar = 0 }
+            SongModeDrone -> rt { trCurrentSectionBar = 0 }
+        Just (nextSection, nextSeed) ->
+          rt
+            { trCurrentSectionName = nextSection
+            , trCurrentSectionBar = 0
+            , trRngState = nextSeed
+            , trTransitionCount = trTransitionCount rt + 1
+            }
+
+pickNextSection ∷ TimelineRuntime → Maybe (String, Word64)
+pickNextSection rt =
+  let available = M.keys (trSections rt)
+      hasEnding = "ending" `elem` available
+      forceEnding =
+        trMode rt == SongModeCue
+          && hasEnding
+          && trTransitionCount rt >= 6
+          && trCurrentSectionName rt /= "ending"
+      cands =
+        if forceEnding
+          then [("ending", 1)]
+          else transitionCandidates (trMode rt) (trCurrentSectionName rt) available
+  in weightedPick (trRngState rt) cands
+
+transitionCandidates ∷ SongMode → String → [String] → [(String, Int)]
+transitionCandidates mode current available =
+  let scripted =
+        case mode of
+          SongModeCue ->
+            case current of
+              "intro" -> [("verse", 10), ("chorus", 2), ("bridge", 1), ("ending", 1)]
+              "verse" -> [("chorus", 8), ("verse", 3), ("bridge", 3), ("ending", 2)]
+              "chorus" -> [("verse", 5), ("bridge", 3), ("chorus", 2), ("ending", 4)]
+              "bridge" -> [("chorus", 7), ("verse", 3), ("ending", 3)]
+              "ending" -> []
+              _ -> [("verse", 5), ("chorus", 5), ("bridge", 2), ("ending", 2)]
+          SongModeDrone ->
+            case current of
+              "intro" -> [("verse", 6), ("bridge", 4), ("chorus", 2)]
+              "verse" -> [("verse", 7), ("bridge", 4), ("chorus", 3), ("ending", 1)]
+              "chorus" -> [("chorus", 5), ("verse", 5), ("bridge", 3), ("ending", 1)]
+              "bridge" -> [("bridge", 5), ("verse", 4), ("chorus", 4), ("ending", 1)]
+              "ending" -> [("verse", 4), ("bridge", 4), ("chorus", 3)]
+              _ -> [("verse", 5), ("chorus", 4), ("bridge", 4), ("ending", 1)]
+      filtered = filter (\(name, w) -> w > 0 && name `elem` available) scripted
+      fallback = filter (/= current) available
+  in if null filtered
+       then map (\name -> (name, 1)) fallback
+       else filtered
+
+weightedPick ∷ Word64 → [(String, Int)] → Maybe (String, Word64)
+weightedPick _ [] = Nothing
+weightedPick seed weighted =
+  let positive = filter ((> 0) . snd) weighted
+      total = sum (map snd positive)
+      nextSeed = nextConductorSeed seed
+  in if total <= 0
+       then Nothing
+       else
+         let ticket = fromIntegral (nextSeed `mod` fromIntegral total) ∷ Int
+         in Just (pick ticket positive, nextSeed)
+  where
+    pick _ [] = ""
+    pick n ((name, w) : xs)
+      | n < w = name
+      | otherwise = pick (n - w) xs
+
+nextConductorSeed ∷ Word64 → Word64
+nextConductorSeed x = x * 6364136223846793005 + 1442695040888963407
+
+initialSectionName ∷ SongSpec → String
+initialSectionName spec =
+  let names = M.keys (sgSections spec)
+  in if "intro" `elem` names
+       then "intro"
+       else case names of
+         [] -> ""
+         x : _ -> x
 
 compileSectionNotes
   ∷ Word32

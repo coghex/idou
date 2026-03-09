@@ -34,6 +34,8 @@ The timeline parser supports:
   - `patterns.<section>: ...`
   - `pattern_<section>: ...`
 
+At runtime, `Player.Thread` now runs a conductor that advances sections at phrase boundaries using Haskell-defined weighted transitions (not YAML-defined transition graphs).
+
 Pattern note syntax is a comma-separated list of `beat/key/duration/velocity`, for example:
 
 ```yaml
