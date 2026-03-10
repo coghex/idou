@@ -45,9 +45,9 @@ import qualified Engine.Core.Queue as Q
 import Engine.Core.Thread (ThreadControl(..), ThreadState(..))
 import Player.Automation
   ( AutomationCurve(..)
-  , EnergyLane
+  , EnergyLane(..)
   , EnergyLaneEvent(..)
-  , MoodLane
+  , MoodLane(..)
   , MoodLaneEvent(..)
   , barFramesForTransport
   , scheduleEnergyLaneNextBar
@@ -67,7 +67,10 @@ import Player.Timeline
   , popReadyBars
   , prepareTimelineRuntime
   , setTimelineTargets
+  , timelineBoundarySpanFromNextBar
+  , timelineNextBarBoundaryFrame
   , timelineRuntimeDone
+  , timelineRuntimeEndFrame
   )
 
 data PlayerMsg
@@ -280,31 +283,14 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerAutomateEnergyNextBar target bars curve -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let lane =
-                scheduleEnergyLaneNextBar
-                  now
-                  (sampleRate (asHandle audioSys))
-                  (pstBeatsPerBar ps)
-                  (pstTempoBpm ps)
-                  (pstEnergyTarget ps)
-                  target
-                  bars
-                  curve
-          modifyIORef' playerStateRef (\s -> s { pstEnergyLane = Just lane })
+          let (lane, ps') = mkEnergyLane audioSys now target bars curve ps
+          writeIORef playerStateRef ps' { pstEnergyLane = Just lane }
         PlayerAutomateMoodNextBar moodRaw bars -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
           let target = normalizeMoodTarget moodRaw
-              lane =
-                scheduleMoodLaneNextBar
-                  now
-                  (sampleRate (asHandle audioSys))
-                  (pstBeatsPerBar ps)
-                  (pstTempoBpm ps)
-                  (pstMoodTarget ps)
-                  target
-                  bars
-          modifyIORef' playerStateRef (\s -> s { pstMoodLane = Just lane })
+              (lane, ps') = mkMoodLane audioSys now target bars ps
+          writeIORef playerStateRef ps' { pstMoodLane = Just lane }
         PlayerCancelEnergyAutomation -> do
           ps <- readIORef playerStateRef
           modifyIORef' playerStateRef (\s -> s { pstEnergyLane = Nothing })
@@ -369,16 +355,14 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
               Q.writeQueue evQ (PlayerEventTimelineStarted frame estimatedBars)
         PlayerStopSongTimeline -> do
           modifyIORef' playerStateRef (\s -> s { pstTimeline = Nothing })
+          sendAudio audioSys AudioStopAll
           Q.writeQueue evQ PlayerEventTimelineStopped
         PlayerScheduleClipNextBar cid bus gain pan loop -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let frame =
-                nextBarFrame
-                  now
-                  (sampleRate (asHandle audioSys))
-                  (pstBeatsPerBar ps)
-                  (pstTempoBpm ps)
+          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          writeIORef playerStateRef ps'
+          let
               action =
                 ScheduledPlayClip
                   { saClipId = cid
@@ -392,24 +376,18 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerScheduleBusGainNextBar bus gain -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let frame =
-                nextBarFrame
-                  now
-                  (sampleRate (asHandle audioSys))
-                  (pstBeatsPerBar ps)
-                  (pstTempoBpm ps)
+          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          writeIORef playerStateRef ps'
+          let
               action = ScheduledSetBusGain bus gain
           scheduleAudioActionAtFrame audioSys frame action
           Q.writeQueue evQ (PlayerEventScheduled frame action)
         PlayerScheduleNoteOnNextBar iid amp pan key noteInst vel adsrOverride -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let frame =
-                nextBarFrame
-                  now
-                  (sampleRate (asHandle audioSys))
-                  (pstBeatsPerBar ps)
-                  (pstTempoBpm ps)
+          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          writeIORef playerStateRef ps'
+          let
               action =
                 ScheduledNoteOn
                   { saInstrumentId = iid
@@ -425,12 +403,9 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerScheduleNoteOffNextBar iid noteInst -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let frame =
-                nextBarFrame
-                  now
-                  (sampleRate (asHandle audioSys))
-                  (pstBeatsPerBar ps)
-                  (pstTempoBpm ps)
+          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          writeIORef playerStateRef ps'
+          let
               action =
                 ScheduledNoteOff
                   { saInstrumentId = iid
@@ -490,9 +465,14 @@ pumpTimeline audioSys evQ playerStateRef = do
       mapM_ (Q.writeQueue evQ . PlayerEventTimelineTransition) transitionTelemetry
       ps' <- foldM (scheduleTimelineBar audioSys evQ runtime'') ps readyBars
       if timelineRuntimeDone runtime''
-        then do
-          writeIORef playerStateRef ps' { pstTimeline = Nothing }
-          Q.writeQueue evQ PlayerEventTimelineFinished
+        then
+          case timelineRuntimeEndFrame runtime'' of
+            Just endFrame
+              | now < endFrame ->
+                  writeIORef playerStateRef ps' { pstTimeline = Just runtime'' }
+            _ -> do
+              writeIORef playerStateRef ps' { pstTimeline = Nothing }
+              Q.writeQueue evQ PlayerEventTimelineFinished
         else
           writeIORef playerStateRef ps' { pstTimeline = Just runtime'' }
 
@@ -551,6 +531,95 @@ applyMoodAutomation now ps =
           PlayerEventMoodAutomationStarted startF endF fromM toM
         MoodLaneCompleted endF finalM ->
           PlayerEventMoodAutomationCompleted endF finalM
+
+resolveNextBarBoundary ∷ AudioSystem → Word64 → PlayerState → (Word64, PlayerState)
+resolveNextBarBoundary audioSys now ps =
+  let fallback =
+        nextBarFrame
+          now
+          (sampleRate (asHandle audioSys))
+          (pstBeatsPerBar ps)
+          (pstTempoBpm ps)
+  in
+    case pstTimeline ps of
+      Nothing -> (fallback, ps)
+      Just runtime ->
+        let (mFrame, runtime') = timelineNextBarBoundaryFrame now runtime
+            frame = maybe fallback id mFrame
+        in (frame, ps { pstTimeline = Just runtime' })
+
+mkEnergyLane
+  ∷ AudioSystem
+  → Word64
+  → Float
+  → Int
+  → AutomationCurve
+  → PlayerState
+  → (EnergyLane, PlayerState)
+mkEnergyLane audioSys now target bars curve ps =
+  let fallback =
+        scheduleEnergyLaneNextBar
+          now
+          (sampleRate (asHandle audioSys))
+          (pstBeatsPerBar ps)
+          (pstTempoBpm ps)
+          (pstEnergyTarget ps)
+          target
+          bars
+          curve
+  in
+    case pstTimeline ps of
+      Nothing -> (fallback, ps)
+      Just runtime ->
+        let (mSpan, runtime') = timelineBoundarySpanFromNextBar now bars runtime
+            lane =
+              case mSpan of
+                Just (startFrame, endFrame) ->
+                  EnergyLane
+                    { elStartFrame = startFrame
+                    , elEndFrame = max startFrame endFrame
+                    , elFromEnergy = clamp01 (pstEnergyTarget ps)
+                    , elToEnergy = clamp01 target
+                    , elCurve = curve
+                    , elStarted = False
+                    }
+                Nothing -> fallback
+        in (lane, ps { pstTimeline = Just runtime' })
+
+mkMoodLane
+  ∷ AudioSystem
+  → Word64
+  → Maybe String
+  → Int
+  → PlayerState
+  → (MoodLane, PlayerState)
+mkMoodLane audioSys now target bars ps =
+  let fallback =
+        scheduleMoodLaneNextBar
+          now
+          (sampleRate (asHandle audioSys))
+          (pstBeatsPerBar ps)
+          (pstTempoBpm ps)
+          (pstMoodTarget ps)
+          target
+          bars
+  in
+    case pstTimeline ps of
+      Nothing -> (fallback, ps)
+      Just runtime ->
+        let (mSpan, runtime') = timelineBoundarySpanFromNextBar now bars runtime
+            lane =
+              case mSpan of
+                Just (startFrame, endFrame) ->
+                  MoodLane
+                    { mlStartFrame = startFrame
+                    , mlEndFrame = max startFrame endFrame
+                    , mlFromMood = pstMoodTarget ps
+                    , mlToMood = target
+                    , mlStarted = False
+                    }
+                Nothing -> fallback
+        in (lane, ps { pstTimeline = Just runtime' })
 
 scheduleTimelineBar
   ∷ AudioSystem

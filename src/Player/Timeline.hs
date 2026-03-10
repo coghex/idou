@@ -18,7 +18,10 @@ module Player.Timeline
   , setTimelineTargets
   , popReadyBars
   , popTransitionTelemetry
+  , timelineNextBarBoundaryFrame
+  , timelineBoundarySpanFromNextBar
   , timelineRuntimeDone
+  , timelineRuntimeEndFrame
   ) where
 
 import Data.Char (isSpace, toLower)
@@ -50,6 +53,7 @@ data InstrumentPatternSpec = InstrumentPatternSpec
   , ipInstrumentId ∷ !InstrumentId
   , ipAmp         ∷ !Float
   , ipPan         ∷ !Float
+  , ipVelocityVariation ∷ !Float
   , ipPatterns    ∷ !(Map String [PatternNote])
   , ipFills       ∷ !(Map String [PatternNote])
   }
@@ -205,6 +209,7 @@ compileTimelineBars sampleRateHz spec = reverse barsRev
                         sampleRateHz
                         sectionName
                         sectionSpec
+                        absIx'
                         (i `mod` barsPerPhrase)
                         barsPerPhrase
                         (sgInstruments spec)
@@ -277,9 +282,66 @@ popReadyBars now runtime = go [] (ensureGeneratedToHorizon now runtime)
 timelineRuntimeDone ∷ TimelineRuntime → Bool
 timelineRuntimeDone rt = trDone rt && trNextBarIx rt >= length (trBars rt)
 
+timelineRuntimeEndFrame ∷ TimelineRuntime → Maybe Word64
+timelineRuntimeEndFrame rt =
+  case reverse (trBars rt) of
+    [] -> Nothing
+    bar : _ ->
+      Just (trStartFrame rt + tbStartOffsetFrames bar + tbLengthFrames bar)
+
+timelineNextBarBoundaryFrame ∷ Word64 → TimelineRuntime → (Maybe Word64, TimelineRuntime)
+timelineNextBarBoundaryFrame now rt0 =
+  let rt = ensureFutureBarStarts now 1 rt0
+  in (firstFutureBoundary now rt, rt)
+
+timelineBoundarySpanFromNextBar ∷ Word64 → Int → TimelineRuntime → (Maybe (Word64, Word64), TimelineRuntime)
+timelineBoundarySpanFromNextBar now barsFromNext rt0 =
+  let bars' = max 0 barsFromNext
+      rt = ensureFutureBarStarts now (bars' + 1) rt0
+      futureStarts = futureBarStartFrames now rt
+      mStart = firstFutureBoundary now rt
+      mEnd =
+        if bars' == 0
+          then mStart
+          else
+            case drop bars' futureStarts of
+              endFrame : _ -> Just endFrame
+              [] ->
+                case timelineRuntimeEndFrame rt of
+                  Just endFrame
+                    | endFrame > now -> Just endFrame
+                  _ -> mStart
+  in (case (mStart, mEnd) of
+        (Just startFrame, Just endFrame) -> Just (startFrame, max startFrame endFrame)
+        _ -> Nothing, rt)
+
 popTransitionTelemetry ∷ TimelineRuntime → ([TimelineTransitionTelemetry], TimelineRuntime)
 popTransitionTelemetry rt =
   (reverse (trPendingTransitions rt), rt { trPendingTransitions = [] })
+
+firstFutureBoundary ∷ Word64 → TimelineRuntime → Maybe Word64
+firstFutureBoundary now rt =
+  case futureBarStartFrames now rt of
+    frame : _ -> Just frame
+    [] ->
+      case timelineRuntimeEndFrame rt of
+        Just endFrame
+          | endFrame > now -> Just endFrame
+        _ -> Nothing
+
+futureBarStartFrames ∷ Word64 → TimelineRuntime → [Word64]
+futureBarStartFrames now rt =
+  [ frame
+  | bar <- trBars rt
+  , let frame = trStartFrame rt + tbStartOffsetFrames bar
+  , frame > now
+  ]
+
+ensureFutureBarStarts ∷ Word64 → Int → TimelineRuntime → TimelineRuntime
+ensureFutureBarStarts now needed rt
+  | needed <= length (futureBarStartFrames now rt) = rt
+  | trDone rt = rt
+  | otherwise = ensureFutureBarStarts now needed (appendGeneratedBar rt)
 
 ensureGeneratedToHorizon ∷ Word64 → TimelineRuntime → TimelineRuntime
 ensureGeneratedToHorizon now runtime = go runtime
@@ -321,14 +383,15 @@ appendGeneratedBar rt =
                barsPerPhrase
                (trGeneratedBarCount rt)
                (trRngState rt)
-               ( compileSectionNotes
-                   (trSampleRateHz rt)
-                   (trCurrentSectionName rt)
-                   sectionSpec
-                   (barIx `mod` barsPerPhrase)
-                   barsPerPhrase
-                   (trInstruments rt)
-               )
+                ( compileSectionNotes
+                    (trSampleRateHz rt)
+                    (trCurrentSectionName rt)
+                    sectionSpec
+                    (trGeneratedBarCount rt)
+                    (barIx `mod` barsPerPhrase)
+                    barsPerPhrase
+                    (trInstruments rt)
+                )
           bar =
             TimelineBar
               { tbSectionName = trCurrentSectionName rt
@@ -977,9 +1040,10 @@ compileSectionNotes
   → SectionSpec
   → Int
   → Int
+  → Int
   → [InstrumentPatternSpec]
   → [TimelineNote]
-compileSectionNotes sampleRateHz sectionName sectionSpec barInPhrase barsPerPhrase insts =
+compileSectionNotes sampleRateHz sectionName sectionSpec absoluteBarIx barInPhrase barsPerPhrase insts =
   let melodic = concatMap perInstrument insts
       hasDrums =
         any
@@ -988,7 +1052,7 @@ compileSectionNotes sampleRateHz sectionName sectionSpec barInPhrase barsPerPhra
       fallbackDrums =
         if hasDrums
           then []
-          else compileFallbackDrumNotes sectionName sectionSpec barInPhrase barsPerPhrase framesPerBeat
+          else compileFallbackDrumNotes sectionName sectionSpec absoluteBarIx barInPhrase barsPerPhrase framesPerBeat
   in melodic <> fallbackDrums
   where
     framesPerBeat =
@@ -1006,16 +1070,17 @@ compileSectionNotes sampleRateHz sectionName sectionSpec barInPhrase barsPerPhra
             if useFill
               then fillNotes
               else beatNotes
-      in map (compilePatternNote framesPerBeat inst) notes
+      in map (compilePatternNote framesPerBeat absoluteBarIx (ssBeatsPerBar sectionSpec) inst) notes
 
-compileFallbackDrumNotes ∷ String → SectionSpec → Int → Int → Double → [TimelineNote]
-compileFallbackDrumNotes sectionName sectionSpec barInPhrase barsPerPhrase framesPerBeat =
+compileFallbackDrumNotes ∷ String → SectionSpec → Int → Int → Int → Double → [TimelineNote]
+compileFallbackDrumNotes sectionName sectionSpec absoluteBarIx barInPhrase barsPerPhrase framesPerBeat =
   let inst =
         InstrumentPatternSpec
           { ipName = "auto-drums"
           , ipInstrumentId = InstrumentId 9
           , ipAmp = 1
           , ipPan = 0
+          , ipVelocityVariation = 0
           , ipPatterns = M.empty
           , ipFills = M.empty
           }
@@ -1057,7 +1122,7 @@ compileFallbackDrumNotes sectionName sectionSpec barInPhrase barsPerPhrase frame
           <> if phraseBoundary
                then map (\b -> mk b 47 0.2 0.72) (filter (< fromIntegral beats) [fromIntegral beats - 1, fromIntegral beats - 0.5])
                else []
-  in map (compilePatternNote framesPerBeat inst) patternNotes
+  in map (compilePatternNote framesPerBeat absoluteBarIx beats inst) patternNotes
 
 isPhraseBoundaryBar ∷ Int → Int → Bool
 isPhraseBoundaryBar barInPhrase barsPerPhrase =
@@ -1079,21 +1144,63 @@ isChorusSection spec = isChorusSectionName (ssName spec)
 isBridgeSection ∷ SectionSpec → Bool
 isBridgeSection spec = isBridgeSectionName (ssName spec)
 
-compilePatternNote ∷ Double → InstrumentPatternSpec → PatternNote → TimelineNote
-compilePatternNote framesPerBeat inst note =
+compilePatternNote ∷ Double → Int → Int → InstrumentPatternSpec → PatternNote → TimelineNote
+compilePatternNote framesPerBeat absoluteBarIx beatsPerBar inst note =
   let onFrames = floor (realToFrac (pnBeatOffset note) * framesPerBeat) ∷ Integer
       durFrames = max 1 (floor (realToFrac (pnDuration note) * framesPerBeat) ∷ Integer)
       onOffset = fromIntegral (max 0 onFrames)
       offOffset = fromIntegral (max 1 (onFrames + durFrames))
+      velocity = humanizedVelocity absoluteBarIx beatsPerBar inst note
   in TimelineNote
       { tnInstrumentId = ipInstrumentId inst
       , tnAmp = max 0 (ipAmp inst)
       , tnPan = max (-1) (min 1 (ipPan inst))
       , tnKey = pnNoteKey note
-      , tnVelocity = max 0 (min 1 (pnVelocity note))
+      , tnVelocity = velocity
       , tnOnOffsetFrames = onOffset
       , tnOffOffsetFrames = offOffset
       }
+
+humanizedVelocity ∷ Int → Int → InstrumentPatternSpec → PatternNote → Float
+humanizedVelocity absoluteBarIx beatsPerBar inst note =
+  let base = clamp01 (pnVelocity note)
+      variation = clamp01 (ipVelocityVariation inst)
+  in if variation <= 0
+       then base
+       else
+         let beatPhase = wrapBeatPhase (pnBeatOffset note) (max 1 beatsPerBar)
+             accentBoost
+               | isNearBeat beatPhase 0 = 0.20 * variation
+               | isNearBeat beatPhase 2 = 0.12 * variation
+               | otherwise = 0
+             seed =
+               velocitySeed
+                 absoluteBarIx
+                 (ipInstrumentId inst)
+                 (pnNoteKey note)
+                 beatPhase
+             jitter = (rand01 seed - 0.5) * 0.10 * variation
+         in clamp01 (base + accentBoost + jitter)
+
+wrapBeatPhase ∷ Float → Int → Float
+wrapBeatPhase beatOffset beatsPerBar =
+  let beats = fromIntegral (max 1 beatsPerBar) ∷ Float
+      q = fromIntegral (floor (beatOffset / beats) ∷ Int) ∷ Float
+      wrapped = beatOffset - q * beats
+  in if wrapped < 0 then wrapped + beats else wrapped
+
+isNearBeat ∷ Float → Float → Bool
+isNearBeat x target = abs (x - target) <= 0.001
+
+velocitySeed ∷ Int → InstrumentId → NoteKey → Float → Word64
+velocitySeed absoluteBarIx iid key beatPhase =
+  let beatTicks = floor (beatPhase * 960) ∷ Int
+      InstrumentId instN = iid
+      NoteKey noteN = key
+      seedBase =
+        fromIntegral absoluteBarIx * 0x9E3779B97F4A7C15
+          + fromIntegral (instN * 131 + noteN * 17 + beatTicks * 7)
+  in nextConductorSeed seedBase
 
 sectionBarFrames ∷ Word32 → SectionSpec → Word64
 sectionBarFrames sampleRateHz sectionSpec =
@@ -1167,7 +1274,11 @@ parseInstruments sectionNames entries = do
       iid <- lookupIntKey ["instruments", name, "instrument_id"] entries
       amp <- lookupFloatKeyDefault ["instruments", name, "amp"] 1 entries
       pan <- lookupFloatKeyDefault ["instruments", name, "pan"] 0 entries
+      velocityVariation <- lookupFloatKeyDefault ["instruments", name, "velocity_variation"] 0 entries
       ensure (iid >= 0) ("instruments." <> name <> ".instrument_id must be >= 0")
+      ensure
+        (velocityVariation >= 0 && velocityVariation <= 1)
+        ("instruments." <> name <> ".velocity_variation must be in [0,1]")
       patterns <- mapM (parseSectionPattern name) sectionNames
       fills <- mapM (parseSectionFillPattern name) sectionNames
       pure
@@ -1176,6 +1287,7 @@ parseInstruments sectionNames entries = do
           , ipInstrumentId = InstrumentId iid
           , ipAmp = amp
           , ipPan = pan
+          , ipVelocityVariation = velocityVariation
           , ipPatterns = M.fromList patterns
           , ipFills = M.fromList fills
           }

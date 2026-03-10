@@ -375,11 +375,11 @@ processMsgs h rb st = do
   case m of
     Nothing -> pure st
     Just msg ->
-      case msg of
+        case msg of
         AudioShutdown ->
-          rbReset rb >> pure st { stActiveCount = 0, stClipActiveCount = 0 }
+          rbReset rb >> pure st { stActiveCount = 0, stClipActiveCount = 0, stScheduled = [] }
         AudioStopAll  ->
-          rbReset rb >> processMsgs h rb st { stActiveCount = 0, stClipActiveCount = 0 }
+          rbReset rb >> processMsgs h rb st { stActiveCount = 0, stClipActiveCount = 0, stScheduled = [] }
 
         AudioLoadInstrument iid inst ->
           setInstrument iid inst st >>= processMsgs h rb

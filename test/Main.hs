@@ -74,6 +74,8 @@ import Player.Timeline
   , TimelineRuntime
   , compileTimelineBars
   , parseSongSpecText
+  , timelineBoundarySpanFromNextBar
+  , timelineRuntimeEndFrame
   , popTransitionTelemetry
   , popReadyBars
   , prepareTimelineRuntime
@@ -128,6 +130,8 @@ testCases =
   [ TestCase "audio-config-parses-yaml-shape" testAudioConfigParsesYamlShape
   , TestCase "audio-config-rejects-too-small-buffer" testAudioConfigRejectsTooSmallBuffer
   , TestCase "timeline-song-spec-parses-yaml" testTimelineSongSpecParsesYaml
+  , TestCase "timeline-velocity-variation-accents-downbeats" testTimelineVelocityVariationAccentsDownbeats
+  , TestCase "timeline-velocity-variation-zero-keeps-base-velocity" testTimelineVelocityVariationZeroKeepsBaseVelocity
   , TestCase "timeline-compiler-builds-cue-sections" testTimelineCompilerBuildsCueSections
   , TestCase "timeline-lookahead-pops-ready-bars" testTimelineLookaheadPopsReadyBars
   , TestCase "timeline-conductor-transitions-at-phrase-boundary" testTimelineConductorTransitionsAtPhraseBoundary
@@ -143,6 +147,8 @@ testCases =
   , TestCase "timeline-section-metadata-steers-conductor" testTimelineSectionMetadataSteersConductor
   , TestCase "timeline-section-feel-steers-variation" testTimelineSectionFeelSteersVariation
   , TestCase "timeline-transition-telemetry-emits-reason-and-weights" testTimelineTransitionTelemetryEmitsReasonAndWeights
+  , TestCase "timeline-runtime-end-frame-includes-last-bar-length" testTimelineRuntimeEndFrameIncludesLastBarLength
+  , TestCase "timeline-next-bar-span-follows-tempo-and-meter-changes" testTimelineNextBarSpanFollowsTempoAndMeterChanges
   , TestCase "automation-energy-lane-ramps-and-completes" testAutomationEnergyLaneRampsAndCompletes
   , TestCase "automation-mood-lane-switches-at-end" testAutomationMoodLaneSwitchesAtEnd
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
@@ -266,6 +272,66 @@ testTimelineSongSpecParsesYaml = do
       assertEqual "lookahead bars" 3 (sgLookaheadBars spec)
       assertEqual "section count" 2 (M.size (sgSections spec))
       assertEqual "instrument count" 1 (length (sgInstruments spec))
+
+testTimelineVelocityVariationAccentsDownbeats ∷ IO ()
+testTimelineVelocityVariationAccentsDownbeats = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "sections:"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  drums:"
+          , "    instrument_id: 9"
+          , "    velocity_variation: 1.0"
+          , "    pattern_ending: 0/49/0.5/0.5,1/49/0.5/0.5,2/49/0.5/0.5"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars = compileTimelineBars testSampleRate spec
+  case bars of
+    bar0 : _ -> do
+      let notes = tbNotes bar0
+          vBeat1 = noteVelocityAtFrame 0 notes
+          vBeat2 = noteVelocityAtFrame 24000 notes
+          vBeat3 = noteVelocityAtFrame 48000 notes
+      assertBool "beat 1 should be loudest under velocity variation" (vBeat1 > vBeat3)
+      assertBool "beat 3 should be louder than beat 2 under velocity variation" (vBeat3 > vBeat2)
+    [] ->
+      error "expected at least one compiled bar"
+
+testTimelineVelocityVariationZeroKeepsBaseVelocity ∷ IO ()
+testTimelineVelocityVariationZeroKeepsBaseVelocity = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "sections:"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  drums:"
+          , "    instrument_id: 9"
+          , "    velocity_variation: 0.0"
+          , "    pattern_ending: 0/49/0.5/0.5,1/49/0.5/0.5,2/49/0.5/0.5"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars = compileTimelineBars testSampleRate spec
+  case bars of
+    bar0 : _ -> do
+      let notes = tbNotes bar0
+      assertNear "beat 1 base velocity remains unchanged" 0.5 (noteVelocityAtFrame 0 notes)
+      assertNear "beat 2 base velocity remains unchanged" 0.5 (noteVelocityAtFrame 24000 notes)
+      assertNear "beat 3 base velocity remains unchanged" 0.5 (noteVelocityAtFrame 48000 notes)
+    [] ->
+      error "expected at least one compiled bar"
 
 testTimelineCompilerBuildsCueSections ∷ IO ()
 testTimelineCompilerBuildsCueSections = do
@@ -490,12 +556,62 @@ testTimelineTransitionTelemetryEmitsReasonAndWeights = do
           in if timelineRuntimeDone rt2
                then (barsAcc', telemetryAcc', rt2)
                else
-                 drainTimelineWithTelemetry
-                   (now + 100000)
-                   (loops + 1)
-                   barsAcc'
-                   telemetryAcc'
-                   rt2
+                  drainTimelineWithTelemetry
+                    (now + 100000)
+                    (loops + 1)
+                    barsAcc'
+                    telemetryAcc'
+                    rt2
+
+testTimelineRuntimeEndFrameIncludesLastBarLength ∷ IO ()
+testTimelineRuntimeEndFrameIncludesLastBarLength = do
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText timelineTempoChangeYaml)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      runtime1 = driveTimelineUntilDone (0 ∷ Word64) 0 runtime0
+  assertBool "runtime should have generated every bar" (timelineRuntimeDone runtime1)
+  assertEqual "end frame should include the full last bar" (Just 240000) (timelineRuntimeEndFrame runtime1)
+  where
+    driveTimelineUntilDone ∷ Word64 → Int → TimelineRuntime → TimelineRuntime
+    driveTimelineUntilDone now loops rt
+      | loops > 32 = error "timeline runtime did not finish within expected iterations"
+      | timelineRuntimeDone rt = rt
+      | otherwise =
+          let (_readyBars, rt') = popReadyBars now rt
+          in driveTimelineUntilDone (now + 100000) (loops + 1) rt'
+
+testTimelineNextBarSpanFollowsTempoAndMeterChanges ∷ IO ()
+testTimelineNextBarSpanFollowsTempoAndMeterChanges = do
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText timelineTempoChangeYaml)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (mSpan, _runtime1) = timelineBoundarySpanFromNextBar 1 1 runtime0
+  assertEqual
+    "next-bar span should follow the upcoming ending tempo and meter"
+    (Just (96000, 240000))
+    mSpan
+
+timelineTempoChangeYaml ∷ String
+timelineTempoChangeYaml =
+  unlines
+    [ "song:"
+    , "  mode: cue"
+    , "sections:"
+    , "  intro:"
+    , "    tempo_bpm: 120"
+    , "    beats_per_bar: 4"
+    , "    bars_per_phrase: 1"
+    , "    phrase_count: 1"
+    , "  ending:"
+    , "    tempo_bpm: 60"
+    , "    beats_per_bar: 3"
+    , "    bars_per_phrase: 1"
+    , "    phrase_count: 1"
+    , "instruments:"
+    , "  bass:"
+    , "    instrument_id: 0"
+    , "    patterns:"
+    , "      intro: 0/36/0.5/0.8"
+    , "      ending: 0/40/0.5/0.8"
+    ]
 
 testTimelineTransitionRulesAreStructured ∷ IO ()
 testTimelineTransitionRulesAreStructured = do
@@ -1922,6 +2038,12 @@ findVoice instId voices =
   case find ((== Just instId) . vNoteInstanceId) voices of
     Just voice -> pure voice
     Nothing -> error ("missing voice with instance " <> show instId)
+
+noteVelocityAtFrame ∷ Word64 → [TimelineNote] → Float
+noteVelocityAtFrame frame notes =
+  case find (\n -> tnOnOffsetFrames n == frame) notes of
+    Just n -> tnVelocity n
+    Nothing -> error ("missing note at frame " <> show frame)
 
 testSampleRate ∷ Word32
 testSampleRate = 48000

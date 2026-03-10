@@ -33,7 +33,7 @@ The timeline parser supports:
 - `song.mode: cue|drone`
 - `song.lookahead_bars`
 - `sections.<name>` with `tempo_bpm`, `beats_per_bar`, optional `beat_unit`, `bars_per_phrase`, `phrase_count`, `mood`, `feel`
-- `instruments.<name>` with `instrument_id`, optional `amp`, `pan`, and section patterns via either:
+- `instruments.<name>` with `instrument_id`, optional `amp`, `pan`, optional `velocity_variation` (0..1), and section patterns via either:
   - `patterns.<section>: ...`
   - `pattern_<section>: ...`
   - optional drum fill patterns per section via either:
@@ -61,3 +61,5 @@ instruments:
     patterns:
       verse: 0/40/0.5/0.8,2/43/0.5/0.8
 ```
+
+When `velocity_variation > 0`, note velocity is humanized deterministically: downbeats are accented (beat 1 strongest, beat 3 secondary in 4/4-style bars) plus light per-hit jitter; `0` disables this and preserves YAML velocities exactly.
