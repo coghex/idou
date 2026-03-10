@@ -549,20 +549,24 @@ kickPatch weight bodyTuneSemis attackTuneSemis =
 
 snarePatch ∷ Float → Instrument
 snarePatch variant =
-  let snapEnv = ADSR 0.0005 (0.04 + 0.02 * variant) 0 0.03
-      bodyEnv = ADSR 0.0005 (0.08 + 0.03 * variant) 0 0.05
-      filt = bpFilter (1800 + 550 * variant) 1.4 0.25 0.55 (ADSR 0.001 0.06 0 0.06)
+  let clapSnapEnv = ADSR 0.001 (0.05 + 0.02 * variant) 0 0.05
+      clapSpreadEnv = ADSR 0.003 (0.11 + 0.03 * variant) 0 0.09
+      bodyEnv = ADSR 0.001 (0.16 + 0.05 * variant) 0.20 (0.22 + 0.06 * variant)
+      filt = bpFilter (1050 + 300 * variant) 1.1 0.35 0.45 (ADSR 0.002 0.12 0.2 0.10)
   in drumPatch
-       [ oscEnv WaveWhiteNoise rootPitch 0.34 snapEnv
-       , oscEnv (noiseMix (0.55 + 0.15 * variant)) rootPitch 0.22 bodyEnv
-       , osc WaveTriangle rootPitch 0.26
-       , osc WaveSquare (semiPitch (19 + 4 * variant)) 0.18
+       [ oscEnv WaveWhiteNoise rootPitch 0.28 clapSnapEnv
+       , oscEnv (noiseMix (0.24 + 0.08 * variant)) rootPitch 0.22 clapSpreadEnv
+       , oscEnv WaveTriangle (semiPitch (-11 + 4 * variant)) 0.52 bodyEnv
+       , oscEnv WaveSine (semiPitch (-5 + 3 * variant)) 0.30 bodyEnv
+       , oscEnv WaveSaw (semiPitch (2 + 2 * variant)) 0.10 clapSpreadEnv
        ]
-       0.12
-       (ADSR 0.001 0.13 0 0.12)
-       0.92
+       0.08
+       (ADSR 0.001 0.20 0.22 0.24)
+       1.08
        (Just filt)
-       [envPitch 2 (-10)]
+       [ envPitch 2 (-18)
+       , envPitch 3 (-12)
+       ]
 
 clapPatch ∷ Instrument
 clapPatch =
@@ -655,16 +659,16 @@ crashPatch brightness =
       filt = hpFilter (1900 + 240 * brightness) 0.75 0.01 0.12 (ADSR 0.008 0.40 0.55 0.80)
   in
     (drumPatch
-       [ oscEnv WaveWhiteNoise rootPitch 0.22 strikeEnv
-       , oscEnv (noiseMix (0.30 + 0.08 * brightness)) rootPitch 0.14 strikeToneEnv
-       , oscEnv WaveWhiteNoise rootPitch 0.42 whiteEnv
-       , oscEnv WavePinkNoise rootPitch 0.50 pinkEnv
-       , oscEnv (noiseMix (0.86 + 0.08 * brightness)) rootPitch 0.42 washEnv
+       [ oscEnv WaveWhiteNoise rootPitch 0.16 strikeEnv
+       , oscEnv (noiseMix (0.30 + 0.08 * brightness)) rootPitch 0.10 strikeToneEnv
+       , oscEnv WaveWhiteNoise rootPitch 0.28 whiteEnv
+       , oscEnv WavePinkNoise rootPitch 0.34 pinkEnv
+       , oscEnv (noiseMix (0.86 + 0.08 * brightness)) rootPitch 0.30 washEnv
        , oscEnv WaveSquare (semiPitch (44 + 6 * brightness)) 0.04 strikeToneEnv
        ]
        0.36
        (ADSR 0.010 (3.20 + 0.80 * brightness) 0.68 (5.80 + 1.50 * brightness))
-       0.94
+       0.68
        (Just filt)
        [])
       { iPolyMax = 128
