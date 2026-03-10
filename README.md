@@ -12,10 +12,11 @@ Run with:
 ```bash
 cabal run idou -- path/to/file.mid
 cabal run idou -- path/to/file.wav
+cabal run idou -- song1.yaml
 cabal run idou -- config/song.yaml
 ```
 
-When launching with `.yaml`/`.yml`, the CLI opens an interactive prompt (`idou>`) for live control (`help` shows commands like `mood`, `energy`, `auto-energy`, `auto-mood`, `tempo`, `meter`, `start`, `stop`, `panic`, `quit`).
+When launching with `.yaml`/`.yml`, the CLI opens an interactive prompt (`idou>`) for live control (`help` shows commands like `genre`, `mood`, `energy`, `auto-energy`, `auto-mood`, `tempo`, `meter`, `start`, `stop`, `panic`, `quit`).
 
 Optional runtime health telemetry:
 
@@ -27,9 +28,38 @@ Telemetry behavior can be tuned in `config/audio.yaml` under `audio.telemetry`:
 - `verbose_report_every_loops`
 - `partial_write_alert_threshold`
 
-## Timeline song YAML (deterministic v1)
+## Timeline song YAML
 
-The timeline parser supports:
+The recommended schema is now a higher-level song-intent format:
+- `song.genre` selects an arranger pack (currently `electronic` and `cinematic`)
+- `song.mood` provides the base mood target for arrangement and conductor weighting
+- `song.tempo_bpm`, `song.beats_per_bar`, optional `song.beat_unit` provide section defaults
+- `song.form` is a comma-separated section order such as `intro,verse,chorus,bridge,outro`
+- `sections.<name>` defines `bars_per_phrase`, `phrase_count`, optional `mood`, `feel`, plus:
+  - `chords: Am,F,C,G` for one chord per bar in the phrase
+  - `melody: 0.0/A4/0.5/0.62,1.5/C5/0.5/0.58,...` where beat offsets are phrase-relative
+
+Example:
+
+```yaml
+song:
+  genre: electronic
+  mood: dramatic
+  tempo_bpm: 100
+  beats_per_bar: 4
+  form: intro,verse,chorus,outro
+
+sections:
+  intro:
+    bars_per_phrase: 4
+    phrase_count: 1
+    chords: Am(add9),Fmaj7,Dm7,Esus4
+    melody: 2.0/A4/1.0/0.54,3.0/C5/0.75/0.58,3.75/E5/0.25/0.62
+```
+
+For the new schema, the arranger generates drums, bass, pad, arp, and lead layers in Haskell from genre + mood + harmony/melody, and drum fills still honor the existing generated-fill system. While the timeline is playing, `genre <name|default>` swaps the active arranger pack for newly generated bars, so you can move between supported genres live.
+
+The older deterministic per-instrument schema is still supported:
 - `song.mode: cue|drone`
 - `song.lookahead_bars`
 - `sections.<name>` with `tempo_bpm`, `beats_per_bar`, optional `beat_unit`, `bars_per_phrase`, `phrase_count`, `mood`, `feel`

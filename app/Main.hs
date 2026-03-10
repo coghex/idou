@@ -102,6 +102,7 @@ playWavInput sys inputPath = do
 data PromptCmd
   = PromptHelp
   | PromptQuit
+  | PromptGenre !(Maybe String)
   | PromptMood !(Maybe String)
   | PromptEnergy !Float
   | PromptAutoEnergy !Float !Int !AutomationCurve
@@ -149,6 +150,11 @@ runPromptCommand sys player cmd =
       sendAudio sys AudioStopAll
       quitInteractive
       pure True
+    PromptGenre genre -> do
+      case genre of
+        Nothing -> sendPlayer player PlayerClearGenreTarget
+        Just g -> sendPlayer player (PlayerSetGenreTarget g)
+      pure False
     PromptMood mood -> do
       case mood of
         Nothing -> sendPlayer player PlayerClearMoodTarget
@@ -197,11 +203,12 @@ parsePromptCmd raw =
           "ease" -> Just AutomationEaseInOut
           "easeinout" -> Just AutomationEaseInOut
           _ -> Nothing
-      parseMood s =
+      parseMaybeLabel s =
         let m = trim s
-        in if null m || map toLower m == "none"
-             then Nothing
-             else Just m
+            lowered = map toLower m
+        in if null m || lowered == "none" || lowered == "default"
+              then Nothing
+              else Just m
   in case lower of
        [] -> PromptHelp
        ["help"] -> PromptHelp
@@ -214,8 +221,10 @@ parsePromptCmd raw =
        ["stop"] -> PromptStop
        ["cancel-energy"] -> PromptCancelEnergy
        ["cancel-mood"] -> PromptCancelMood
+       ("genre" : genreParts) ->
+         PromptGenre (parseMaybeLabel (unwords genreParts))
        ("mood" : moodParts) ->
-         PromptMood (parseMood (unwords moodParts))
+         PromptMood (parseMaybeLabel (unwords moodParts))
        ["energy", x] ->
          maybe (PromptUnknown "Usage: energy <0..1>") PromptEnergy (parseFloat x)
        ["tempo", x] ->
@@ -234,8 +243,8 @@ parsePromptCmd raw =
          case parseInt barsS of
            Nothing -> PromptUnknown "Usage: auto-mood <bars> <mood|none>"
            Just bars ->
-             let moodText = unwords moodPartsRev
-             in PromptAutoMood (parseMood moodText) bars
+              let moodText = unwords moodPartsRev
+              in PromptAutoMood (parseMaybeLabel moodText) bars
        _ -> PromptUnknown "Unknown command. Type `help` for available commands."
 
 printPromptHelp ∷ IO ()
@@ -248,6 +257,7 @@ printPromptHelp =
       , "  start                    Start timeline playback"
       , "  stop                     Stop timeline playback"
       , "  panic                    Stop all audio voices/clips immediately"
+      , "  genre <name|default>     Set/clear live genre override"
       , "  mood <name|none>         Set/clear mood target"
       , "  energy <0..1>            Set energy target immediately"
       , "  auto-energy <t> <bars> [step|linear|ease]"
@@ -319,6 +329,10 @@ printPlayerEvent ev =
       putStrLn "[player] energy lane canceled"
     PlayerEventMoodAutomationCanceled ->
       putStrLn "[player] mood lane canceled"
+    PlayerEventGenreChanged genre ->
+      putStrLn ("[player] genre set to " <> genre)
+    PlayerEventGenreChangeRejected requested err ->
+      putStrLn ("[player] genre change rejected (" <> requested <> "): " <> err)
     PlayerEventScheduled _ _ ->
       pure ()
     PlayerEventAudio _ ->

@@ -18,6 +18,7 @@ import Control.Exception (finally)
 import Control.Monad (foldM)
 import Data.Char (isSpace, toLower)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
+import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word64)
 
 import Audio.Thread
@@ -65,13 +66,16 @@ import Player.Timeline
   , loadSongSpec
   , popTransitionTelemetry
   , popReadyBars
-  , prepareTimelineRuntime
-  , setTimelineTargets
-  , timelineBoundarySpanFromNextBar
-  , timelineNextBarBoundaryFrame
-  , timelineRuntimeDone
-  , timelineRuntimeEndFrame
-  )
+    , prepareTimelineRuntime
+    , setTimelineGenre
+    , setTimelineTargets
+    , sgGenre
+    , timelineBoundarySpanFromNextBar
+    , timelineNextBarBoundaryFrame
+    , timelineRuntimeDone
+    , timelineRuntimeEndFrame
+    , validateSongGenre
+    )
 
 data PlayerMsg
   = PlayerShutdown
@@ -86,6 +90,10 @@ data PlayerMsg
   | PlayerSetMoodTarget
       { pmMoodTarget ∷ !String
       }
+  | PlayerSetGenreTarget
+      { pmGenreTarget ∷ !String
+      }
+  | PlayerClearGenreTarget
   | PlayerClearMoodTarget
   | PlayerSetEnergyTarget
       { pmEnergyTarget ∷ !Float
@@ -166,6 +174,13 @@ data PlayerEvent
       }
   | PlayerEventEnergyAutomationCanceled
   | PlayerEventMoodAutomationCanceled
+  | PlayerEventGenreChanged
+      { peGenreCurrent ∷ !String
+      }
+  | PlayerEventGenreChangeRejected
+      { peGenreRequested ∷ !String
+      , peGenreError     ∷ !String
+      }
   | PlayerEventScheduled
       { peFrame ∷ !Word64
       , peAction ∷ !ScheduledAudioAction
@@ -175,6 +190,7 @@ data PlayerEvent
 data PlayerState = PlayerState
   { pstBeatsPerBar ∷ !Int
   , pstTempoBpm    ∷ !Float
+  , pstGenreTarget ∷ !(Maybe String)
   , pstMoodTarget  ∷ !(Maybe String)
   , pstEnergyTarget ∷ !Float
   , pstEnergyLane  ∷ !(Maybe EnergyLane)
@@ -195,7 +211,7 @@ startPlayerThread audioSys = do
   msgQ <- Q.newQueue
   evQ <- Q.newQueue
   controlRef <- newIORef ThreadRunning
-  playerStateRef <- newIORef (PlayerState 4 120 Nothing 0.5 Nothing Nothing Nothing Nothing 1)
+  playerStateRef <- newIORef (PlayerState 4 120 Nothing Nothing 0.5 Nothing Nothing Nothing Nothing 1)
   doneVar <- newEmptyMVar
   tid <- forkIO $
     runPlayerLoop audioSys msgQ evQ controlRef playerStateRef `finally` putMVar doneVar ()
@@ -266,20 +282,37 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           let bpm' = max 1 bpm
           modifyIORef' playerStateRef (\s -> s { pstTempoBpm = bpm' })
           sendAudio audioSys (AudioSetTransportBpm bpm')
+        PlayerSetGenreTarget genreRaw -> do
+          ps <- readIORef playerStateRef
+          let genre' = normalizeGenreTarget genreRaw
+          case validateGenreTarget ps genre' of
+            Left err ->
+              Q.writeQueue evQ (PlayerEventGenreChangeRejected genreRaw err)
+            Right currentGenre -> do
+              writeIORef playerStateRef (applyLiveTimelineSettings (ps { pstGenreTarget = genre' }))
+              Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
+        PlayerClearGenreTarget -> do
+          ps <- readIORef playerStateRef
+          case validateGenreTarget ps Nothing of
+            Left err ->
+              Q.writeQueue evQ (PlayerEventGenreChangeRejected "<default>" err)
+            Right currentGenre -> do
+              writeIORef playerStateRef (applyLiveTimelineSettings (ps { pstGenreTarget = Nothing }))
+              Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
         PlayerSetMoodTarget moodRaw -> do
           let mood' = normalizeMoodTarget moodRaw
           modifyIORef'
             playerStateRef
-            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = mood', pstMoodLane = Nothing }))
+            (\s -> applyLiveTimelineSettings (s { pstMoodTarget = mood', pstMoodLane = Nothing }))
         PlayerClearMoodTarget ->
           modifyIORef'
             playerStateRef
-            (\s -> applyLiveTimelineTargets (s { pstMoodTarget = Nothing, pstMoodLane = Nothing }))
+            (\s -> applyLiveTimelineSettings (s { pstMoodTarget = Nothing, pstMoodLane = Nothing }))
         PlayerSetEnergyTarget energy ->
           let energy' = clamp01 energy
           in modifyIORef'
                playerStateRef
-               (\s -> applyLiveTimelineTargets (s { pstEnergyTarget = energy', pstEnergyLane = Nothing }))
+               (\s -> applyLiveTimelineSettings (s { pstEnergyTarget = energy', pstEnergyLane = Nothing }))
         PlayerAutomateEnergyNextBar target bars curve -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
@@ -324,7 +357,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
                   sendAudio audioSys (AudioSetTransportBpm (tbTempoBpm firstBar))
               modifyIORef'
                 playerStateRef
-                (\s -> s { pstSongSpec = Just spec, pstTimeline = Nothing })
+                (\s -> s { pstSongSpec = Just spec, pstGenreTarget = Nothing, pstTimeline = Nothing })
               Q.writeQueue evQ (PlayerEventTimelineLoaded path)
         PlayerStartSongTimeline -> do
           ps <- readIORef playerStateRef
@@ -342,9 +375,8 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
                       (pstBeatsPerBar ps)
                       (pstTempoBpm ps)
                   runtime =
-                    setTimelineTargets
-                      (pstMoodTarget ps)
-                      (pstEnergyTarget ps)
+                    applyLiveTimelineRuntime
+                      ps
                       ( prepareTimelineRuntime
                           (sampleRate (asHandle audioSys))
                           frame
@@ -415,25 +447,66 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           Q.writeQueue evQ (PlayerEventScheduled frame action)
       processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef
 
-applyLiveTimelineTargets ∷ PlayerState → PlayerState
-applyLiveTimelineTargets ps =
+applyLiveTimelineSettings ∷ PlayerState → PlayerState
+applyLiveTimelineSettings ps =
   case pstTimeline ps of
     Nothing -> ps
     Just timeline ->
       ps
         { pstTimeline =
             Just
-              ( setTimelineTargets
-                  (pstMoodTarget ps)
-                  (pstEnergyTarget ps)
-                  timeline
-              )
+              (applyLiveTimelineRuntime ps timeline)
         }
+
+applyLiveTimelineRuntime ∷ PlayerState → TimelineRuntime → TimelineRuntime
+applyLiveTimelineRuntime ps timeline =
+  let timeline' =
+        setTimelineTargets
+          (pstMoodTarget ps)
+          (pstEnergyTarget ps)
+          timeline
+  in case activeGenreTarget ps of
+       Nothing -> timeline'
+       Just genre ->
+         case setTimelineGenre genre timeline' of
+           Left _ -> timeline'
+           Right timeline'' -> timeline''
 
 normalizeMoodTarget ∷ String → Maybe String
 normalizeMoodTarget raw =
   let m = map toLower (trim raw)
   in if null m then Nothing else Just m
+
+normalizeGenreTarget ∷ String → Maybe String
+normalizeGenreTarget raw =
+  let g = map toLower (trim raw)
+  in if null g || g == "none" || g == "default"
+       then Nothing
+       else Just g
+
+activeGenreTarget ∷ PlayerState → Maybe String
+activeGenreTarget ps =
+  case pstGenreTarget ps of
+    Just genre -> Just genre
+    Nothing -> baseSongGenre ps
+
+baseSongGenre ∷ PlayerState → Maybe String
+baseSongGenre ps =
+  case pstSongSpec ps of
+    Nothing -> Nothing
+    Just spec ->
+      let genre = trim (sgGenre spec)
+      in if null genre then Nothing else Just genre
+
+validateGenreTarget ∷ PlayerState → Maybe String → Either String String
+validateGenreTarget ps target =
+  let resolved =
+        case target of
+          Just genre -> genre
+          Nothing -> fromMaybe "" (baseSongGenre ps)
+  in if null resolved
+       then Left "live genre switching requires a song using song.genre"
+       else validateSongGenre resolved
 
 trim ∷ String → String
 trim = dropWhileEnd isSpace . dropWhile isSpace
@@ -480,7 +553,7 @@ advanceAutomationLanes ∷ Word64 → Queue PlayerEvent → PlayerState → IO P
 advanceAutomationLanes now evQ ps0 = do
   let (ps1, energyEvents) = applyEnergyAutomation now ps0
       (ps2, moodEvents) = applyMoodAutomation now ps1
-      ps3 = applyLiveTimelineTargets ps2
+      ps3 = applyLiveTimelineSettings ps2
   mapM_ (Q.writeQueue evQ) (energyEvents <> moodEvents)
   pure ps3
 

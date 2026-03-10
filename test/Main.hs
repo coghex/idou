@@ -72,15 +72,17 @@ import Player.Timeline
   , TimelineBar(..)
   , TimelineNote(..)
   , TimelineTransitionTelemetry(..)
-  , TimelineRuntime
+  , TimelineRuntime(..)
   , compileTimelineBars
   , parseSongSpecText
+  , setTimelineGenre
   , timelineBoundarySpanFromNextBar
   , timelineRuntimeEndFrame
   , popTransitionTelemetry
   , popReadyBars
   , prepareTimelineRuntime
   , setTimelineTargets
+  , sgGenre
   , sgInstruments
   , sgLookaheadBars
   , sgMode
@@ -131,6 +133,10 @@ testCases =
   [ TestCase "audio-config-parses-yaml-shape" testAudioConfigParsesYamlShape
   , TestCase "audio-config-rejects-too-small-buffer" testAudioConfigRejectsTooSmallBuffer
   , TestCase "timeline-song-spec-parses-yaml" testTimelineSongSpecParsesYaml
+  , TestCase "timeline-song-intent-schema-arranges-electronic-song" testTimelineSongIntentSchemaArrangesElectronicSong
+  , TestCase "timeline-song-intent-schema-uses-top-level-defaults" testTimelineSongIntentSchemaUsesTopLevelDefaults
+  , TestCase "timeline-song-intent-schema-supports-cinematic-genre" testTimelineSongIntentSchemaSupportsCinematicGenre
+  , TestCase "timeline-live-genre-switch-updates-future-bars" testTimelineLiveGenreSwitchUpdatesFutureBars
   , TestCase "timeline-velocity-variation-accents-downbeats" testTimelineVelocityVariationAccentsDownbeats
   , TestCase "timeline-velocity-variation-zero-keeps-base-velocity" testTimelineVelocityVariationZeroKeepsBaseVelocity
   , TestCase "timeline-compiler-builds-cue-sections" testTimelineCompilerBuildsCueSections
@@ -279,6 +285,130 @@ testTimelineSongSpecParsesYaml = do
       assertEqual "lookahead bars" 3 (sgLookaheadBars spec)
       assertEqual "section count" 2 (M.size (sgSections spec))
       assertEqual "instrument count" 1 (length (sgInstruments spec))
+
+testTimelineSongIntentSchemaArrangesElectronicSong ∷ IO ()
+testTimelineSongIntentSchemaArrangesElectronicSong = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  genre: electronic"
+          , "  mood: dramatic"
+          , "  tempo_bpm: 100"
+          , "  beats_per_bar: 4"
+          , "  form: intro,verse,outro"
+          , "sections:"
+          , "  intro:"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "    chords: Am(add9),Fmaj7"
+          , "    melody: 2.0/A4/1.0/0.54,3.0/C5/0.75/0.58,4.0/E5/0.5/0.62"
+          , "  verse:"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "    chords: Am,F"
+          , "    melody: 0.0/A4/0.5/0.62,4.0/C5/0.5/0.60"
+          , "  outro:"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    chords: Am"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars = compileTimelineBars testSampleRate spec
+      leadKeys bar = [ key | note <- tbNotes bar, tnInstrumentId note == InstrumentId 80, let NoteKey key = tnKey note ]
+      hasInstrument iid bar = any ((== iid) . tnInstrumentId) (tbNotes bar)
+  assertEqual "generated electronic arrangement should create its instrument palette" 5 (length (sgInstruments spec))
+  assertEqual "form should compile into expected bar count" 5 (length bars)
+  case bars of
+    introBar0 : introBar1 : _ -> do
+      assertBool "intro bar should include generated drums" (hasInstrument (InstrumentId 9) introBar0)
+      assertBool "intro bar should include generated bass" (hasInstrument (InstrumentId 38) introBar0)
+      assertBool "intro bar should include generated pad" (hasInstrument (InstrumentId 88) introBar0)
+      assertEqual "phrase-relative melody should stay out of the first bar" [] (filter (== 76) (leadKeys introBar0))
+      assertEqual "phrase-relative melody should land in the second bar" [76] (filter (== 76) (leadKeys introBar1))
+    _ ->
+      error "expected arranged bars for generated electronic song"
+
+testTimelineSongIntentSchemaUsesTopLevelDefaults ∷ IO ()
+testTimelineSongIntentSchemaUsesTopLevelDefaults = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  genre: electronic"
+          , "  tempo_bpm: 98"
+          , "  beats_per_bar: 3"
+          , "sections:"
+          , "  ending:"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    chords: Am"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars = compileTimelineBars testSampleRate spec
+  case bars of
+    bar0 : _ -> do
+      assertNear "top-level tempo should flow into sections" 98 (tbTempoBpm bar0)
+      assertEqual "top-level beats-per-bar should flow into sections" 3 (tbBeatsPerBar bar0)
+      assertBool "generated arrangement should still create notes" (not (null (tbNotes bar0)))
+    [] ->
+      error "expected at least one compiled bar"
+
+testTimelineSongIntentSchemaSupportsCinematicGenre ∷ IO ()
+testTimelineSongIntentSchemaSupportsCinematicGenre = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  genre: cinematic"
+          , "  mood: dramatic"
+          , "  tempo_bpm: 90"
+          , "  beats_per_bar: 4"
+          , "sections:"
+          , "  ending:"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "    chords: Dm,Bb"
+          , "    melody: 0.0/F4/1.0/0.6,2.0/A4/1.0/0.66"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars = compileTimelineBars testSampleRate spec
+      leadPrograms = [ iid | bar <- bars, note <- tbNotes bar, let iid = tnInstrumentId note, iid == InstrumentId 61 ]
+      padPrograms = [ iid | bar <- bars, note <- tbNotes bar, let iid = tnInstrumentId note, iid == InstrumentId 91 ]
+  assertEqual "cinematic genre should be recorded on the song spec" "cinematic" (sgGenre spec)
+  assertBool "cinematic arrangement should use its own lead instrument" (not (null leadPrograms))
+  assertBool "cinematic arrangement should use its own pad instrument" (not (null padPrograms))
+
+testTimelineLiveGenreSwitchUpdatesFutureBars ∷ IO ()
+testTimelineLiveGenreSwitchUpdatesFutureBars = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  genre: electronic"
+          , "  mood: dramatic"
+          , "  tempo_bpm: 100"
+          , "  beats_per_bar: 4"
+          , "sections:"
+          , "  ending:"
+          , "    bars_per_phrase: 4"
+          , "    phrase_count: 1"
+          , "    chords: Am,F,C,G"
+          , "    melody: 0.0/A4/0.5/0.62,4.0/C5/0.5/0.60,8.0/E5/0.5/0.64,12.0/G5/0.5/0.68"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtime0 = (prepareTimelineRuntime testSampleRate 0 spec) { trLookaheadBars = 0 }
+      (bars0, runtime1) = popReadyBars 0 runtime0
+  case bars0 of
+    firstBar : _ -> do
+      assertBool "first bar should use electronic lead before switch" (any ((== InstrumentId 80) . tnInstrumentId) (tbNotes firstBar))
+      runtime2 <- either (\err -> error ("genre switch failed: " <> err)) pure (setTimelineGenre "cinematic" runtime1)
+      let nextNow = tbLengthFrames firstBar
+          (bars1, _runtime3) = popReadyBars nextNow runtime2
+      case bars1 of
+        switchedBar : _ -> do
+          assertBool "future bar should use cinematic lead after switch" (any ((== InstrumentId 61) . tnInstrumentId) (tbNotes switchedBar))
+          assertBool "future bar should stop using the old electronic lead" (not (any ((== InstrumentId 80) . tnInstrumentId) (tbNotes switchedBar)))
+        [] ->
+          error "expected a future bar after genre switch"
+    [] ->
+      error "expected an initial bar before genre switch"
 
 testTimelineVelocityVariationAccentsDownbeats ∷ IO ()
 testTimelineVelocityVariationAccentsDownbeats = do
