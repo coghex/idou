@@ -68,6 +68,7 @@ import Player.Automation
   )
 import Player.Timeline
   ( SongMode(..)
+  , SongSpec
   , TimelineBar(..)
   , TimelineNote(..)
   , TimelineTransitionTelemetry(..)
@@ -139,6 +140,9 @@ testCases =
   , TestCase "timeline-transition-rules-are-structured" testTimelineTransitionRulesAreStructured
   , TestCase "timeline-cue-without-ending-does-not-stop-early" testTimelineCueWithoutEndingDoesNotStopEarly
   , TestCase "timeline-drum-fills-trigger-at-phrase-boundary" testTimelineDrumFillsTriggerAtPhraseBoundary
+  , TestCase "timeline-generated-drum-fills-trigger-at-phrase-boundary" testTimelineGeneratedDrumFillsTriggerAtPhraseBoundary
+  , TestCase "timeline-generated-drum-fills-follow-time-signature-and-variation" testTimelineGeneratedDrumFillsFollowTimeSignatureAndVariation
+  , TestCase "timeline-generated-drum-fills-follow-preceding-cymbal-context" testTimelineGeneratedDrumFillsFollowPrecedingCymbalContext
   , TestCase "timeline-default-drums-are-present" testTimelineDefaultDrumsArePresent
   , TestCase "timeline-chorus-stability-vs-bridge-variation" testTimelineChorusStabilityVsBridgeVariation
   , TestCase "timeline-energy-target-steers-density" testTimelineEnergyTargetSteersDensity
@@ -149,6 +153,7 @@ testCases =
   , TestCase "timeline-transition-telemetry-emits-reason-and-weights" testTimelineTransitionTelemetryEmitsReasonAndWeights
   , TestCase "timeline-runtime-end-frame-includes-last-bar-length" testTimelineRuntimeEndFrameIncludesLastBarLength
   , TestCase "timeline-next-bar-span-follows-tempo-and-meter-changes" testTimelineNextBarSpanFollowsTempoAndMeterChanges
+  , TestCase "timeline-drum-timing-humanization-is-deterministic" testTimelineDrumTimingHumanizationIsDeterministic
   , TestCase "automation-energy-lane-ramps-and-completes" testAutomationEnergyLaneRampsAndCompletes
   , TestCase "automation-mood-lane-switches-at-end" testAutomationMoodLaneSwitchesAtEnd
   , TestCase "envelope-release-reaches-done" testEnvelopeReleaseReachesDone
@@ -172,10 +177,12 @@ testCases =
   , TestCase "noise-layer-envelope-shapes-amplitude" testNoiseLayerEnvelopeShapesAmplitude
   , TestCase "gm-drum-noise-layers-use-envelopes" testGmDrumNoiseLayersUseEnvelopes
   , TestCase "gm-kick-uses-separate-body-and-attack-tuning" testGmKickUsesSeparateBodyAndAttackTuning
+  , TestCase "gm-tom-family-has-noise-attack-and-ascending-tuning" testGmTomFamilyHasNoiseAttackAndAscendingTuning
   , TestCase "gm-crash-has-long-noise-tail" testGmCrashHasLongNoiseTail
   , TestCase "gm-program-map-varies-by-family" testGmProgramMapVariesByFamily
   , TestCase "gm-percussion-channel-ignores-program" testGmPercussionChannelIgnoresProgram
   , TestCase "gm-drum-map-varies-by-key-family" testGmDrumMapVariesByKeyFamily
+  , TestCase "gm-drum-map-covers-standard-toms-and-cymbals" testGmDrumMapCoversStandardTomsAndCymbals
   , TestCase "instrument-load-keeps-active-voice-until-live-apply" testInstrumentLoadKeepsActiveVoiceUntilLiveApply
   , TestCase "clip-one-shot-auto-releases-source" testClipOneShotAutoReleasesSource
   , TestCase "clip-music-bus-gain-zero-mutes-output" testClipMusicBusGainZeroMutesOutput
@@ -286,8 +293,8 @@ testTimelineVelocityVariationAccentsDownbeats = do
           , "    bars_per_phrase: 1"
           , "    phrase_count: 1"
           , "instruments:"
-          , "  drums:"
-          , "    instrument_id: 9"
+          , "  lead:"
+          , "    instrument_id: 0"
           , "    velocity_variation: 1.0"
           , "    pattern_ending: 0/49/0.5/0.5,1/49/0.5/0.5,2/49/0.5/0.5"
           ]
@@ -317,8 +324,8 @@ testTimelineVelocityVariationZeroKeepsBaseVelocity = do
           , "    bars_per_phrase: 1"
           , "    phrase_count: 1"
           , "instruments:"
-          , "  drums:"
-          , "    instrument_id: 9"
+          , "  lead:"
+          , "    instrument_id: 0"
           , "    velocity_variation: 0.0"
           , "    pattern_ending: 0/49/0.5/0.5,1/49/0.5/0.5,2/49/0.5/0.5"
           ]
@@ -613,6 +620,41 @@ timelineTempoChangeYaml =
     , "      ending: 0/40/0.5/0.8"
     ]
 
+testTimelineDrumTimingHumanizationIsDeterministic ∷ IO ()
+testTimelineDrumTimingHumanizationIsDeterministic = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "sections:"
+          , "  intro:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  drums:"
+          , "    instrument_id: 9"
+          , "    velocity_variation: 1"
+          , "    patterns:"
+          , "      intro: 0/49/0.2/0.4,0.5/49/0.2/0.5,1/49/0.2/0.6,1.5/49/0.2/0.7"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars1 = compileTimelineBars testSampleRate spec
+      bars2 = compileTimelineBars testSampleRate spec
+  case (bars1, bars2) of
+    (bar1 : _, bar2 : _) -> do
+      let offsets1 = map tnOnOffsetFrames (tbNotes bar1)
+          offsets2 = map tnOnOffsetFrames (tbNotes bar2)
+          exactOffsets = [0, 12000, 24000, 36000] ∷ [Word64]
+      assertEqual "drum timing humanization should be deterministic" offsets1 offsets2
+      assertBool "cymbal notes should not all stay perfectly on-grid" (offsets1 /= exactOffsets)
+      assertBool
+        "timing humanization should stay within a small window"
+        (and (zipWith (\actual expected -> abs (fromIntegral actual - fromIntegral expected ∷ Int) <= 720) offsets1 exactOffsets))
+    _ ->
+      error "expected compiled drum bar"
+
 testTimelineTransitionRulesAreStructured ∷ IO ()
 testTimelineTransitionRulesAreStructured = do
   let yamlText =
@@ -801,6 +843,160 @@ testTimelineDrumFillsTriggerAtPhraseBoundary = do
   assertBool "boundary bars should not keep base kick note when fill is defined" (all (not . hasKey 36) boundaryBars)
   assertBool "non-boundary bars should keep base beat notes" (all (hasKey 36) nonBoundaryBars)
   assertBool "non-boundary bars should not contain fill tom note" (all (not . hasKey 47) nonBoundaryBars)
+
+testTimelineGeneratedDrumFillsTriggerAtPhraseBoundary ∷ IO ()
+testTimelineGeneratedDrumFillsTriggerAtPhraseBoundary = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "  lookahead_bars: 2"
+          , "sections:"
+          , "  ending:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 4"
+          , "    phrase_count: 2"
+          , "    mood: intense"
+          , "    feel: driving"
+          , "instruments:"
+          , "  drums:"
+          , "    instrument_id: 9"
+          , "    amp: 1"
+          , "    pan: 0"
+          , "    velocity_variation: 0"
+          , "    pattern_ending: 0/36/0.25/0.90,1/42/0.12/0.46,2/38/0.22/0.84,3/42/0.12/0.48"
+          , "    fill_generator:"
+          , "      enabled: true"
+          , "      variation: 0.72"
+          , "      density: 0.76"
+          , "      length_beats: 2.0"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let runtimeA0 = prepareTimelineRuntime testSampleRate 0 spec
+      runtimeB0 = prepareTimelineRuntime testSampleRate 0 spec
+      (barsA, _doneA) = drainTimelineBarsForTest 0 0 [] runtimeA0
+      (barsB, _doneB) = drainTimelineBarsForTest 0 0 [] runtimeB0
+      boundaryBars = filter (\b -> tbBarInPhrase b == 3) barsA
+      nonBoundaryBars = filter (\b -> tbBarInPhrase b /= 3) barsA
+      hasFillVoice bar =
+        any
+          (\n ->
+             let NoteKey k = tnKey n
+             in k `elem` [45, 47, 48, 50, 49, 52, 55, 57])
+          (tbNotes bar)
+  assertEqual "generated fills should be deterministic" barsA barsB
+  assertEqual "expected two phrase-boundary bars" 2 (length boundaryBars)
+  assertBool "generated fill bars should introduce tom or cymbal accents" (all hasFillVoice boundaryBars)
+  assertBool "non-boundary bars should stay on the base groove" (all (not . hasFillVoice) nonBoundaryBars)
+
+testTimelineGeneratedDrumFillsFollowTimeSignatureAndVariation ∷ IO ()
+testTimelineGeneratedDrumFillsFollowTimeSignatureAndVariation = do
+  let mkSpec ∷ Float → Float → Either String SongSpec
+      mkSpec variation density =
+        parseSongSpecText $
+          unlines
+            [ "song:"
+            , "  mode: cue"
+            , "  lookahead_bars: 2"
+            , "sections:"
+            , "  ending:"
+            , "    tempo_bpm: 108"
+            , "    beats_per_bar: 3"
+            , "    bars_per_phrase: 2"
+            , "    phrase_count: 2"
+            , "    mood: steady"
+            , "    feel: sparse"
+            , "instruments:"
+            , "  drums:"
+            , "    instrument_id: 9"
+            , "    amp: 1"
+            , "    pan: 0"
+            , "    velocity_variation: 0"
+            , "    pattern_ending: 0/36/0.25/0.88,1/38/0.22/0.82,2/46/0.24/0.42"
+            , "    fill_generator:"
+            , "      enabled: true"
+            , "      variation: " <> show variation
+            , "      density: " <> show density
+            , "      length_beats: 1.5"
+            ]
+  specLow <- either (\err -> error ("parse failed: " <> err)) pure (mkSpec 0.15 0.42)
+  specHigh <- either (\err -> error ("parse failed: " <> err)) pure (mkSpec 0.92 0.86)
+  let runtimeLow0 = prepareTimelineRuntime testSampleRate 0 specLow
+      runtimeHigh0 = prepareTimelineRuntime testSampleRate 0 specHigh
+      (barsLow, _doneLow) = drainTimelineBarsForTest 0 0 [] runtimeLow0
+      (barsHigh, _doneHigh) = drainTimelineBarsForTest 0 0 [] runtimeHigh0
+      boundaryLow = findBoundaryBar 1 barsLow
+      boundaryHigh = findBoundaryBar 1 barsHigh
+      beatOffsets bar =
+        let framesPerBeat =
+              (fromIntegral testSampleRate ∷ Float)
+                * 60
+                / tbTempoBpm bar
+        in [ fromIntegral (tnOnOffsetFrames note) / framesPerBeat
+           | note <- tbNotes bar
+           ]
+      lowOffsets = beatOffsets boundaryLow
+      highOffsets = beatOffsets boundaryHigh
+  assertBool "generated fill in 3/4 should start in the last half of the bar" (all (>= 1.49) lowOffsets && all (>= 1.49) highOffsets)
+  assertBool "higher variation should produce denser generated fills" (length (tbNotes boundaryHigh) > length (tbNotes boundaryLow))
+
+testTimelineGeneratedDrumFillsFollowPrecedingCymbalContext ∷ IO ()
+testTimelineGeneratedDrumFillsFollowPrecedingCymbalContext = do
+  let mkSpec ∷ Int → Either String SongSpec
+      mkSpec cymbalKey =
+        parseSongSpecText $
+          unlines
+            [ "song:"
+            , "  mode: cue"
+            , "  lookahead_bars: 2"
+            , "sections:"
+            , "  ending:"
+            , "    tempo_bpm: 120"
+            , "    beats_per_bar: 4"
+            , "    bars_per_phrase: 2"
+            , "    phrase_count: 1"
+            , "    mood: rising"
+            , "    feel: driving pulse"
+            , "instruments:"
+            , "  drums:"
+            , "    instrument_id: 9"
+            , "    amp: 1"
+            , "    pan: 0"
+            , "    velocity_variation: 0"
+            , "    pattern_ending: 0/36/0.25/0.88,1/" <> show cymbalKey <> "/0.22/0.46,2/38/0.22/0.84,3/" <> show cymbalKey <> "/0.22/0.46"
+            , "    fill_generator:"
+            , "      enabled: true"
+            , "      variation: 0.70"
+            , "      density: 0.70"
+            , "      length_beats: 2.0"
+            ]
+      earliestCymbalKeys bar =
+        let framesPerBeat =
+              (fromIntegral testSampleRate ∷ Float)
+                * 60
+                / tbTempoBpm bar
+            cymbalNotes =
+              [ (fromIntegral (tnOnOffsetFrames note) / framesPerBeat, key)
+              | note <- tbNotes bar
+              , let NoteKey key = tnKey note
+              , key `elem` [42, 44, 46, 49, 51, 52, 53, 55, 57, 59]
+              ]
+        in case cymbalNotes of
+             [] -> []
+             xs ->
+               let firstBeat = minimum (map fst xs)
+               in [ key | (beat, key) <- xs, abs (beat - firstBeat) < 0.001 ]
+  specRide <- either (\err -> error ("parse failed: " <> err)) pure (mkSpec 51)
+  specHat <- either (\err -> error ("parse failed: " <> err)) pure (mkSpec 46)
+  let runtimeRide0 = prepareTimelineRuntime testSampleRate 0 specRide
+      runtimeHat0 = prepareTimelineRuntime testSampleRate 0 specHat
+      (barsRide, _doneRide) = drainTimelineBarsForTest 0 0 [] runtimeRide0
+      (barsHat, _doneHat) = drainTimelineBarsForTest 0 0 [] runtimeHat0
+      rideBoundary = findBoundaryBar 1 barsRide
+      hatBoundary = findBoundaryBar 1 barsHat
+  assertBool "ride groove should carry ride color into the generated fill lead-in" (51 `elem` earliestCymbalKeys rideBoundary)
+  assertBool "hat groove should carry hat color into the generated fill lead-in" (46 `elem` earliestCymbalKeys hatBoundary)
 
 testTimelineChorusStabilityVsBridgeVariation ∷ IO ()
 testTimelineChorusStabilityVsBridgeVariation = do
@@ -1242,6 +1438,12 @@ drainTimelineBarsForTest now loops acc rt
            then (acc', rt')
            else drainTimelineBarsForTest (now + 120000) (loops + 1) acc' rt'
 
+findBoundaryBar ∷ Int → [TimelineBar] → TimelineBar
+findBoundaryBar barInPhrase bars =
+  case filter (\bar -> tbBarInPhrase bar == barInPhrase) bars of
+    bar : _ -> bar
+    [] -> error ("expected bar at phrase slot " <> show barInPhrase)
+
 testEnvelopeReleaseReachesDone ∷ IO ()
 testEnvelopeReleaseReachesDone = do
   let adsr = ADSR 0.01 0.02 0.4 0.01
@@ -1570,6 +1772,22 @@ testGmKickUsesSeparateBodyAndAttackTuning = do
     _ ->
       error "kick patch should expose body, trigger, and attack layers"
 
+testGmTomFamilyHasNoiseAttackAndAscendingTuning ∷ IO ()
+testGmTomFamilyHasNoiseAttackAndAscendingTuning = do
+  let toms = map gmDrumInstrument [41, 43, 45, 47, 48, 50]
+      bodySemis = map primaryLayerSemitone toms
+  assertBool
+    "tom body tuning should rise across the GM tom family"
+    (and (zipWith (<) bodySemis (drop 1 bodySemis)))
+  assertBool
+    "each tom should include an enveloped noise attack layer"
+    (all (any noiseLayerHasEnvelope . iOscs) toms)
+  where
+    primaryLayerSemitone inst =
+      case iOscs inst of
+        layer : _ -> psSemitones (olPitch layer)
+        [] -> error "expected tom patch to have at least one oscillator layer"
+
 testGmCrashHasLongNoiseTail ∷ IO ()
 testGmCrashHasLongNoiseTail = do
   let crash = gmDrumInstrument 49
@@ -1610,6 +1828,24 @@ testGmDrumMapVariesByKeyFamily = do
   assertBool "closed and open hihat patches should differ" (hatClosed /= hatOpen)
   assertBool "cowbell and bongo patches should differ" (cowbell /= bongo)
   assertEqual "kick patch should be short" 0 (aSustain (iAdsrDefault kick))
+
+testGmDrumMapCoversStandardTomsAndCymbals ∷ IO ()
+testGmDrumMapCoversStandardTomsAndCymbals = do
+  let lowFloorTom = gmDrumInstrument 41
+      highTom = gmDrumInstrument 50
+      crash1 = gmDrumInstrument 49
+      china = gmDrumInstrument 52
+      splash = gmDrumInstrument 55
+      crash2 = gmDrumInstrument 57
+      ride1 = gmDrumInstrument 51
+      ride2 = gmDrumInstrument 59
+      clap = gmDrumInstrument 39
+      vibraslap = gmDrumInstrument 58
+  assertBool "floor tom and high tom patches should differ" (lowFloorTom /= highTom)
+  assertBool "china cymbal should differ from crash 1" (china /= crash1)
+  assertBool "splash cymbal should differ from crash 2" (splash /= crash2)
+  assertBool "ride 1 and ride 2 should differ" (ride1 /= ride2)
+  assertBool "vibraslap should not reuse clap patch" (vibraslap /= clap)
 
 testInstrumentLoadKeepsActiveVoiceUntilLiveApply ∷ IO ()
 testInstrumentLoadKeepsActiveVoiceUntilLiveApply = do

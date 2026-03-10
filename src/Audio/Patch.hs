@@ -33,24 +33,24 @@ gmDrumInstrument key =
     38 -> snarePatch 0.0
     39 -> clapPatch
     40 -> snarePatch 0.2
-    41 -> tomPatch (-0.35)
+    41 -> lowFloorTomPatch
     42 -> hatPatch False
-    43 -> tomPatch (-0.15)
+    43 -> highFloorTomPatch
     44 -> pedalHatPatch
-    45 -> tomPatch 0.05
+    45 -> lowTomPatch
     46 -> hatPatch True
-    47 -> tomPatch 0.2
-    48 -> tomPatch 0.38
+    47 -> lowMidTomPatch
+    48 -> hiMidTomPatch
     49 -> crashPatch 0.0
-    50 -> tomPatch 0.55
+    50 -> highTomPatch
     51 -> ridePatch 0.0
-    52 -> crashPatch 0.2
+    52 -> chinaPatch
     53 -> rideBellPatch
     54 -> tambourinePatch
-    55 -> crashPatch 0.4
+    55 -> splashPatch
     56 -> cowbellPatch
     57 -> crashPatch 0.7
-    58 -> clapPatch
+    58 -> vibraslapPatch
     59 -> ridePatch 0.4
     60 -> bongoPatch 0.0
     61 -> bongoPatch 0.2
@@ -62,7 +62,7 @@ gmDrumInstrument key =
       | key < 41 -> snarePatch 0.1
       | key < 49 -> tomPatch 0.15
       | key < 57 -> crashPatch 0.25
-      | otherwise -> percussionPatch
+       | otherwise -> percussionPatch
 
 gmProgramInstrument ∷ Int → Instrument
 gmProgramInstrument program =
@@ -549,41 +549,47 @@ kickPatch weight bodyTuneSemis attackTuneSemis =
 
 snarePatch ∷ Float → Instrument
 snarePatch variant =
-  let clapSnapEnv = ADSR 0.001 (0.05 + 0.02 * variant) 0 0.05
-      clapSpreadEnv = ADSR 0.003 (0.11 + 0.03 * variant) 0 0.09
-      bodyEnv = ADSR 0.001 (0.16 + 0.05 * variant) 0.20 (0.22 + 0.06 * variant)
-      filt = bpFilter (1050 + 300 * variant) 1.1 0.35 0.45 (ADSR 0.002 0.12 0.2 0.10)
+  let wireSnapEnv = ADSR 0.0005 (0.026 + 0.010 * variant) 0 0.020
+      wireTailEnv = ADSR 0.0012 (0.070 + 0.018 * variant) 0 0.050
+      airEnv = ADSR 0.0010 (0.10 + 0.02 * variant) 0 0.07
+      bodyEnv = ADSR 0.0008 (0.11 + 0.02 * variant) 0 0.08
+      shellEnv = ADSR 0.0010 (0.14 + 0.02 * variant) 0 0.10
+      filt = bpFilter (1320 + 240 * variant) 1.05 0.16 0.34 (ADSR 0.001 0.07 0 0.06)
   in drumPatch
-       [ oscEnv WaveWhiteNoise rootPitch 0.28 clapSnapEnv
-       , oscEnv (noiseMix (0.24 + 0.08 * variant)) rootPitch 0.22 clapSpreadEnv
-       , oscEnv WaveTriangle (semiPitch (-11 + 4 * variant)) 0.52 bodyEnv
-       , oscEnv WaveSine (semiPitch (-5 + 3 * variant)) 0.30 bodyEnv
-       , oscEnv WaveSaw (semiPitch (2 + 2 * variant)) 0.10 clapSpreadEnv
+       [ oscEnv WaveWhiteNoise rootPitch 0.24 wireSnapEnv
+       , oscEnv (noiseMix (0.28 + 0.06 * variant)) rootPitch 0.22 wireTailEnv
+       , oscEnv WavePinkNoise rootPitch 0.10 airEnv
+       , oscEnv WaveTriangle (semiPitch (-18 + 2 * variant)) 0.34 bodyEnv
+       , oscEnv WaveSine (semiPitch (-11 + 2 * variant)) 0.22 shellEnv
+       , oscEnv WaveTriangle (semiPitch (-6 + 2 * variant)) 0.12 shellEnv
        ]
        0.08
-       (ADSR 0.001 0.20 0.22 0.24)
-       1.08
+       (ADSR 0.0008 0.15 0 0.11)
+       1.06
        (Just filt)
-       [ envPitch 2 (-18)
-       , envPitch 3 (-12)
+       [ envPitch 3 (-18)
+       , envPitch 4 (-10)
+       , envPitch 5 (-6)
        ]
 
 clapPatch ∷ Instrument
 clapPatch =
-  let snapEnv = ADSR 0.0005 0.04 0 0.03
-      spreadEnv = ADSR 0.002 0.10 0 0.06
-      filt = hpFilter 2400 0.8 0.05 0.30 (ADSR 0.001 0.05 0 0.08)
+  let snapEnv = ADSR 0.0005 0.028 0 0.018
+      spreadEnv = ADSR 0.0012 0.060 0 0.040
+      airEnv = ADSR 0.0020 0.095 0 0.050
+      tailEnv = ADSR 0.0035 0.085 0 0.060
+      filt = hpFilter 2600 0.78 0.01 0.18 (ADSR 0.0008 0.03 0 0.04)
   in drumPatch
-       [ oscEnv WaveWhiteNoise rootPitch 0.28 snapEnv
-       , oscEnv (noiseMix 0.25) rootPitch 0.20 spreadEnv
-       , osc WaveSquare (semiPitch 31) 0.22
-       , osc WaveTriangle (semiPitch 55) 0.12
+       [ oscEnv WaveWhiteNoise rootPitch 0.42 snapEnv
+       , oscEnv (noiseMix 0.22) rootPitch 0.30 spreadEnv
+       , oscEnv WavePinkNoise rootPitch 0.14 airEnv
+       , oscEnv (noiseMix 0.62) rootPitch 0.12 tailEnv
        ]
        0.18
-       (ADSR 0.001 0.17 0 0.18)
-       0.80
+       (ADSR 0.0008 0.09 0 0.07)
+       0.84
        (Just filt)
-       [envPitch 2 (-5)]
+       []
 
 rimPatch ∷ Instrument
 rimPatch =
@@ -601,20 +607,22 @@ rimPatch =
 
 hatPatch ∷ Bool → Instrument
 hatPatch isOpen =
-  let decay = if isOpen then 0.26 else 0.08
-      release = if isOpen then 0.22 else 0.05
-      snapEnv = ADSR 0.0005 decay 0 release
-      washEnv = ADSR 0.0005 (decay * 1.35) 0 (release * 1.25)
-      filt = hpFilter 4200 0.9 0.02 0.12 (ADSR 0.001 0.03 0 0.03)
+  let decay = if isOpen then 0.34 else 0.14
+      release = if isOpen then 0.28 else 0.12
+      tickEnv = ADSR 0.0004 (0.020 + if isOpen then 0.010 else 0.004) 0 0.012
+      hissEnv = ADSR 0.0005 (decay * 1.10) 0 (release * 0.95)
+      washEnv = ADSR 0.0010 (decay * 1.55) 0 (release * 1.20)
+      metallicEnv = ADSR 0.0006 (decay * 0.60) 0 (release * 0.70)
+      filt = hpFilter (5200 + if isOpen then 200 else 0) 0.78 0.01 0.08 (ADSR 0.001 0.05 0 0.05)
   in drumPatch
-       [ oscEnv WaveWhiteNoise rootPitch 0.34 snapEnv
-       , oscEnv (noiseMix 0.72) rootPitch 0.24 washEnv
-       , osc WaveSquare (semiPitch 43) 0.18
-       , osc WaveTriangle (semiPitch 58) 0.10
+       [ oscEnv WaveWhiteNoise rootPitch 0.24 tickEnv
+       , oscEnv (noiseMix 0.84) rootPitch 0.30 hissEnv
+       , oscEnv WavePinkNoise rootPitch 0.18 washEnv
+       , oscEnv WaveTriangle (semiPitch 64) 0.04 metallicEnv
        ]
-       0.16
+       0.08
        (ADSR 0.001 decay 0 release)
-       (if isOpen then 0.66 else 0.58)
+       (if isOpen then 0.58 else 0.48)
        (Just filt)
        []
 
@@ -634,41 +642,87 @@ pedalHatPatch =
        (Just filt)
        []
 
+lowFloorTomPatch, highFloorTomPatch, lowTomPatch, lowMidTomPatch, hiMidTomPatch, highTomPatch ∷ Instrument
+lowFloorTomPatch = tomPatch (-0.70)
+highFloorTomPatch = tomPatch (-0.42)
+lowTomPatch = tomPatch (-0.12)
+lowMidTomPatch = tomPatch 0.12
+hiMidTomPatch = tomPatch 0.38
+highTomPatch = tomPatch 0.64
+
 tomPatch ∷ Float → Instrument
 tomPatch position =
-  let pitch = semiPitch (-14 + 5 * position)
-      filt = lpFilter (420 + 280 * position) 0.95 0.45 0.45 (ADSR 0.001 0.10 0 0.08)
+  let tone = max 0 (min 1 ((position + 0.70) / 1.34))
+      bodySemi = -23 + 12 * position
+      subSemi = bodySemi - 11
+      ringSemi = bodySemi + 2.3
+      knockSemi = bodySemi + 9
+      bodyEnv = ADSR 0.0006 (0.12 - 0.02 * tone) 0 0.07
+      subEnv = ADSR 0.0008 (0.10 - 0.01 * tone) 0 0.06
+      ringEnv = ADSR 0.0007 (0.11 - 0.015 * tone) 0 0.06
+      clickEnv = ADSR 0.0004 0.016 0 0.012
+      shellEnv = ADSR 0.0006 (0.040 + 0.006 * tone) 0 0.025
+      gritEnv = ADSR 0.0008 (0.055 + 0.010 * tone) 0 0.032
+      filt = lpFilter (440 + 540 * tone) 0.86 0.24 0.42 (ADSR 0.001 0.08 0 0.05)
   in drumPatch
-       [ osc WaveTriangle pitch 0.54
-       , osc WaveSine (semiPitch (-7 + 8 * position)) 0.24
-       , osc WaveSaw (octavePitch (-2)) 0.12
+       [ oscEnv WaveSine (semiPitch bodySemi) 0.42 bodyEnv
+       , oscEnv WaveTriangle (semiPitch subSemi) 0.20 subEnv
+       , oscEnv WaveTriangle (semiPitch ringSemi) 0.18 ringEnv
+       , oscEnv WaveWhiteNoise rootPitch 0.10 clickEnv
+       , oscEnv (noiseMix 0.18) rootPitch 0.08 shellEnv
+       , oscEnv WavePinkNoise rootPitch 0.05 gritEnv
+       , oscEnv WaveSine (semiPitch knockSemi) 0.05 clickEnv
        ]
-       0.08
-       (ADSR 0.001 0.18 0 0.16)
+       0.01
+       (ADSR 0.001 0.14 0 0.10)
        0.74
        (Just filt)
-       [envPitch 0 (-26), envPitch 1 (-14)]
+       [ envPitch 0 (-46)
+       , envPitch 1 (-26)
+       , envPitch 2 (-22)
+       , envPitch 6 (-12)
+       ]
 
 crashPatch ∷ Float → Instrument
 crashPatch brightness =
-  let strikeEnv = ADSR 0.0015 (0.20 + 0.06 * brightness) 0.18 (0.32 + 0.10 * brightness)
-      strikeToneEnv = ADSR 0.0015 (0.24 + 0.06 * brightness) 0.12 (0.34 + 0.12 * brightness)
-      whiteEnv = ADSR 0.010 (2.60 + 0.70 * brightness) 0.55 (3.80 + 1.10 * brightness)
-      pinkEnv = ADSR 0.014 (3.40 + 0.90 * brightness) 0.65 (4.80 + 1.30 * brightness)
-      washEnv = ADSR 0.022 (4.20 + 1.00 * brightness) 0.75 (6.20 + 1.60 * brightness)
-      filt = hpFilter (1900 + 240 * brightness) 0.75 0.01 0.12 (ADSR 0.008 0.40 0.55 0.80)
+  let strikeEnv = ADSR 0.0008 (0.10 + 0.04 * brightness) 0 0.10
+      strikeToneEnv = ADSR 0.0008 (0.12 + 0.05 * brightness) 0 0.12
+      whiteEnv = ADSR 0.006 (1.80 + 0.45 * brightness) 0.34 (2.40 + 0.70 * brightness)
+      pinkEnv = ADSR 0.010 (2.40 + 0.60 * brightness) 0.42 (3.20 + 0.90 * brightness)
+      washEnv = ADSR 0.016 (3.10 + 0.75 * brightness) 0.52 (4.20 + 1.10 * brightness)
+      filt = hpFilter (2800 + 320 * brightness) 0.68 0.0 0.08 (ADSR 0.004 0.18 0.24 0.40)
   in
     (drumPatch
-       [ oscEnv WaveWhiteNoise rootPitch 0.16 strikeEnv
-       , oscEnv (noiseMix (0.30 + 0.08 * brightness)) rootPitch 0.10 strikeToneEnv
-       , oscEnv WaveWhiteNoise rootPitch 0.28 whiteEnv
-       , oscEnv WavePinkNoise rootPitch 0.34 pinkEnv
-       , oscEnv (noiseMix (0.86 + 0.08 * brightness)) rootPitch 0.30 washEnv
-       , oscEnv WaveSquare (semiPitch (44 + 6 * brightness)) 0.04 strikeToneEnv
+       [ oscEnv WaveWhiteNoise rootPitch 0.22 strikeEnv
+       , oscEnv (noiseMix (0.42 + 0.08 * brightness)) rootPitch 0.12 strikeToneEnv
+       , oscEnv WaveWhiteNoise rootPitch 0.18 whiteEnv
+       , oscEnv WavePinkNoise rootPitch 0.38 pinkEnv
+       , oscEnv (noiseMix (0.74 + 0.06 * brightness)) rootPitch 0.28 washEnv
        ]
-       0.36
-       (ADSR 0.010 (3.20 + 0.80 * brightness) 0.68 (5.80 + 1.50 * brightness))
-       0.68
+       0.20
+       (ADSR 0.006 (2.40 + 0.60 * brightness) 0.42 (3.60 + 0.90 * brightness))
+       0.62
+       (Just filt)
+       [])
+      { iPolyMax = 128
+      }
+
+chinaPatch ∷ Instrument
+chinaPatch =
+  let strikeEnv = ADSR 0.0005 0.08 0 0.06
+      trashEnv = ADSR 0.002 0.42 0 0.42
+      washEnv = ADSR 0.008 1.30 0.12 1.20
+      filt = hpFilter 2400 0.72 0.0 0.10 (ADSR 0.003 0.12 0.14 0.24)
+  in
+    (drumPatch
+       [ oscEnv WaveWhiteNoise rootPitch 0.22 strikeEnv
+       , oscEnv (noiseMix 0.58) rootPitch 0.30 trashEnv
+       , oscEnv WavePinkNoise rootPitch 0.22 washEnv
+       , oscEnv WaveSaw (semiPitch 23) 0.05 trashEnv
+       ]
+       0.18
+       (ADSR 0.003 0.90 0.12 1.00)
+       0.58
        (Just filt)
        [])
       { iPolyMax = 128
@@ -705,6 +759,26 @@ rideBellPatch =
        (Just filt)
        [envPitch 0 (-9)]
 
+splashPatch ∷ Instrument
+splashPatch =
+  let strikeEnv = ADSR 0.0005 0.05 0 0.03
+      whiteEnv = ADSR 0.002 0.34 0 0.26
+      washEnv = ADSR 0.006 0.72 0.08 0.62
+      filt = hpFilter 4200 0.74 0.0 0.08 (ADSR 0.002 0.06 0.08 0.14)
+  in
+    (drumPatch
+       [ oscEnv WaveWhiteNoise rootPitch 0.24 strikeEnv
+       , oscEnv (noiseMix 0.80) rootPitch 0.22 whiteEnv
+       , oscEnv WavePinkNoise rootPitch 0.12 washEnv
+       ]
+       0.16
+       (ADSR 0.002 0.56 0.08 0.48)
+       0.54
+       (Just filt)
+       [])
+      { iPolyMax = 128
+      }
+
 tambourinePatch ∷ Instrument
 tambourinePatch =
   let filt = hpFilter 3600 1.0 0.02 0.16 (ADSR 0.001 0.04 0 0.05)
@@ -728,11 +802,31 @@ cowbellPatch =
        , osc WaveSquare (semiPitch 31) 0.30
        , osc WaveTriangle (semiPitch 43) 0.16
        ]
+        0.12
+        (ADSR 0.001 0.11 0 0.13)
+        0.72
+        (Just filt)
+        []
+
+vibraslapPatch ∷ Instrument
+vibraslapPatch =
+  let buzzEnv = ADSR 0.0005 0.09 0 0.08
+      rattleEnv = ADSR 0.001 0.24 0 0.22
+      tailEnv = ADSR 0.002 0.34 0 0.30
+      filt = bpFilter 2100 1.05 0.10 0.18 (ADSR 0.001 0.08 0 0.12)
+  in drumPatch
+       [ oscEnv (noiseMix 0.48) rootPitch 0.18 rattleEnv
+       , oscEnv WaveSquare (semiPitch 17) 0.18 buzzEnv
+       , oscEnv WaveTriangle (semiPitch 31) 0.12 tailEnv
+       , oscEnv WaveWhiteNoise rootPitch 0.10 tailEnv
+       ]
        0.12
-       (ADSR 0.001 0.11 0 0.13)
-       0.72
+       (ADSR 0.001 0.22 0 0.22)
+       0.62
        (Just filt)
-       []
+       [ envPitch 1 (-10)
+       , envPitch 2 (-6)
+       ]
 
 bongoPatch ∷ Float → Instrument
 bongoPatch variant =

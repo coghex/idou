@@ -3,6 +3,7 @@
 module Player.Timeline
   ( SongMode(..)
   , PatternNote(..)
+  , FillGeneratorSpec(..)
   , InstrumentPatternSpec(..)
   , SectionSpec(..)
   , SongSpec(..)
@@ -27,7 +28,7 @@ module Player.Timeline
 import Data.Char (isSpace, toLower)
 import Data.Bits (xor)
 import Data.List (nub, sortOn)
-import Data.Maybe (mapMaybe)
+import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Map.Strict (Map)
 import Data.Word (Word32, Word64)
 
@@ -48,6 +49,13 @@ data PatternNote = PatternNote
   }
   deriving (Eq, Show)
 
+data FillGeneratorSpec = FillGeneratorSpec
+  { fgVariation   ∷ !Float
+  , fgDensity     ∷ !Float
+  , fgLengthBeats ∷ !Float
+  }
+  deriving (Eq, Show)
+
 data InstrumentPatternSpec = InstrumentPatternSpec
   { ipName        ∷ !String
   , ipInstrumentId ∷ !InstrumentId
@@ -56,6 +64,7 @@ data InstrumentPatternSpec = InstrumentPatternSpec
   , ipVelocityVariation ∷ !Float
   , ipPatterns    ∷ !(Map String [PatternNote])
   , ipFills       ∷ !(Map String [PatternNote])
+  , ipFillGenerator ∷ !(Maybe FillGeneratorSpec)
   }
   deriving (Eq, Show)
 
@@ -209,6 +218,9 @@ compileTimelineBars sampleRateHz spec = reverse barsRev
                         sampleRateHz
                         sectionName
                         sectionSpec
+                        Nothing
+                        0.5
+                        Nothing
                         absIx'
                         (i `mod` barsPerPhrase)
                         barsPerPhrase
@@ -387,6 +399,9 @@ appendGeneratedBar rt =
                     (trSampleRateHz rt)
                     (trCurrentSectionName rt)
                     sectionSpec
+                    (trTargetMood rt)
+                    (trTargetEnergy rt)
+                    (tbNotes <$> lastTimelineBar (trBars rt))
                     (trGeneratedBarCount rt)
                     (barIx `mod` barsPerPhrase)
                     barsPerPhrase
@@ -1038,12 +1053,15 @@ compileSectionNotes
   ∷ Word32
   → String
   → SectionSpec
+  → Maybe String
+  → Float
+  → Maybe [TimelineNote]
   → Int
   → Int
   → Int
   → [InstrumentPatternSpec]
   → [TimelineNote]
-compileSectionNotes sampleRateHz sectionName sectionSpec absoluteBarIx barInPhrase barsPerPhrase insts =
+compileSectionNotes sampleRateHz sectionName sectionSpec targetMood targetEnergy mPrevBarNotes absoluteBarIx barInPhrase barsPerPhrase insts =
   let melodic = concatMap perInstrument insts
       hasDrums =
         any
@@ -1062,14 +1080,28 @@ compileSectionNotes sampleRateHz sectionName sectionSpec absoluteBarIx barInPhra
     perInstrument inst =
       let beatNotes = M.findWithDefault [] sectionName (ipPatterns inst)
           fillNotes = M.findWithDefault [] sectionName (ipFills inst)
-          useFill =
+          useExplicitFill =
             isDrumInstrumentId (ipInstrumentId inst)
               && isPhraseBoundaryBar barInPhrase barsPerPhrase
               && not (null fillNotes)
+          generatedFill =
+            if useExplicitFill
+              then Nothing
+              else
+                generateFillPattern
+                  sectionSpec
+                  targetMood
+                  targetEnergy
+                  (fromMaybe [] mPrevBarNotes)
+                  absoluteBarIx
+                  barInPhrase
+                  barsPerPhrase
+                  inst
+                  beatNotes
           notes =
-            if useFill
+            if useExplicitFill
               then fillNotes
-              else beatNotes
+              else fromMaybe beatNotes generatedFill
       in map (compilePatternNote framesPerBeat absoluteBarIx (ssBeatsPerBar sectionSpec) inst) notes
 
 compileFallbackDrumNotes ∷ String → SectionSpec → Int → Int → Int → Double → [TimelineNote]
@@ -1083,6 +1115,7 @@ compileFallbackDrumNotes sectionName sectionSpec absoluteBarIx barInPhrase barsP
           , ipVelocityVariation = 0
           , ipPatterns = M.empty
           , ipFills = M.empty
+          , ipFillGenerator = Nothing
           }
       beats = max 1 (ssBeatsPerBar sectionSpec)
       sectionN = normalizeSectionName sectionName
@@ -1124,6 +1157,295 @@ compileFallbackDrumNotes sectionName sectionSpec absoluteBarIx barInPhrase barsP
                else []
   in map (compilePatternNote framesPerBeat absoluteBarIx beats inst) patternNotes
 
+generateFillPattern
+  ∷ SectionSpec
+  → Maybe String
+  → Float
+  → [TimelineNote]
+  → Int
+  → Int
+  → Int
+  → InstrumentPatternSpec
+  → [PatternNote]
+  → Maybe [PatternNote]
+generateFillPattern sectionSpec targetMood targetEnergy prevBarNotes absoluteBarIx barInPhrase barsPerPhrase inst beatNotes
+  | not (isDrumInstrumentId (ipInstrumentId inst)) = Nothing
+  | not (isPhraseBoundaryBar barInPhrase barsPerPhrase) = Nothing
+  | otherwise =
+      case ipFillGenerator inst of
+        Nothing -> Nothing
+        Just cfg ->
+          let prevDrumNotes = filter (\n -> tnInstrumentId n == ipInstrumentId inst) prevBarNotes
+              contextKeys =
+                if null prevDrumNotes
+                  then map patternNoteKeyInt beatNotes
+                  else map timelineNoteKeyInt prevDrumNotes
+              contextDensity =
+                if null prevDrumNotes
+                  then fromIntegral (length beatNotes)
+                  else fromIntegral (length prevDrumNotes)
+              beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+              descWords = fillDescriptorWords targetMood sectionSpec
+              energy = clamp01 targetEnergy
+              moodDensityBias
+                | hasAny descWords ["frantic", "intense", "aggressive", "dense", "heavy"] = 0.14
+                | hasAny descWords ["steady", "driving", "pulse"] = 0.08
+                | hasAny descWords ["sparse", "minimal", "calm", "ambient"] = -0.10
+                | otherwise = 0
+              contextBias
+                | contextDensity / beats < 3 = 0.12
+                | contextDensity / beats > 5.5 = -0.06
+                | otherwise = 0
+              density = clamp01 (fgDensity cfg + moodDensityBias + contextBias + (energy - 0.5) * 0.20)
+              fillLength =
+                clampFillLength
+                  beats
+                  ( fgLengthBeats cfg
+                      + if hasAny descWords ["frantic", "intense", "rising", "swell"]
+                          then 0.50
+                          else 0
+                      + if hasAny descWords ["sparse", "minimal"]
+                          then -0.50
+                          else 0
+                  )
+              fillStart = max 0 (beats - fillLength)
+              subdivision
+                | density + fgVariation cfg > 1.10 = 0.25
+                | otherwise = 0.50
+              styleSeed =
+                nextConductorSeed
+                  ( fromIntegral absoluteBarIx * 0x9E3779B97F4A7C15
+                      `xor` fromIntegral (length contextKeys * 17 + floor (energy * 100))
+                  )
+              styleWeights =
+                [ ("snare-answer", 3 + if countMatching isSnareKey contextKeys > 0 then 2 else 0)
+                , ("tom-run", 3 + if hasAny descWords ["frantic", "dense", "intense", "bridge"] then 3 else 0)
+                , ("kick-answer", 2 + if countMatching isKickKey contextKeys > 1 then 2 else 0)
+                , ("cymbal-lift", 2 + if hasAny descWords ["rising", "swell", "release", "intro"] then 4 else 0)
+                ]
+              styleName =
+                case weightedPick styleSeed styleWeights of
+                  Just choice -> wcName choice
+                  Nothing -> "snare-answer"
+              leadCymbal = chooseLeadCymbalKey descWords contextKeys
+              accentCymbal =
+                chooseAccentCymbalKey
+                  descWords
+                  contextKeys
+                  (nextConductorSeed styleSeed)
+              mainGrid = fillGrid fillStart beats subdivision
+              endSnareBeat = max fillStart (beats - max subdivision 0.50)
+              kickAnchor =
+                if countMatching isKickKey contextKeys > 0 && fillLength > 1.0
+                  then [mkPatternNote fillStart 36 0.20 0.72]
+                  else []
+              leadNote =
+                if fillLength >= 0.75
+                  then [mkPatternNote fillStart leadCymbal (cymbalDuration leadCymbal) (0.40 + 0.12 * density)]
+                  else []
+              bodyNotes =
+                fillBodyNotes
+                  styleName
+                  descWords
+                  (fgVariation cfg)
+                  fillStart
+                  endSnareBeat
+                  mainGrid
+                  styleSeed
+                  contextKeys
+              ghostNotes =
+                fillGhostNotes
+                  (fgVariation cfg)
+                  fillStart
+                  endSnareBeat
+                  subdivision
+                  (nextConductorSeed (styleSeed + 0x5BF03635))
+              finalAccent =
+                [ mkPatternNote endSnareBeat 38 0.22 0.90
+                , mkPatternNote
+                    (min (beats - 0.10) (endSnareBeat + min 0.12 subdivision))
+                    accentCymbal
+                    (cymbalDuration accentCymbal)
+                    (0.66 + 0.18 * density)
+                ]
+              generated =
+                sortOn pnBeatOffset (kickAnchor <> leadNote <> bodyNotes <> ghostNotes <> finalAccent)
+          in if null generated then Nothing else Just generated
+
+fillBodyNotes
+  ∷ String
+  → [String]
+  → Float
+  → Float
+  → Float
+  → [Float]
+  → Word64
+  → [Int]
+  → [PatternNote]
+fillBodyNotes styleName descWords variation fillStart endSnareBeat grid seed contextKeys =
+  let bodySlots = filter (\beat -> beat > fillStart + 0.001 && beat < endSnareBeat - 0.001) grid
+      tomLane = chooseTomLane descWords variation seed
+      snareChoices = [38, 40]
+      keyFor ix =
+        case styleName of
+          "tom-run" -> tomLane !! (ix `mod` length tomLane)
+          "kick-answer" ->
+            ([38, 36, 45, 38, 47] !! (ix `mod` 5))
+          "cymbal-lift" ->
+            ([46, 38, 47, 38, 50] !! (ix `mod` 5))
+          _ ->
+            let tomKey = tomLane !! (ix `mod` length tomLane)
+                snareKey = snareChoices !! (ix `mod` length snareChoices)
+            in if even ix then snareKey else tomKey
+      velocityFor ix key =
+        clamp01
+          ( 0.58
+              + if isSnareKey key then 0.10 else 0.04
+              + if isTomKey key then 0.06 else 0
+              + fromIntegral (ix `mod` 3) * 0.04
+              + variation * 0.08
+          )
+      durFor key
+        | isCymbalLike key = cymbalDuration key
+        | isKickKey key = 0.20
+        | otherwise = 0.18 + variation * 0.04
+      useBodySlot ix _beat =
+        rand01 (seed + fromIntegral (ix * 97 + keyFor ix * 11 + countMatching isKickKey contextKeys))
+          <= 0.62 + variation * 0.22
+      body =
+        [ mkPatternNote beat key (durFor key) (velocityFor ix key)
+        | (ix, beat) <- zip [0 :: Int ..] bodySlots
+        , let key = keyFor ix
+        , useBodySlot ix beat
+        ]
+  in case (body, bodySlots) of
+       ([], beat : _) ->
+         let key =
+               if styleName == "tom-run"
+                 then case tomLane of
+                        tom : _ -> tom
+                        [] -> 45
+                 else 38
+         in [mkPatternNote beat key 0.20 0.72]
+       _ -> body
+
+fillGhostNotes ∷ Float → Float → Float → Float → Word64 → [PatternNote]
+fillGhostNotes variation fillStart endSnareBeat subdivision seed
+  | variation < 0.45 = []
+  | otherwise =
+      let offset = if subdivision <= 0.25 then 0.125 else 0.25
+          slots = takeWhile (< endSnareBeat - 0.20) [fillStart + offset, fillStart + offset + max offset subdivision ..]
+      in [ mkPatternNote beat 40 0.12 (0.34 + variation * 0.12)
+         | (ix, beat) <- zip [0 :: Int ..] slots
+         , rand01 (seed + fromIntegral (ix * 131)) <= 0.45 + variation * 0.20
+         ]
+
+fillDescriptorWords ∷ Maybe String → SectionSpec → [String]
+fillDescriptorWords targetMood spec =
+  nub (sectionDescriptorWords spec <> maybe [] wordsLower targetMood)
+
+chooseTomLane ∷ [String] → Float → Word64 → [Int]
+chooseTomLane descWords variation seed =
+  let baseOptions =
+        [ [45, 47, 48, 50]
+        , [50, 48, 47, 45]
+        , [43, 45, 47, 50]
+        ]
+      intenseOptions =
+        if hasAny descWords ["frantic", "intense", "dense", "aggressive"]
+          then [[43, 45, 47, 48, 50], [50, 48, 47, 45, 43]]
+          else []
+      opts = baseOptions <> intenseOptions
+      ix = seededIndex seed (length opts)
+      chosen = opts !! ix
+  in if variation < 0.30 then take 3 chosen else chosen
+
+chooseLeadCymbalKey ∷ [String] → [Int] → Int
+chooseLeadCymbalKey descWords contextKeys =
+  case dominantKeyBy isHatLike contextKeys of
+    Just 42 -> 46
+    Just 44 -> 46
+    Just key -> key
+    Nothing ->
+      case dominantKeyBy isRideLike contextKeys of
+        Just key -> key
+        Nothing ->
+          if hasAny descWords ["rising", "swell", "intro"]
+            then 46
+            else 42
+
+chooseAccentCymbalKey ∷ [String] → [Int] → Word64 → Int
+chooseAccentCymbalKey descWords contextKeys seed =
+  let choices
+        | hasAny descWords ["frantic", "intense", "aggressive", "dense"] = [52, 57, 49]
+        | hasAny descWords ["rising", "swell", "release"] = [57, 55, 49]
+        | hasAny descWords ["steady", "driving", "pulse"] = [49, 55, 52]
+        | dominantKeyBy isRideLike contextKeys /= Nothing = [49, 55, 57]
+        | otherwise = [49, 57, 55]
+  in choices !! seededIndex seed (length choices)
+
+fillGrid ∷ Float → Float → Float → [Float]
+fillGrid startBeat beats subdivision =
+  takeWhile (< beats - 0.001) [startBeat, startBeat + subdivision ..]
+
+clampFillLength ∷ Float → Float → Float
+clampFillLength beats x = max 0.75 (min beats x)
+
+mkPatternNote ∷ Float → Int → Float → Float → PatternNote
+mkPatternNote beat key dur vel =
+  PatternNote
+    { pnBeatOffset = beat
+    , pnNoteKey = NoteKey key
+    , pnDuration = dur
+    , pnVelocity = clamp01 vel
+    }
+
+cymbalDuration ∷ Int → Float
+cymbalDuration key
+  | key `elem` [42, 44, 46] = 0.24
+  | key `elem` [51, 53, 59] = 0.42
+  | key == 55 = 0.72
+  | otherwise = 1.05
+
+timelineNoteKeyInt ∷ TimelineNote → Int
+timelineNoteKeyInt note =
+  case tnKey note of
+    NoteKey key -> key
+
+patternNoteKeyInt ∷ PatternNote → Int
+patternNoteKeyInt note =
+  case pnNoteKey note of
+    NoteKey key -> key
+
+countMatching ∷ (Int → Bool) → [Int] → Int
+countMatching predFn = length . filter predFn
+
+dominantKeyBy ∷ (Int → Bool) → [Int] → Maybe Int
+dominantKeyBy predFn keys =
+  case sortOn (\(count, key) -> (-count, key)) (mapMaybe asCount (M.toList counts)) of
+    (_, key) : _ -> Just key
+    [] -> Nothing
+  where
+    counts = M.fromListWith (+) [(key, 1 :: Int) | key <- keys, predFn key]
+    asCount (key, count)
+      | count > 0 = Just (count, key)
+      | otherwise = Nothing
+
+seededIndex ∷ Word64 → Int → Int
+seededIndex _ n | n <= 1 = 0
+seededIndex seed n = fromIntegral (seed `mod` fromIntegral n)
+
+hasAny ∷ [String] → [String] → Bool
+hasAny haystack needles = any (`elem` haystack) needles
+
+isKickKey, isSnareKey, isHatLike, isRideLike, isTomKey, isCymbalLike ∷ Int → Bool
+isKickKey key = key `elem` [35, 36]
+isSnareKey key = key `elem` [38, 39, 40]
+isHatLike key = key `elem` [42, 44, 46]
+isRideLike key = key `elem` [51, 53, 59]
+isTomKey key = key `elem` [41, 43, 45, 47, 48, 50]
+isCymbalLike key = key `elem` [42, 44, 46, 49, 51, 52, 53, 55, 57, 59]
+
 isPhraseBoundaryBar ∷ Int → Int → Bool
 isPhraseBoundaryBar barInPhrase barsPerPhrase =
   barsPerPhrase > 0 && barInPhrase == (barsPerPhrase - 1)
@@ -1146,10 +1468,12 @@ isBridgeSection spec = isBridgeSectionName (ssName spec)
 
 compilePatternNote ∷ Double → Int → Int → InstrumentPatternSpec → PatternNote → TimelineNote
 compilePatternNote framesPerBeat absoluteBarIx beatsPerBar inst note =
-  let onFrames = floor (realToFrac (pnBeatOffset note) * framesPerBeat) ∷ Integer
+  let baseOnFrames = floor (realToFrac (pnBeatOffset note) * framesPerBeat) ∷ Integer
+      timingJitterFrames = humanizedTimingJitterFrames framesPerBeat absoluteBarIx beatsPerBar inst note
+      onFrames = max 0 (baseOnFrames + timingJitterFrames)
       durFrames = max 1 (floor (realToFrac (pnDuration note) * framesPerBeat) ∷ Integer)
-      onOffset = fromIntegral (max 0 onFrames)
-      offOffset = fromIntegral (max 1 (onFrames + durFrames))
+      onOffset = fromIntegral onFrames
+      offOffset = fromIntegral (max (onFrames + 1) (onFrames + durFrames))
       velocity = humanizedVelocity absoluteBarIx beatsPerBar inst note
   in TimelineNote
       { tnInstrumentId = ipInstrumentId inst
@@ -1182,6 +1506,27 @@ humanizedVelocity absoluteBarIx beatsPerBar inst note =
              jitter = (rand01 seed - 0.5) * 0.10 * variation
          in clamp01 (base + accentBoost + jitter)
 
+humanizedTimingJitterFrames ∷ Double → Int → Int → InstrumentPatternSpec → PatternNote → Integer
+humanizedTimingJitterFrames framesPerBeat absoluteBarIx beatsPerBar inst note =
+  let variation = clamp01 (ipVelocityVariation inst)
+  in if variation <= 0 || not (isDrumInstrumentId (ipInstrumentId inst))
+       then 0
+       else
+         let beatPhase = wrapBeatPhase (pnBeatOffset note) (max 1 beatsPerBar)
+             NoteKey key = pnNoteKey note
+             jitterBeats
+               | key `elem` [42, 44, 46, 49, 51, 52, 55, 57, 59] = 0.030 * variation
+               | key `elem` [38, 39, 40] = 0.014 * variation
+               | otherwise = 0.010 * variation
+             seed =
+               timingSeed
+                 absoluteBarIx
+                 (ipInstrumentId inst)
+                 (pnNoteKey note)
+                 beatPhase
+             jitter = (rand01 seed - 0.5) * 2 * jitterBeats
+         in round (realToFrac jitter * framesPerBeat)
+
 wrapBeatPhase ∷ Float → Int → Float
 wrapBeatPhase beatOffset beatsPerBar =
   let beats = fromIntegral (max 1 beatsPerBar) ∷ Float
@@ -1201,6 +1546,10 @@ velocitySeed absoluteBarIx iid key beatPhase =
         fromIntegral absoluteBarIx * 0x9E3779B97F4A7C15
           + fromIntegral (instN * 131 + noteN * 17 + beatTicks * 7)
   in nextConductorSeed seedBase
+
+timingSeed ∷ Int → InstrumentId → NoteKey → Float → Word64
+timingSeed absoluteBarIx iid key beatPhase =
+  velocitySeed absoluteBarIx iid key beatPhase + 0xA24BAED4963EE407
 
 sectionBarFrames ∷ Word32 → SectionSpec → Word64
 sectionBarFrames sampleRateHz sectionSpec =
@@ -1275,6 +1624,7 @@ parseInstruments sectionNames entries = do
       amp <- lookupFloatKeyDefault ["instruments", name, "amp"] 1 entries
       pan <- lookupFloatKeyDefault ["instruments", name, "pan"] 0 entries
       velocityVariation <- lookupFloatKeyDefault ["instruments", name, "velocity_variation"] 0 entries
+      fillGenerator <- parseFillGenerator name
       ensure (iid >= 0) ("instruments." <> name <> ".instrument_id must be >= 0")
       ensure
         (velocityVariation >= 0 && velocityVariation <= 1)
@@ -1290,7 +1640,35 @@ parseInstruments sectionNames entries = do
           , ipVelocityVariation = velocityVariation
           , ipPatterns = M.fromList patterns
           , ipFills = M.fromList fills
+          , ipFillGenerator = fillGenerator
           }
+
+    parseFillGenerator instName = do
+      let basePath = ["instruments", instName, "fill_generator"]
+          blockPresent = any (pathStartsWith basePath) (M.keys entries)
+      enabled <- lookupBoolKeyDefault (basePath <> ["enabled"]) blockPresent entries
+      if not enabled
+        then pure Nothing
+        else do
+          variation <- lookupFloatKeyDefault (basePath <> ["variation"]) 0.65 entries
+          density <- lookupFloatKeyDefault (basePath <> ["density"]) 0.72 entries
+          lengthBeats <- lookupFloatKeyDefault (basePath <> ["length_beats"]) 2.0 entries
+          ensure
+            (variation >= 0 && variation <= 1)
+            ("instruments." <> instName <> ".fill_generator.variation must be in [0,1]")
+          ensure
+            (density >= 0 && density <= 1)
+            ("instruments." <> instName <> ".fill_generator.density must be in [0,1]")
+          ensure
+            (lengthBeats > 0)
+            ("instruments." <> instName <> ".fill_generator.length_beats must be > 0")
+          pure
+            (Just
+               FillGeneratorSpec
+                 { fgVariation = variation
+                 , fgDensity = density
+                 , fgLengthBeats = lengthBeats
+                 })
 
     parseSectionPattern instName sectionName = do
       let dottedPath = ["instruments", instName, "patterns", sectionName]
@@ -1424,6 +1802,26 @@ lookupTextDefault key fallback entries =
     Nothing -> fallback
     Just v -> v
 
+lookupBoolKey ∷ [String] → FlatYaml → Either String Bool
+lookupBoolKey key entries =
+  case M.lookup key entries of
+    Nothing -> Left ("missing key " <> renderPath key)
+    Just raw ->
+      case map toLower raw of
+        "true" -> pure True
+        "false" -> pure False
+        "yes" -> pure True
+        "no" -> pure False
+        "on" -> pure True
+        "off" -> pure False
+        _ -> Left ("invalid bool for " <> renderPath key <> ": " <> raw)
+
+lookupBoolKeyDefault ∷ [String] → Bool → FlatYaml → Either String Bool
+lookupBoolKeyDefault key fallback entries =
+  case M.lookup key entries of
+    Nothing -> pure fallback
+    Just _ -> lookupBoolKey key entries
+
 parseInt ∷ String → String → Either String Int
 parseInt label raw =
   case reads raw of
@@ -1457,6 +1855,9 @@ dropWhileEnd p = reverse . dropWhile p . reverse
 normalizeName ∷ String → String
 normalizeName = map toLower . trim
 
+pathStartsWith ∷ Eq a ⇒ [a] → [a] → Bool
+pathStartsWith prefix xs = take (length prefix) xs == prefix
+
 normalizeMood ∷ Maybe String → Maybe String
 normalizeMood mood =
   case mood of
@@ -1480,3 +1881,9 @@ renderPath = foldl render ""
 ensure ∷ Bool → String → Either String ()
 ensure cond msg =
   if cond then pure () else Left msg
+
+lastTimelineBar ∷ [TimelineBar] → Maybe TimelineBar
+lastTimelineBar bars =
+  case reverse bars of
+    bar : _ -> Just bar
+    [] -> Nothing
