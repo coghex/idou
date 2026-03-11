@@ -5,12 +5,20 @@ import { invoke } from '@tauri-apps/api/core';
 import MelodyGrid, { type OverlayNote } from './components/MelodyGrid';
 import { clamp, midiToNoteName, noteNameToMidi, quantizeBeat } from './lib/note';
 import {
+  analyzeChordRoman,
+  applyChordPreset,
+  availableChordPresets,
+  buildChordPalette,
+  CHORD_KEY_OPTIONS,
   buildSectionLoopDocument,
   createNoteId,
+  type HarmonicMode,
+  inferChordToolContext,
   normalizeSectionName,
   parseSongText,
   sectionTotalBeats,
   serializeSong,
+  transposeChordList,
   validateSong,
 } from './lib/song';
 import type { MelodyNote, SongSection } from './lib/song';
@@ -180,6 +188,10 @@ function App() {
   const [beatWidth, setBeatWidth] = useState<number>(42);
   const [showAccompaniment, setShowAccompaniment] = useState(true);
   const [auditionInstrument, setAuditionInstrument] = useState<string>('lead');
+  const [chordToolKey, setChordToolKey] = useState<string>('C');
+  const [chordToolMode, setChordToolMode] = useState<HarmonicMode>('major');
+  const [selectedChordIndex, setSelectedChordIndex] = useState<number>(0);
+  const [chordPresetId, setChordPresetId] = useState<string>('pop-lift');
 
   const selectedSection =
     document.sections.find((section) => section.name === selectedSectionName) ?? document.sections[0] ?? null;
@@ -193,6 +205,34 @@ function App() {
   const currentFileLabel = useMemo(() => basename(currentPath), [currentPath]);
   const currentSnapLabel =
     SNAP_OPTIONS.find((option) => option.value === snapStep)?.label ?? `${snapStep.toFixed(3)} beat`;
+  const chordPalette = useMemo(() => buildChordPalette(chordToolKey, chordToolMode), [chordToolKey, chordToolMode]);
+  const chordPresets = useMemo(() => availableChordPresets(chordToolMode), [chordToolMode]);
+  const chordRomans = useMemo(
+    () => selectedSection?.chords.map((chord) => analyzeChordRoman(chord, chordToolKey, chordToolMode)) ?? [],
+    [chordToolKey, chordToolMode, selectedSection?.chords],
+  );
+
+  useEffect(() => {
+    if (!selectedSection) {
+      return;
+    }
+    const inferred = inferChordToolContext(selectedSection.chords);
+    setChordToolKey(inferred.keyRoot);
+    setChordToolMode(inferred.mode);
+    setSelectedChordIndex(0);
+  }, [selectedSection?.name]);
+
+  useEffect(() => {
+    if (selectedSection && selectedChordIndex >= selectedSection.chords.length) {
+      setSelectedChordIndex(Math.max(0, selectedSection.chords.length - 1));
+    }
+  }, [selectedChordIndex, selectedSection]);
+
+  useEffect(() => {
+    if (chordPresets.length > 0 && !chordPresets.some((preset) => preset.id === chordPresetId)) {
+      setChordPresetId(chordPresets[0].id);
+    }
+  }, [chordPresetId, chordPresets]);
 
   useEffect(() => {
     setAccompanimentDirty(true);
@@ -556,6 +596,69 @@ function App() {
     );
   }
 
+  function setSelectedSectionChords(chords: string[]) {
+    const sanitized = chords.map((entry) => entry.trim()).filter(Boolean);
+    setSelectedSectionField('chords', sanitized);
+  }
+
+  function replaceOrAppendChord(symbol: string) {
+    if (!selectedSection) {
+      return;
+    }
+
+    const nextChords = [...selectedSection.chords];
+    if (nextChords.length === 0) {
+      nextChords.push(symbol);
+      setSelectedChordIndex(0);
+    } else if (selectedChordIndex >= 0 && selectedChordIndex < nextChords.length) {
+      nextChords[selectedChordIndex] = symbol;
+    } else {
+      nextChords.push(symbol);
+      setSelectedChordIndex(nextChords.length - 1);
+    }
+    setSelectedSectionChords(nextChords);
+    setStatusMessage(`Chord set to ${symbol}.`);
+  }
+
+  function appendChordSlot() {
+    if (!selectedSection) {
+      return;
+    }
+    const fallback = chordPalette[0]?.symbol ?? 'C';
+    const nextChords = [...selectedSection.chords, fallback];
+    setSelectedChordIndex(nextChords.length - 1);
+    setSelectedSectionChords(nextChords);
+    setStatusMessage(`Added chord ${fallback}.`);
+  }
+
+  function removeSelectedChord() {
+    if (!selectedSection || selectedSection.chords.length === 0) {
+      return;
+    }
+    const nextChords = selectedSection.chords.filter((_, index) => index !== selectedChordIndex);
+    setSelectedChordIndex(Math.max(0, selectedChordIndex - (selectedChordIndex >= nextChords.length ? 1 : 0)));
+    setSelectedSectionChords(nextChords);
+    setStatusMessage('Removed chord slot.');
+  }
+
+  function applySelectedChordPreset() {
+    const nextChords = applyChordPreset(chordToolKey, chordToolMode, chordPresetId);
+    if (nextChords.length === 0) {
+      return;
+    }
+    setSelectedChordIndex(0);
+    setSelectedSectionChords(nextChords);
+    setStatusMessage(`Applied ${chordPresets.find((preset) => preset.id === chordPresetId)?.label ?? 'preset'}.`);
+  }
+
+  function transposeSelectedChords(semitones: number) {
+    if (!selectedSection || selectedSection.chords.length === 0) {
+      return;
+    }
+    setSelectedSectionChords(transposeChordList(selectedSection.chords, semitones));
+    setStatusMessage(semitones > 0 ? 'Transposed chords up.' : 'Transposed chords down.');
+  }
+
   function updateSelectedNote(updater: (note: MelodyNote) => MelodyNote) {
     if (!selectedSection || !selectedNote) {
       return;
@@ -825,17 +928,78 @@ function App() {
                     Chords
                     <input
                       value={selectedSection.chords.join(',')}
-                      onChange={(event) =>
-                        setSelectedSectionField(
-                          'chords',
-                          event.target.value
-                            .split(',')
-                            .map((entry) => entry.trim())
-                            .filter(Boolean),
-                        )
-                      }
+                      onChange={(event) => setSelectedSectionChords(event.target.value.split(','))}
                     />
                   </label>
+                </div>
+
+                <div className="chord-tools">
+                  <div className="chord-tool-row">
+                    <label className="toolbar-control">
+                      <span>Key</span>
+                      <select value={chordToolKey} onChange={(event) => setChordToolKey(event.target.value)}>
+                        {CHORD_KEY_OPTIONS.map((keyRoot) => (
+                          <option key={keyRoot} value={keyRoot}>
+                            {keyRoot}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="toolbar-control">
+                      <span>Mode</span>
+                      <select value={chordToolMode} onChange={(event) => setChordToolMode(event.target.value as HarmonicMode)}>
+                        <option value="major">Major</option>
+                        <option value="minor">Minor</option>
+                      </select>
+                    </label>
+                    <label className="toolbar-control chord-preset-control">
+                      <span>Preset</span>
+                      <select value={chordPresetId} onChange={(event) => setChordPresetId(event.target.value)}>
+                        {chordPresets.map((preset) => (
+                          <option key={preset.id} value={preset.id}>
+                            {preset.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button onClick={() => applySelectedChordPreset()} disabled={chordPresets.length === 0}>
+                      Apply
+                    </button>
+                    <button onClick={() => transposeSelectedChords(-1)} disabled={selectedSection.chords.length === 0}>
+                      -1
+                    </button>
+                    <button onClick={() => transposeSelectedChords(1)} disabled={selectedSection.chords.length === 0}>
+                      +1
+                    </button>
+                    <button onClick={() => appendChordSlot()}>Add</button>
+                    <button onClick={() => removeSelectedChord()} disabled={selectedSection.chords.length === 0}>
+                      Remove
+                    </button>
+                  </div>
+
+                  <div className="chord-chip-list">
+                    {selectedSection.chords.map((chord, index) => (
+                      <button
+                        key={`${chord}-${index}`}
+                        className={index === selectedChordIndex ? 'chord-chip selected' : 'chord-chip'}
+                        onClick={() => setSelectedChordIndex(index)}
+                      >
+                        <span className="chord-chip-symbol">{chord}</span>
+                        <span className="chord-chip-roman">{chordRomans[index] ?? chord}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="chord-palette">
+                    {chordPalette.map((option) => (
+                      <button key={option.id} className="chord-degree-button" onClick={() => replaceOrAppendChord(option.symbol)}>
+                        <span>{option.label}</span>
+                        <strong>{option.symbol}</strong>
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="hint">Pick a slot, then choose a chord. Presets replace the whole progression.</div>
                 </div>
               </div>
 

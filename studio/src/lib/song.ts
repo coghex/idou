@@ -1,6 +1,84 @@
 import yaml from 'js-yaml';
 import { midiToNoteName, noteNameToMidi } from './note';
 
+const CHORD_ROOTS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const;
+const CHORD_ROOT_INDEX = new Map<string, number>([
+  ['C', 0],
+  ['B#', 0],
+  ['C#', 1],
+  ['DB', 1],
+  ['D', 2],
+  ['D#', 3],
+  ['EB', 3],
+  ['E', 4],
+  ['FB', 4],
+  ['F', 5],
+  ['E#', 5],
+  ['F#', 6],
+  ['GB', 6],
+  ['G', 7],
+  ['G#', 8],
+  ['AB', 8],
+  ['A', 9],
+  ['A#', 10],
+  ['BB', 10],
+  ['B', 11],
+  ['CB', 11],
+]);
+
+type ScaleDegreeDefinition = {
+  id: string;
+  label: string;
+  semitone: number;
+  suffix: string;
+};
+
+export type HarmonicMode = 'major' | 'minor';
+
+export type ChordDegreeOption = {
+  id: string;
+  label: string;
+  symbol: string;
+};
+
+export type ChordPreset = {
+  id: string;
+  label: string;
+  modes: readonly HarmonicMode[];
+  degrees: readonly string[];
+};
+
+const MAJOR_DEGREES: readonly ScaleDegreeDefinition[] = [
+  { id: 'I', label: 'I', semitone: 0, suffix: '' },
+  { id: 'ii', label: 'ii', semitone: 2, suffix: 'm' },
+  { id: 'iii', label: 'iii', semitone: 4, suffix: 'm' },
+  { id: 'IV', label: 'IV', semitone: 5, suffix: '' },
+  { id: 'V', label: 'V', semitone: 7, suffix: '' },
+  { id: 'vi', label: 'vi', semitone: 9, suffix: 'm' },
+  { id: 'vii-dim', label: 'vii dim', semitone: 11, suffix: 'dim' },
+] as const;
+
+const MINOR_DEGREES: readonly ScaleDegreeDefinition[] = [
+  { id: 'i', label: 'i', semitone: 0, suffix: 'm' },
+  { id: 'III', label: 'III', semitone: 3, suffix: '' },
+  { id: 'iv', label: 'iv', semitone: 5, suffix: 'm' },
+  { id: 'v', label: 'v', semitone: 7, suffix: 'm' },
+  { id: 'VI', label: 'VI', semitone: 8, suffix: '' },
+  { id: 'VII', label: 'VII', semitone: 10, suffix: '' },
+  { id: 'ii-dim', label: 'ii dim', semitone: 2, suffix: 'dim' },
+] as const;
+
+export const CHORD_KEY_OPTIONS = [...CHORD_ROOTS] as const;
+
+export const CHORD_PRESETS: readonly ChordPreset[] = [
+  { id: 'pop-lift', label: 'Pop lift', modes: ['major'], degrees: ['I', 'V', 'vi', 'IV'] },
+  { id: 'anthem', label: 'Anthem', modes: ['major'], degrees: ['vi', 'IV', 'I', 'V'] },
+  { id: 'sunrise', label: 'Sunrise', modes: ['major'], degrees: ['I', 'iii', 'vi', 'IV'] },
+  { id: 'minor-rise', label: 'Minor rise', modes: ['minor'], degrees: ['i', 'VI', 'III', 'VII'] },
+  { id: 'dusk', label: 'Dusk', modes: ['minor'], degrees: ['i', 'iv', 'VI', 'VII'] },
+  { id: 'shadow-loop', label: 'Shadow loop', modes: ['minor'], degrees: ['i', 'VII', 'VI', 'VII'] },
+] as const;
+
 export type MelodyNote = {
   id: string;
   beat: number;
@@ -32,6 +110,83 @@ export type SongDocument = {
   };
   sections: SongSection[];
 };
+
+function degreeDefinitionsForMode(mode: HarmonicMode): readonly ScaleDegreeDefinition[] {
+  return mode === 'major' ? MAJOR_DEGREES : MINOR_DEGREES;
+}
+
+function normalizeChordRoot(root: string): string | null {
+  const normalized = root.trim().toUpperCase();
+  const index = CHORD_ROOT_INDEX.get(normalized);
+  return index === undefined ? null : CHORD_ROOTS[index];
+}
+
+function parseChordSymbol(symbol: string): { root: string; suffix: string; bass: string | null } | null {
+  const match = /^([A-Ga-g])([#bB]?)([^/]*?)(?:\/([A-Ga-g])([#bB]?))?$/.exec(symbol.trim());
+  if (!match) {
+    return null;
+  }
+
+  const [, rootLetter, rootAccidental, suffix, bassLetter, bassAccidental] = match;
+  const root = normalizeChordRoot(`${rootLetter}${rootAccidental}`);
+  if (!root) {
+    return null;
+  }
+
+  const bass = bassLetter ? normalizeChordRoot(`${bassLetter}${bassAccidental ?? ''}`) : null;
+  return {
+    root,
+    suffix: suffix.trim(),
+    bass,
+  };
+}
+
+function transposeChordRoot(root: string, semitones: number): string | null {
+  const normalized = normalizeChordRoot(root);
+  if (!normalized) {
+    return null;
+  }
+  const index = CHORD_ROOT_INDEX.get(normalized.toUpperCase());
+  if (index === undefined) {
+    return null;
+  }
+  const nextIndex = (((index + semitones) % 12) + 12) % 12;
+  return CHORD_ROOTS[nextIndex];
+}
+
+function chordQualityFromSuffix(suffix: string): 'major' | 'minor' | 'diminished' {
+  const lowered = suffix.trim().toLowerCase();
+  if (lowered.startsWith('m') && !lowered.startsWith('maj')) {
+    return 'minor';
+  }
+  if (lowered.includes('dim') || lowered.includes('o')) {
+    return 'diminished';
+  }
+  return 'major';
+}
+
+function formatRomanQuality(label: string, quality: 'major' | 'minor' | 'diminished'): string {
+  const match = /^([b#]*)([ivIV]+)(.*)$/.exec(label);
+  if (!match) {
+    return label;
+  }
+
+  const [, accidental, roman, suffix] = match;
+  const casedRoman = quality === 'major' ? roman.toUpperCase() : roman.toLowerCase();
+  return quality === 'diminished'
+    ? `${accidental}${casedRoman}${suffix} dim`
+    : `${accidental}${casedRoman}${suffix}`;
+}
+
+function chromaticRomanLabel(interval: number, mode: HarmonicMode): string {
+  const major = ['I', 'bII', 'ii', 'bIII', 'iii', 'IV', '#IV', 'V', 'bVI', 'vi', 'bVII', 'vii'];
+  const minor = ['i', 'bII', 'ii', 'III', '#III', 'iv', '#iv', 'v', 'VI', '#VI', 'VII', 'vii'];
+  return (mode === 'major' ? major : minor)[interval] ?? '?';
+}
+
+function sanitizeChordList(chords: string[]): string[] {
+  return chords.map((chord) => chord.trim()).filter(Boolean);
+}
 
 type RawSongFile = {
   song?: Record<string, unknown>;
@@ -206,6 +361,85 @@ export function createDefaultSong(): SongDocument {
   };
 }
 
+export function buildChordPalette(keyRoot: string, mode: HarmonicMode): ChordDegreeOption[] {
+  const normalizedRoot = normalizeChordRoot(keyRoot) ?? 'C';
+  const rootIndex = CHORD_ROOT_INDEX.get(normalizedRoot.toUpperCase()) ?? 0;
+
+  return degreeDefinitionsForMode(mode).map((degree) => ({
+    id: degree.id,
+    label: degree.label,
+    symbol: `${CHORD_ROOTS[(rootIndex + degree.semitone) % 12]}${degree.suffix}`,
+  }));
+}
+
+export function availableChordPresets(mode: HarmonicMode): ChordPreset[] {
+  return CHORD_PRESETS.filter((preset) => preset.modes.includes(mode));
+}
+
+export function applyChordPreset(keyRoot: string, mode: HarmonicMode, presetId: string): string[] {
+  const palette = buildChordPalette(keyRoot, mode);
+  const paletteById = new Map(palette.map((degree) => [degree.id, degree.symbol]));
+  const preset = availableChordPresets(mode).find((candidate) => candidate.id === presetId);
+  if (!preset) {
+    return [];
+  }
+
+  return preset.degrees
+    .map((degreeId) => paletteById.get(degreeId))
+    .filter((value): value is string => typeof value === 'string');
+}
+
+export function transposeChordSymbol(symbol: string, semitones: number): string {
+  const parsed = parseChordSymbol(symbol);
+  if (!parsed) {
+    return symbol;
+  }
+
+  const root = transposeChordRoot(parsed.root, semitones);
+  const bass = parsed.bass ? transposeChordRoot(parsed.bass, semitones) : null;
+  if (!root) {
+    return symbol;
+  }
+
+  return `${root}${parsed.suffix}${bass ? `/${bass}` : ''}`;
+}
+
+export function transposeChordList(chords: string[], semitones: number): string[] {
+  return sanitizeChordList(chords.map((chord) => transposeChordSymbol(chord, semitones)));
+}
+
+export function analyzeChordRoman(chordSymbol: string, keyRoot: string, mode: HarmonicMode): string {
+  const parsed = parseChordSymbol(chordSymbol);
+  const normalizedKey = normalizeChordRoot(keyRoot);
+  if (!parsed || !normalizedKey) {
+    return chordSymbol;
+  }
+
+  const chordIndex = CHORD_ROOT_INDEX.get(parsed.root.toUpperCase());
+  const keyIndex = CHORD_ROOT_INDEX.get(normalizedKey.toUpperCase());
+  if (chordIndex === undefined || keyIndex === undefined) {
+    return chordSymbol;
+  }
+
+  const interval = (((chordIndex - keyIndex) % 12) + 12) % 12;
+  const diatonicMatch = degreeDefinitionsForMode(mode).find((degree) => degree.semitone === interval);
+  const label = diatonicMatch?.label ?? chromaticRomanLabel(interval, mode);
+  return formatRomanQuality(label, chordQualityFromSuffix(parsed.suffix));
+}
+
+export function inferChordToolContext(chords: string[]): { keyRoot: string; mode: HarmonicMode } {
+  const firstChord = sanitizeChordList(chords)[0];
+  const parsed = firstChord ? parseChordSymbol(firstChord) : null;
+  if (!parsed) {
+    return { keyRoot: 'C', mode: 'major' };
+  }
+
+  return {
+    keyRoot: parsed.root,
+    mode: chordQualityFromSuffix(parsed.suffix) === 'minor' ? 'minor' : 'major',
+  };
+}
+
 export function buildSectionLoopDocument(document: SongDocument, sectionName: string): SongDocument {
   const section = document.sections.find((entry) => entry.name === sectionName);
   if (!section) {
@@ -340,7 +574,8 @@ export function validateSong(document: SongDocument): string[] {
     }
     names.add(normalizedName);
 
-    if (section.chords.length === 0) {
+    const sanitizedChords = sanitizeChordList(section.chords);
+    if (sanitizedChords.length === 0) {
       issues.push(`Section "${normalizedName}" should define at least one chord.`);
     }
 

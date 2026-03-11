@@ -23,7 +23,7 @@ The repository now also includes a companion desktop editor in `studio/` for aut
 Current studio workflow:
 - song-level editing for `genre`, `mood`, `tempo_bpm`, `beats_per_bar`, and `beat_unit`
 - section/form editing with reorderable sections
-- chord editing per section
+- chord editing per section, with compact presets, roman-numeral feedback, and transpose helpers
 - canvas-based melody grid for note entry, drag/resize editing, and selection
 - DAW-style transport-first layout with snap and zoom controls for the piano roll
 - piano-key auditioning for generated `lead`, `pad`, `arp`, and `bass` layers using the current song genre
