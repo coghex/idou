@@ -225,7 +225,6 @@ startPlayerThread audioSys = do
 stopPlayerThread ∷ PlayerSystem → IO ()
 stopPlayerThread ps = do
   Q.writeQueue (psMsgQueue ps) PlayerShutdown
-  writeIORef (tsRunning (psThread ps)) ThreadStopped
   takeMVar (tsDone (psThread ps))
 
 sendPlayer ∷ PlayerSystem → PlayerMsg → IO ()
@@ -279,7 +278,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerSetMeter beats ->
           modifyIORef' playerStateRef (\s -> s { pstBeatsPerBar = max 1 beats })
         PlayerSetTempoBpm bpm -> do
-          let bpm' = max 1 bpm
+          let bpm' = if isNaN bpm || isInfinite bpm then 120 else max 1 bpm
           modifyIORef' playerStateRef (\s -> s { pstTempoBpm = bpm' })
           sendAudio audioSys (AudioSetTransportBpm bpm')
         PlayerSetGenreTarget genreRaw -> do

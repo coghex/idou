@@ -27,6 +27,7 @@ module Player.Timeline
   , timelineRuntimeEndFrame
   ) where
 
+import Control.Exception (evaluate)
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, toLower)
 import Data.Bits (xor)
 import Data.List (isInfixOf, nub, sortOn)
@@ -168,6 +169,7 @@ data TimelineRuntime = TimelineRuntime
 loadSongSpec ∷ FilePath → IO (Either String SongSpec)
 loadSongSpec path = do
   text <- readFile path
+  _ <- evaluate (length text)
   pure (parseSongSpecText text)
 
 parseSongSpecText ∷ String → Either String SongSpec

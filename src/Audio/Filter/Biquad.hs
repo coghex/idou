@@ -54,7 +54,9 @@ clampQ q =
 -- | Compute RBJ cookbook biquad coefficients for the given type/cutoff/Q.
 --   sampleRate must be > 0.
 biquadCoeffs ∷ FilterType → Float → Float → Float → BiquadCoeffs
-biquadCoeffs ftype sampleRate cutoffHz0 q0 =
+biquadCoeffs ftype sampleRate cutoffHz0 q0
+  | sampleRate <= 0 = BiquadCoeffs 1 0 0 0 0
+  | otherwise =
   let cutoffHz = clampCutoff sampleRate cutoffHz0
       q        = clampQ q0
 

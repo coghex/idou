@@ -191,6 +191,8 @@ lookupWord32Key ∷ [String] → FlatYaml → Either String Word32
 lookupWord32Key key entries = do
   n <- lookupIntKey key entries
   ensure (n >= 0) ("value for " <> renderPath key <> " must be non-negative")
+  ensure (n <= fromIntegral (maxBound ∷ Word32))
+    ("value for " <> renderPath key <> " exceeds maximum (" <> show (maxBound ∷ Word32) <> ")")
   pure (fromIntegral n)
 
 lookupIntKeyDefault ∷ [String] → Int → FlatYaml → Either String Int
@@ -211,11 +213,11 @@ validateAudioConfig cfg = do
   ensure (acChunkFrames cfg > 0) "audio.chunk_frames must be greater than 0"
   ensure (acMaxVoices cfg > 0) "audio.max_voices must be greater than 0"
   let bufferCfg = acBuffer cfg
-      targetFrames = acChunkFrames cfg * abTargetChunks bufferCfg
+      targetFrames = toInteger (acChunkFrames cfg) * toInteger (abTargetChunks bufferCfg)
   ensure (abCapacityFrames bufferCfg > 0) "audio.buffer.capacity_frames must be greater than 0"
   ensure (abTargetChunks bufferCfg > 0) "audio.buffer.target_chunks must be greater than 0"
   ensure
-    (fromIntegral targetFrames <= abCapacityFrames bufferCfg)
+    (targetFrames <= toInteger (abCapacityFrames bufferCfg))
     "audio.buffer.capacity_frames must be at least chunk_frames * target_chunks"
   let telemetryCfg = acTelemetry cfg
   ensure (atVerboseReportEveryLoops telemetryCfg > 0) "audio.telemetry.verbose_report_every_loops must be greater than 0"

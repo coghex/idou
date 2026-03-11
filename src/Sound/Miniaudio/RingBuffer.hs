@@ -36,7 +36,11 @@ foreign import ccall "hs_ma_rb_reset"
   rbReset :: Ptr MaRB -> IO ()
 
 rbCreateF32 :: Word32 -> Word32 -> IO (Ptr MaRB)
-rbCreateF32 capacityFrames channels = c_rbCreateF32 capacityFrames channels
+rbCreateF32 capacityFrames channels = do
+  ptr <- c_rbCreateF32 capacityFrames channels
+  if ptr == nullPtr
+    then error "rbCreateF32: failed to allocate ring buffer"
+    else pure ptr
 
 rbWriteF32 :: Ptr MaRB -> Ptr CFloat -> Word32 -> IO Word32
 rbWriteF32 = c_rbWriteF32

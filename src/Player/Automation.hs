@@ -70,7 +70,7 @@ data MoodLaneEvent
 barFramesForTransport ∷ Word32 → Int → Float → Word64
 barFramesForTransport sampleRateHz beatsPerBar bpm =
   let beats = max 1 beatsPerBar
-      tempo = max 1 bpm
+      tempo = if isNaN bpm || isInfinite bpm then 120 else max 1 bpm
       framesPerBarD =
         (fromIntegral sampleRateHz ∷ Double)
           * 60
