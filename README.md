@@ -31,7 +31,7 @@ Telemetry behavior can be tuned in `config/audio.yaml` under `audio.telemetry`:
 ## Timeline song YAML
 
 The recommended schema is now a higher-level song-intent format:
-- `song.genre` selects an arranger pack (currently `electronic` and `cinematic`)
+- `song.genre` selects an arranger pack (currently `electronic`, `ambient`, `blackmetal`, and `cinematic`)
 - `song.mood` provides the base mood target for arrangement and conductor weighting
 - `song.tempo_bpm`, `song.beats_per_bar`, optional `song.beat_unit` provide section defaults
 - `song.form` is a comma-separated section order such as `intro,verse,chorus,bridge,outro`
@@ -57,7 +57,7 @@ sections:
     melody: 2.0/A4/1.0/0.54,3.0/C5/0.75/0.58,3.75/E5/0.25/0.62
 ```
 
-For the new schema, the arranger generates drums, bass, pad, arp, and lead layers in Haskell from genre + mood + harmony/melody, and drum fills still honor the existing generated-fill system. While the timeline is playing, `genre <name|default>` swaps the active arranger pack for newly generated bars, so you can move between supported genres live.
+For the new schema, the arranger generates drums, bass, pad, arp, and lead layers in Haskell from genre + mood + harmony/melody, and drum fills still honor the existing generated-fill system. Basslines and accompaniment now use chord-aware support tones, melody-guided extension tones, approach notes into upcoming roots, and smoother pad voicings so the generated harmony reacts to both the progression and the authored melodic anchor instead of repeating a fixed root/fifth loop. While the timeline is playing, `genre <name|default>` swaps the active arranger pack for newly generated bars, so you can move between supported genres live.
 
 The older deterministic per-instrument schema is still supported:
 - `song.mode: cue|drone`

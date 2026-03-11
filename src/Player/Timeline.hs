@@ -321,7 +321,7 @@ setTimelineGenre genreRaw rt = do
 validateSongGenre ∷ String → Either String String
 validateSongGenre genreRaw = do
   let genre = normalizeName genreRaw
-  ensure (isSupportedGenre genre) ("unsupported song.genre: " <> genreRaw <> " (expected electronic|cinematic)")
+  ensure (isSupportedGenre genre) ("unsupported song.genre: " <> genreRaw <> " (expected electronic|ambient|blackmetal|cinematic)")
   pure genre
 
 popReadyBars ∷ Word64 → TimelineRuntime → ([TimelineBar], TimelineRuntime)
@@ -1175,6 +1175,22 @@ arrangeInstrumentBar songGenre targetMood sectionSpec absoluteBarIx barInPhrase 
                "arp" -> arrangeElectronicArp targetMood sectionSpec absoluteBarIx barInPhrase
                "lead" -> arrangeElectronicLead sectionSpec barInPhrase
                _ -> []
+           "ambient" ->
+             case normalizeName (ipName inst) of
+               "drums" -> arrangeAmbientDrums targetMood sectionSpec absoluteBarIx barInPhrase
+               "bass" -> arrangeAmbientBass targetMood sectionSpec barInPhrase
+               "pad" -> arrangeAmbientPad targetMood sectionSpec barInPhrase
+               "arp" -> arrangeAmbientShimmer targetMood sectionSpec absoluteBarIx barInPhrase
+               "lead" -> arrangeAmbientLead sectionSpec barInPhrase
+               _ -> []
+           "blackmetal" ->
+             case normalizeName (ipName inst) of
+               "drums" -> arrangeBlackmetalDrums targetMood sectionSpec absoluteBarIx barInPhrase
+               "bass" -> arrangeBlackmetalBass targetMood sectionSpec barInPhrase
+               "pad" -> arrangeBlackmetalPad targetMood sectionSpec barInPhrase
+               "arp" -> arrangeBlackmetalTremolo targetMood sectionSpec absoluteBarIx barInPhrase
+               "lead" -> arrangeBlackmetalLead sectionSpec barInPhrase
+               _ -> []
            "cinematic" ->
              case normalizeName (ipName inst) of
                "drums" -> arrangeCinematicDrums targetMood sectionSpec absoluteBarIx barInPhrase
@@ -1194,7 +1210,10 @@ arrangeElectronicLead ∷ SectionSpec → Int → [PatternNote]
 arrangeElectronicLead sectionSpec barInPhrase =
   let localNotes = melodyNotesForBar sectionSpec barInPhrase
   in if null localNotes
-       then map (\note -> note { pnVelocity = pnVelocity note * 0.78 }) (arrangeElectronicArp Nothing sectionSpec 0 barInPhrase)
+       then
+         [ mkPatternNote beat key dur (vel * 0.78)
+         | (beat, key, dur, vel) <- harmonicSparklePattern 5 0.5 0.75 0.36 sectionSpec barInPhrase
+         ]
        else localNotes
 
 arrangeCinematicLead ∷ SectionSpec → Int → [PatternNote]
@@ -1218,58 +1237,57 @@ arrangeCinematicLead sectionSpec barInPhrase =
 
 arrangeElectronicPad ∷ Maybe String → SectionSpec → Int → [PatternNote]
 arrangeElectronicPad targetMood sectionSpec barInPhrase =
-  let chord = chordForBar sectionSpec barInPhrase
-      descWords = arrangementDescriptorWords targetMood sectionSpec
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
       vel
         | isIntroSectionName (ssName sectionSpec) = 0.34
         | hasAny descWords ["dramatic", "tense", "combat"] = 0.46
         | otherwise = 0.38
       lengthBeats = max 1 (fromIntegral (ssBeatsPerBar sectionSpec) - if hasAny descWords ["staccato", "pulse"] then 0.5 else 0.12)
-      voicing = chordVoicing 4 chord
+      voicing = harmonicVoicingForBar 4 sectionSpec barInPhrase
   in [ mkPatternNote 0 key lengthBeats vel | key <- voicing ]
 
 arrangeCinematicPad ∷ Maybe String → SectionSpec → Int → [PatternNote]
 arrangeCinematicPad targetMood sectionSpec barInPhrase =
-  let chord = chordForBar sectionSpec barInPhrase
-      descWords = arrangementDescriptorWords targetMood sectionSpec
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
       vel
         | hasAny descWords ["dramatic", "intense", "combat"] = 0.54
         | hasAny descWords ["ambient", "sparse", "calm"] = 0.36
         | otherwise = 0.44
       lengthBeats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec))
-      voicing = chordVoicing 4 chord <> map (+ 12) (take 2 (drop 1 (chordVoicing 4 chord)))
+      voicing = harmonicVoicingForBar 4 sectionSpec barInPhrase
   in [ mkPatternNote 0 key (max 1 (lengthBeats - 0.05)) vel | key <- voicing ]
 
 arrangeElectronicBass ∷ Maybe String → SectionSpec → Int → [PatternNote]
 arrangeElectronicBass targetMood sectionSpec barInPhrase =
-  let chord = chordForBar sectionSpec barInPhrase
-      descWords = arrangementDescriptorWords targetMood sectionSpec
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
       beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
-      root = midiFromPitchClass 2 (csRootClass chord)
-      fifth = midiFromPitchClass 2 ((csRootClass chord + 7) `mod` 12)
-      octave = midiFromPitchClass 3 (csRootClass chord)
+      root = bassRootMidi 2 sectionSpec barInPhrase
+      support = bassSupportMidi 2 sectionSpec barInPhrase
+      upper = bassUpperMidi 3 sectionSpec barInPhrase
+      approach = bassApproachMidi 2 sectionSpec barInPhrase
       introPattern = [mkPatternNote 0 root beats 0.74]
       sparsePattern =
-        [ mkPatternNote 0 root 1.0 0.82
-        , mkPatternNote (beats - 1) fifth 0.75 0.72
+        [ mkPatternNote 0 root (max 1 (beats / 2 - 0.1)) 0.82
+        , mkPatternNote (max 0 (beats / 2)) support 0.6 0.70
+        , mkPatternNote (max 0 (beats - 0.75)) approach 0.55 0.68
         ]
       versePattern =
         [ mkPatternNote 0 root 0.75 0.84
-        , mkPatternNote 1.5 root 0.5 0.74
-        , mkPatternNote 2.5 fifth 0.5 0.72
-        , mkPatternNote 3.25 octave 0.5 0.70
+        , mkPatternNote 1.5 support 0.5 0.74
+        , mkPatternNote 2.5 root 0.5 0.72
+        , mkPatternNote (max 0 3.25) approach 0.45 0.70
         ]
       chorusPattern =
         [ mkPatternNote 0 root 0.5 0.88
-        , mkPatternNote 1 root 0.5 0.74
-        , mkPatternNote 2 fifth 0.5 0.80
-        , mkPatternNote 3 octave 0.5 0.84
+        , mkPatternNote 1 support 0.5 0.76
+        , mkPatternNote 2 upper 0.5 0.82
+        , mkPatternNote 3 approach 0.45 0.84
         ]
       bridgePattern =
         [ mkPatternNote 0 root 0.5 0.82
-        , mkPatternNote 1.0 fifth 0.5 0.74
-        , mkPatternNote 2.0 root 0.5 0.78
-        , mkPatternNote 3.0 octave 0.5 0.72
+        , mkPatternNote 1.0 support 0.5 0.74
+        , mkPatternNote 2.0 upper 0.5 0.78
+        , mkPatternNote 3.0 approach 0.45 0.72
         ]
   in if isIntroSectionName (ssName sectionSpec)
        then introPattern
@@ -1283,21 +1301,22 @@ arrangeElectronicBass targetMood sectionSpec barInPhrase =
 
 arrangeCinematicBass ∷ Maybe String → SectionSpec → Int → [PatternNote]
 arrangeCinematicBass targetMood sectionSpec barInPhrase =
-  let chord = chordForBar sectionSpec barInPhrase
-      descWords = arrangementDescriptorWords targetMood sectionSpec
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
       beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
-      root = midiFromPitchClass 2 (csRootClass chord)
-      fifth = midiFromPitchClass 2 ((csRootClass chord + 7) `mod` 12)
-      octave = midiFromPitchClass 3 (csRootClass chord)
+      root = bassRootMidi 2 sectionSpec barInPhrase
+      support = bassSupportMidi 2 sectionSpec barInPhrase
+      approach = bassApproachMidi 2 sectionSpec barInPhrase
+      upper = bassUpperMidi 3 sectionSpec barInPhrase
       sustained =
-        [ mkPatternNote 0 root (max 1 (beats - 0.1)) 0.70
-        , mkPatternNote (max 0 (beats - 1)) fifth 0.75 0.54
+        [ mkPatternNote 0 root (max 1 (beats / 2 - 0.1)) 0.70
+        , mkPatternNote (max 0 (beats / 2)) support 0.75 0.56
+        , mkPatternNote (max 0 (beats - 0.75)) approach 0.60 0.52
         ]
       pulse =
         [ mkPatternNote 0 root 0.9 0.78
-        , mkPatternNote 1.5 root 0.6 0.66
-        , mkPatternNote 2.5 fifth 0.6 0.62
-        , mkPatternNote 3.25 octave 0.5 0.60
+        , mkPatternNote 1.5 support 0.6 0.66
+        , mkPatternNote 2.5 upper 0.6 0.62
+        , mkPatternNote 3.25 approach 0.45 0.60
         ]
   in if isIntroSectionName (ssName sectionSpec) || isEndingSectionName (ssName sectionSpec) || hasAny descWords ["ambient", "calm", "sparse"]
        then sustained
@@ -1305,51 +1324,131 @@ arrangeCinematicBass targetMood sectionSpec barInPhrase =
 
 arrangeElectronicArp ∷ Maybe String → SectionSpec → Int → Int → [PatternNote]
 arrangeElectronicArp targetMood sectionSpec absoluteBarIx barInPhrase =
-  let chord = chordForBar sectionSpec barInPhrase
-      descWords = arrangementDescriptorWords targetMood sectionSpec
-      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
       step
         | hasAny descWords ["dramatic", "tense", "frantic", "dense"] = 0.5
         | otherwise = 1.0
-      slots = beatGrid step beats
-      voicing = chordVoicing 5 chord
-      voiceCount = max 1 (length voicing)
-      velocityAt ix =
-        if hasAny descWords ["intro", "ambient", "outro", "ending"]
-          then 0.28 + fromIntegral (ix `mod` 2) * 0.03
-          else 0.36 + fromIntegral (ix `mod` 3) * 0.04
-      keyAt ix =
-        let baseIx = (ix + absoluteBarIx) `mod` voiceCount
-        in voicing !! baseIx
+      sustain = min 0.75 step
+      baseVel
+        | hasAny descWords ["intro", "ambient", "outro", "ending"] = 0.28
+        | otherwise = 0.36
   in if isIntroSectionName (ssName sectionSpec)
        then []
        else
-         [ mkPatternNote beat (keyAt ix) (min 0.75 step) (velocityAt ix)
-         | (ix, beat) <- zip [0 :: Int ..] slots
+         [ mkPatternNote beat key sustain vel
+         | (beat, key, _dur, vel) <- harmonicSparklePattern 5 step sustain baseVel sectionSpec (absoluteBarIx + barInPhrase)
          ]
 
 arrangeCinematicOstinato ∷ Maybe String → SectionSpec → Int → Int → [PatternNote]
 arrangeCinematicOstinato targetMood sectionSpec absoluteBarIx barInPhrase =
-  let chord = chordForBar sectionSpec barInPhrase
-      descWords = arrangementDescriptorWords targetMood sectionSpec
-      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
       step
         | hasAny descWords ["dramatic", "intense", "combat", "driving"] = 0.5
         | otherwise = 1.0
-      slots = beatGrid step beats
-      voicing = chordVoicing 5 chord
-      voiceCount = max 1 (length voicing)
-      keyAt ix = voicing !! ((absoluteBarIx + ix * 2) `mod` voiceCount)
-      velAt ix =
-        if hasAny descWords ["ambient", "calm", "sparse", "intro", "ending"]
-          then 0.22 + fromIntegral (ix `mod` 2) * 0.03
-          else 0.34 + fromIntegral (ix `mod` 3) * 0.04
+      sustain = min 0.8 step
+      baseVel
+        | hasAny descWords ["ambient", "calm", "sparse", "intro", "ending"] = 0.22
+        | otherwise = 0.34
   in if isIntroSectionName (ssName sectionSpec) && not (hasAny descWords ["dramatic", "intense"])
        then []
        else
-         [ mkPatternNote beat (keyAt ix) (min 0.8 step) (velAt ix)
-         | (ix, beat) <- zip [0 :: Int ..] slots
+         [ mkPatternNote beat key sustain vel
+         | (beat, key, _dur, vel) <- harmonicSparklePattern 5 step sustain baseVel sectionSpec (absoluteBarIx + barInPhrase * 2)
          ]
+
+arrangeAmbientLead ∷ SectionSpec → Int → [PatternNote]
+arrangeAmbientLead sectionSpec barInPhrase =
+  let localNotes = melodyNotesForBar sectionSpec barInPhrase
+      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      topVoice =
+        case reverse (harmonicVoicingForBar 5 sectionSpec barInPhrase) of
+          key : _ -> key
+          [] -> midiFromPitchClass 5 0
+  in if null localNotes
+       then [mkPatternNote 0 topVoice (max 1 (beats - 0.25)) 0.26]
+       else [ note { pnDuration = max 0.9 (pnDuration note), pnVelocity = clamp01 (pnVelocity note * 0.72) } | note <- localNotes ]
+
+arrangeAmbientPad ∷ Maybe String → SectionSpec → Int → [PatternNote]
+arrangeAmbientPad targetMood sectionSpec barInPhrase =
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
+      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      voicing = harmonicVoicingForBar 4 sectionSpec barInPhrase
+      vel
+        | hasAny descWords ["dark", "tense", "dramatic"] = 0.34
+        | otherwise = 0.28
+  in [ mkPatternNote 0 key (max 1 (beats - 0.05)) vel | key <- voicing ]
+
+arrangeAmbientBass ∷ Maybe String → SectionSpec → Int → [PatternNote]
+arrangeAmbientBass targetMood sectionSpec barInPhrase =
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
+      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      root = bassRootMidi 2 sectionSpec barInPhrase
+      support = bassSupportMidi 2 sectionSpec barInPhrase
+      approach = bassApproachMidi 2 sectionSpec barInPhrase
+  in if hasAny descWords ["dramatic", "tense"]
+       then
+         [ mkPatternNote 0 root (max 1 (beats - 0.8)) 0.58
+         , mkPatternNote (max 0 (beats - 0.75)) approach 0.60 0.42
+         ]
+       else
+         [ mkPatternNote 0 root (max 1 (beats - 0.2)) 0.48
+         , mkPatternNote (max 0 (beats / 2)) support 0.8 0.34
+         ]
+
+arrangeAmbientShimmer ∷ Maybe String → SectionSpec → Int → Int → [PatternNote]
+arrangeAmbientShimmer targetMood sectionSpec absoluteBarIx barInPhrase =
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
+      step
+        | hasAny descWords ["dramatic", "tense", "rising"] = 1.0
+        | otherwise = 2.0
+      sustain = max 0.6 (min 1.8 step)
+      baseVel
+        | hasAny descWords ["dramatic", "tense"] = 0.24
+        | otherwise = 0.18
+  in [ mkPatternNote beat key sustain vel
+     | (beat, key, _dur, vel) <- harmonicSparklePattern 6 step sustain baseVel sectionSpec (absoluteBarIx + barInPhrase)
+     ]
+
+arrangeBlackmetalLead ∷ SectionSpec → Int → [PatternNote]
+arrangeBlackmetalLead sectionSpec barInPhrase =
+  let localNotes = melodyNotesForBar sectionSpec barInPhrase
+  in if null localNotes
+       then [ mkPatternNote beat key 0.22 vel | (beat, key, _dur, vel) <- harmonicSparklePattern 5 0.25 0.22 0.46 sectionSpec barInPhrase ]
+       else [ note { pnDuration = max 0.2 (min 0.5 (pnDuration note)), pnVelocity = clamp01 (pnVelocity note * 0.92) } | note <- localNotes ]
+
+arrangeBlackmetalPad ∷ Maybe String → SectionSpec → Int → [PatternNote]
+arrangeBlackmetalPad targetMood sectionSpec barInPhrase =
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
+      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      voicing = harmonicVoicingForBar 4 sectionSpec barInPhrase
+      vel
+        | hasAny descWords ["ambient", "sparse"] = 0.30
+        | otherwise = 0.42
+  in [ mkPatternNote 0 key (max 1 (beats - 0.08)) vel | key <- voicing ]
+
+arrangeBlackmetalBass ∷ Maybe String → SectionSpec → Int → [PatternNote]
+arrangeBlackmetalBass _targetMood sectionSpec barInPhrase =
+  let beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      root = bassRootMidi 2 sectionSpec barInPhrase
+      support = bassSupportMidi 2 sectionSpec barInPhrase
+      upper = bassUpperMidi 3 sectionSpec barInPhrase
+      approach = bassApproachMidi 2 sectionSpec barInPhrase
+      slots = takeWhile (< beats) [0, 0.5 ..]
+      keyAt ix
+        | ix == length slots - 1 = approach
+        | ix `mod` 4 == 0 = root
+        | ix `mod` 4 == 1 = support
+        | ix `mod` 4 == 2 = root
+        | otherwise = upper
+  in [ mkPatternNote beat (keyAt ix) 0.28 (0.64 + fromIntegral (ix `mod` 2) * 0.06)
+     | (ix, beat) <- zip [0 :: Int ..] slots
+     ]
+
+arrangeBlackmetalTremolo ∷ Maybe String → SectionSpec → Int → Int → [PatternNote]
+arrangeBlackmetalTremolo _targetMood sectionSpec absoluteBarIx barInPhrase =
+  [ mkPatternNote beat key 0.18 vel
+  | (beat, key, _dur, vel) <- harmonicSparklePattern 5 0.25 0.18 0.46 sectionSpec (absoluteBarIx * 2 + barInPhrase)
+  ]
 
 arrangeElectronicDrums ∷ Maybe String → SectionSpec → Int → Int → [PatternNote]
 arrangeElectronicDrums targetMood sectionSpec absoluteBarIx barInPhrase =
@@ -1497,6 +1596,112 @@ arrangeCinematicDrums targetMood sectionSpec absoluteBarIx barInPhrase =
         | isEndingSectionName (ssName sectionSpec) = endingNotes
         | isBridgeSectionName (ssName sectionSpec) = bridgeNotes
         | isChorusSectionName (ssName sectionSpec) || hasAny descWords ["dramatic", "intense", "combat"] = chorusNotes
+         | otherwise = verseNotes
+  in map (humanizeElectronicDrum absoluteBarIx) (filter (\note -> pnBeatOffset note < beats) baseNotes)
+
+arrangeAmbientDrums ∷ Maybe String → SectionSpec → Int → Int → [PatternNote]
+arrangeAmbientDrums targetMood sectionSpec absoluteBarIx barInPhrase =
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
+      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      barsPerPhrase = max 1 (ssBarsPerPhrase sectionSpec)
+      barProgress =
+        if barsPerPhrase <= 1
+          then 1
+          else fromIntegral barInPhrase / fromIntegral (barsPerPhrase - 1)
+      cym key beat dur vel = mkPatternNote beat key dur vel
+      tom key beat vel = mkPatternNote beat key 0.28 vel
+      introNotes =
+        [ cym 49 0 1.2 0.26
+        , cym 49 (max 0 (beats - 0.75)) 1.0 (0.24 + barProgress * 0.10)
+        ]
+          <> [ cym 46 beat 0.6 (0.16 + fromIntegral ix * 0.03)
+             | (ix, beat) <- zip [0 :: Int ..] (beatGrid 2.0 beats)
+             ]
+      verseNotes =
+        [ cym 51 beat 0.55 (0.20 + fromIntegral (ix `mod` 2) * 0.03)
+        | (ix, beat) <- zip [0 :: Int ..] (beatGrid 2.0 beats)
+        ]
+          <> [ tom 43 (beats - 1) 0.28 | hasAny descWords ["dramatic", "tense", "dark"] ]
+      chorusNotes =
+        [ cym 49 0 1.1 0.32
+        , cym 51 2.0 0.7 0.24
+        , tom 45 (max 0 (beats - 0.5)) 0.40
+        ]
+      endingNotes =
+        [ cym 49 0 1.4 0.24
+        , cym 46 (max 0 (beats - 1)) 0.8 0.18
+        ]
+      baseNotes
+        | isIntroSectionName (ssName sectionSpec) = introNotes
+        | isEndingSectionName (ssName sectionSpec) = endingNotes
+        | isChorusSectionName (ssName sectionSpec) || hasAny descWords ["dramatic", "tense", "combat"] = chorusNotes
+        | otherwise = verseNotes
+  in map (humanizeElectronicDrum absoluteBarIx) (filter (\note -> pnBeatOffset note < beats) baseNotes)
+
+arrangeBlackmetalDrums ∷ Maybe String → SectionSpec → Int → Int → [PatternNote]
+arrangeBlackmetalDrums targetMood sectionSpec absoluteBarIx _barInPhrase =
+  let descWords = arrangementDescriptorWords targetMood sectionSpec
+      beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      blastSlots = beatGrid 0.5 beats
+      tremSlots = beatGrid 0.25 beats
+      kick beat vel = mkPatternNote beat 36 0.22 vel
+      snare beat vel = mkPatternNote beat 38 0.18 vel
+      hat key beat dur vel = mkPatternNote beat key dur vel
+      crash beat dur vel = mkPatternNote beat 49 dur vel
+      tom key beat vel = mkPatternNote beat key 0.20 vel
+      introNotes =
+        [ crash 0 0.9 0.42
+        , snare (max 0 (beats - 0.5)) 0.74
+        ]
+          <> [ hat 46 beat 0.22 (0.22 + fromIntegral ix * 0.03)
+             | (ix, beat) <- zip [0 :: Int ..] blastSlots
+             ]
+      verseNotes =
+        [ kick beat (0.78 + fromIntegral (ix `mod` 2) * 0.06)
+        | (ix, beat) <- zip [0 :: Int ..] blastSlots
+        ]
+          <> [ snare beat (0.74 + fromIntegral (ix `mod` 2) * 0.05)
+             | (ix, beat) <- zip [0 :: Int ..] [0.5, 1.5 ..]
+             , beat < beats
+             ]
+          <> [ hat 51 beat 0.16 (0.38 + fromIntegral (ix `mod` 3) * 0.03)
+             | (ix, beat) <- zip [0 :: Int ..] tremSlots
+             ]
+      chorusNotes =
+        [ kick beat (0.84 + fromIntegral (ix `mod` 2) * 0.06)
+        | (ix, beat) <- zip [0 :: Int ..] blastSlots
+        ]
+          <> [ snare beat (0.82 + fromIntegral (ix `mod` 2) * 0.04)
+             | (ix, beat) <- zip [0 :: Int ..] [0.5, 1.5 ..]
+             , beat < beats
+             ]
+          <> [ hat 49 0 0.8 0.46
+             ]
+          <> [ hat 46 beat 0.14 (0.42 + fromIntegral (ix `mod` 4) * 0.03)
+             | (ix, beat) <- zip [0 :: Int ..] tremSlots
+             ]
+      bridgeNotes =
+        [ kick beat (0.76 + fromIntegral (ix `mod` 2) * 0.05)
+        | (ix, beat) <- zip [0 :: Int ..] blastSlots
+        ]
+          <> [ snare 1.5 0.76
+             , snare 3.0 0.82
+             , tom 45 2.5 0.58
+             , tom 47 3.0 0.54
+             ]
+          <> [ hat 51 beat 0.16 0.34
+             | beat <- beatGrid 0.5 beats
+             ]
+      endingNotes =
+        [ crash 0 1.0 0.40
+        , kick 0 0.72
+        , tom 43 (max 0 (beats - 0.5)) 0.50
+        ]
+      baseNotes
+        | isIntroSectionName (ssName sectionSpec) = introNotes
+        | isEndingSectionName (ssName sectionSpec) = endingNotes
+        | isBridgeSectionName (ssName sectionSpec) = bridgeNotes
+        | isChorusSectionName (ssName sectionSpec) || hasAny descWords ["intense", "aggressive", "combat", "dramatic"] = chorusNotes
         | otherwise = verseNotes
   in map (humanizeElectronicDrum absoluteBarIx) (filter (\note -> pnBeatOffset note < beats) baseNotes)
 
@@ -1524,6 +1729,9 @@ chordForBar sectionSpec barInPhrase =
     [] -> ChordSpec "C" 0 [0, 4, 7]
     chords -> chords !! (barInPhrase `mod` length chords)
 
+nextChordForBar ∷ SectionSpec → Int → ChordSpec
+nextChordForBar sectionSpec barInPhrase = chordForBar sectionSpec (barInPhrase + 1)
+
 melodyNotesForBar ∷ SectionSpec → Int → [PatternNote]
 melodyNotesForBar sectionSpec barInPhrase =
   let beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
@@ -1535,10 +1743,240 @@ melodyNotesForBar sectionSpec barInPhrase =
      , pnBeatOffset note < endBeat
      ]
 
+melodyAnchorForBar ∷ SectionSpec → Int → Maybe PatternNote
+melodyAnchorForBar sectionSpec barInPhrase =
+  case sortOn anchorRank (melodyNotesForBar sectionSpec barInPhrase) of
+    note : _ -> Just note
+    [] -> Nothing
+  where
+    beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+    isStrongBeat beat =
+      let roundedBeat = fromIntegral (round beat ∷ Int) ∷ Float
+      in abs (beat - roundedBeat) <= 0.08
+    anchorRank note =
+      let noteEnd = min beats (pnBeatOffset note + pnDuration note)
+          strongBeatPenalty = if isStrongBeat (pnBeatOffset note) then 0 ∷ Int else 1
+          durationRank = negate (round (pnDuration note * 100) ∷ Int)
+          velocityRank = negate (round (pnVelocity note * 100) ∷ Int)
+          endRank = negate (round (noteEnd * 100) ∷ Int)
+      in (strongBeatPenalty, durationRank, velocityRank, endRank)
+
+melodyAnchorPitchClassForBar ∷ SectionSpec → Int → Maybe Int
+melodyAnchorPitchClassForBar sectionSpec barInPhrase =
+  (`mod` 12) . patternNoteKeyInt <$> melodyAnchorForBar sectionSpec barInPhrase
+
+harmonicAccentPitchClassForBar ∷ SectionSpec → Int → ChordSpec → Int
+harmonicAccentPitchClassForBar sectionSpec barInPhrase chord =
+  fromMaybe
+    (chordColorPitchClass chord)
+    (melodyAnchorPitchClassForBar sectionSpec barInPhrase)
+
 chordVoicing ∷ Int → ChordSpec → [Int]
 chordVoicing octave chord =
   let root = midiFromPitchClass octave (csRootClass chord)
   in root : [ root + interval | interval <- drop 1 (csIntervals chord) ]
+
+chordPitchClasses ∷ ChordSpec → [Int]
+chordPitchClasses chord =
+  nub [ (csRootClass chord + (interval `mod` 12)) `mod` 12 | interval <- csIntervals chord ]
+
+chordThirdPitchClass ∷ ChordSpec → Int
+chordThirdPitchClass chord =
+  let pcs = chordPitchClasses chord
+      rootPc = csRootClass chord
+      preferred =
+        filter (`elem` pcs)
+          [ (rootPc + 3) `mod` 12
+          , (rootPc + 4) `mod` 12
+          , (rootPc + 5) `mod` 12
+          , (rootPc + 2) `mod` 12
+          ]
+  in case preferred of
+       pc : _ -> pc
+       [] -> rootPc
+
+chordFifthPitchClass ∷ ChordSpec → Int
+chordFifthPitchClass chord =
+  let pcs = chordPitchClasses chord
+      rootPc = csRootClass chord
+      preferred =
+        filter (`elem` pcs)
+          [ (rootPc + 7) `mod` 12
+          , (rootPc + 6) `mod` 12
+          , (rootPc + 8) `mod` 12
+          ]
+  in case preferred of
+       pc : _ -> pc
+       [] -> chordThirdPitchClass chord
+
+chordColorPitchClass ∷ ChordSpec → Int
+chordColorPitchClass chord =
+  let pcs = chordPitchClasses chord
+      rootPc = csRootClass chord
+      preferred =
+        filter (`elem` pcs)
+          [ (rootPc + 10) `mod` 12
+          , (rootPc + 11) `mod` 12
+          , (rootPc + 2) `mod` 12
+          , (rootPc + 9) `mod` 12
+          ]
+  in case preferred of
+       pc : _ -> pc
+       [] -> chordThirdPitchClass chord
+
+padPitchClasses ∷ ChordSpec → [Int]
+padPitchClasses chord =
+  let rootPc = csRootClass chord
+      thirdPc = chordThirdPitchClass chord
+      fifthPc = chordFifthPitchClass chord
+      colorPc = chordColorPitchClass chord
+      pcs = nub [rootPc, thirdPc, fifthPc, colorPc]
+  in case pcs of
+       [a, b, c] -> [a, b, c, a]
+       [a, b] -> [a, b, a, b]
+       [a] -> [a, a, a, a]
+       xs -> take 4 xs
+
+padPitchClassesForBar ∷ SectionSpec → Int → ChordSpec → [Int]
+padPitchClassesForBar sectionSpec barInPhrase chord =
+  case melodyAnchorPitchClassForBar sectionSpec barInPhrase of
+    Nothing -> padPitchClasses chord
+    Just anchorPc ->
+      let rootPc = csRootClass chord
+          supportPcs =
+            nub
+              ( rootPc
+                  : filter
+                      (\pc -> pc /= rootPc && pc /= anchorPc)
+                      [ chordThirdPitchClass chord
+                      , chordFifthPitchClass chord
+                      , chordColorPitchClass chord
+                      ]
+              )
+          body = take 3 supportPcs
+          fillPc =
+            case reverse body of
+              pc : _ -> pc
+              [] -> rootPc
+      in take 4 (body <> [anchorPc] <> repeat fillPc)
+
+pitchClassMidiAtOrAbove ∷ Int → Int → Int
+pitchClassMidiAtOrAbove lower pitchClass =
+  case [n | n <- [lower .. lower + 24], n `mod` 12 == pitchClass `mod` 12] of
+    n : _ -> n
+    [] -> lower
+
+basePitchClassVoicing ∷ Int → [Int] → [Int]
+basePitchClassVoicing octave pitchClasses =
+  case pitchClasses of
+    pc0 : pc1 : pc2 : pc3 : _ ->
+      let root0 = pitchClassMidiAtOrAbove (midiFromPitchClass octave pc0) pc0
+          note1 = pitchClassMidiAtOrAbove (root0 + 3) pc1
+          note2 = pitchClassMidiAtOrAbove (note1 + 3) pc2
+          note3 = pitchClassMidiAtOrAbove (note2 + 2) pc3
+      in [root0, note1, note2, note3]
+    _ ->
+      let root0 = midiFromPitchClass octave 0
+      in [root0, root0 + 4, root0 + 7, root0 + 12]
+
+baseChordVoicing ∷ Int → ChordSpec → [Int]
+baseChordVoicing octave chord = basePitchClassVoicing octave (padPitchClasses chord)
+
+rotateVoicingUp ∷ [Int] → [Int]
+rotateVoicingUp [] = []
+rotateVoicingUp (x : xs) = xs <> [x + 12]
+
+candidateChordVoicingsForBar ∷ Int → SectionSpec → Int → [[Int]]
+candidateChordVoicingsForBar octave sectionSpec barInPhrase =
+  let chord = chordForBar sectionSpec barInPhrase
+      baseVoicing = basePitchClassVoicing octave (padPitchClassesForBar sectionSpec barInPhrase chord)
+  in take 4 (iterate rotateVoicingUp baseVoicing)
+
+voicingDistance ∷ [Int] → [Int] → Int
+voicingDistance left right = sum (zipWith (\a b -> abs (a - b)) left right)
+
+harmonicVoicingForBar ∷ Int → SectionSpec → Int → [Int]
+harmonicVoicingForBar octave sectionSpec barInPhrase =
+  let candidatesFor ix = candidateChordVoicingsForBar octave sectionSpec ix
+      choose ix prevVoicing candidates =
+        case sortOn (scoreFor ix prevVoicing) candidates of
+          voicing : _ -> voicing
+          [] -> baseChordVoicing octave (chordForBar sectionSpec barInPhrase)
+        where
+          scoreFor barIx previousVoicing voicing =
+            let voiceLeadingScore =
+                  case previousVoicing of
+                    [] -> sum (map (\n -> abs (n - midiFromPitchClass octave 0)) voicing)
+                    _ -> voicingDistance previousVoicing voicing
+                melodyScore =
+                  case melodyAnchorForBar sectionSpec barIx of
+                    Nothing -> 0
+                    Just note ->
+                      let anchorKey = patternNoteKeyInt note
+                          anchorPc = anchorKey `mod` 12
+                          topVoice =
+                            case reverse voicing of
+                              key : _ -> key
+                              [] -> midiFromPitchClass octave (csRootClass (chordForBar sectionSpec barIx))
+                          pitchClassPenalty = if topVoice `mod` 12 == anchorPc then 0 else 18
+                          overlapPenalty = if topVoice >= anchorKey then 10 else 0
+                          spacingPenalty = abs ((anchorKey - topVoice) - 7)
+                      in pitchClassPenalty + overlapPenalty + spacingPenalty
+            in voiceLeadingScore + melodyScore
+  in foldl
+       (\prev ix -> choose ix prev (candidatesFor ix))
+       []
+       [0 .. max 0 barInPhrase]
+
+bassRootMidi ∷ Int → SectionSpec → Int → Int
+bassRootMidi octave sectionSpec barInPhrase =
+  midiFromPitchClass octave (csRootClass (chordForBar sectionSpec barInPhrase))
+
+bassSupportMidi ∷ Int → SectionSpec → Int → Int
+bassSupportMidi octave sectionSpec barInPhrase =
+  let chord = chordForBar sectionSpec barInPhrase
+      thirdPc = chordThirdPitchClass chord
+      fifthPc = chordFifthPitchClass chord
+      rootPc = csRootClass chord
+      rootMidi = bassRootMidi octave sectionSpec barInPhrase
+      supportPc =
+        if thirdPc == rootPc
+          then fifthPc
+          else thirdPc
+  in pitchClassMidiAtOrAbove (rootMidi + 2) supportPc
+
+bassUpperMidi ∷ Int → SectionSpec → Int → Int
+bassUpperMidi octave sectionSpec barInPhrase =
+  let supportMidi = bassSupportMidi octave sectionSpec barInPhrase
+      chord = chordForBar sectionSpec barInPhrase
+      accentPc = harmonicAccentPitchClassForBar sectionSpec barInPhrase chord
+  in pitchClassMidiAtOrAbove (supportMidi + 2) accentPc
+
+bassApproachMidi ∷ Int → SectionSpec → Int → Int
+bassApproachMidi octave sectionSpec barInPhrase =
+  let currentRoot = bassRootMidi octave sectionSpec barInPhrase
+      nextRoot = midiFromPitchClass octave (csRootClass (nextChordForBar sectionSpec barInPhrase))
+      candidates = [nextRoot - 2, nextRoot - 1, nextRoot + 1, nextRoot + 2, nextRoot]
+  in case sortOn (\note -> (abs (note - currentRoot), abs (note - nextRoot))) candidates of
+       note : _ -> note
+       [] -> nextRoot
+
+harmonicSparklePattern ∷ Int → Float → Float → Float → SectionSpec → Int → [(Float, Int, Float, Float)]
+harmonicSparklePattern octave step sustain baseVelocity sectionSpec patternSeed =
+  let beats = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
+      slots = beatGrid step beats
+      barInPhrase = patternSeed `mod` max 1 (ssBarsPerPhrase sectionSpec)
+      voicing = harmonicVoicingForBar octave sectionSpec barInPhrase
+      voiceCount = max 1 (length voicing)
+      approach = bassApproachMidi octave sectionSpec barInPhrase
+      keyAt ix =
+        if ix == length slots - 1 && step <= 0.75
+          then approach + 12
+          else voicing !! ((ix + patternSeed) `mod` voiceCount)
+      velAt ix = clamp01 (baseVelocity + fromIntegral (ix `mod` 3) * 0.04)
+  in [ (beat, keyAt ix, sustain, velAt ix)
+     | (ix, beat) <- zip [0 :: Int ..] slots
+     ]
 
 midiFromPitchClass ∷ Int → Int → Int
 midiFromPitchClass octave pitchClass = 12 * (octave + 1) + pitchClass
@@ -2153,6 +2591,22 @@ arrangeGeneratedInstruments genre sections
         , generatedInstrument "arp" 81 0.46 0.12 0.18 Nothing
         , generatedInstrument "lead" 80 0.86 (-0.05) 0.12 Nothing
         ]
+  | normalizeName genre == "ambient" =
+      pure
+        [ generatedInstrument "drums" 9 0.76 0 0.24 (Just (FillGeneratorSpec 0.30 0.24 1.0))
+        , generatedInstrument "bass" 39 0.54 0 0.10 Nothing
+        , generatedInstrument "pad" 94 0.68 0 0.04 Nothing
+        , generatedInstrument "arp" 98 0.32 0.10 0.06 Nothing
+        , generatedInstrument "lead" 88 0.38 0 0.04 Nothing
+        ]
+  | normalizeName genre == "blackmetal" =
+      pure
+        [ generatedInstrument "drums" 9 1.0 0 0.58 (Just (FillGeneratorSpec 0.78 0.84 2.0))
+        , generatedInstrument "bass" 34 0.92 0 0.18 Nothing
+        , generatedInstrument "pad" 48 0.58 0 0.08 Nothing
+        , generatedInstrument "arp" 30 0.84 (-0.08) 0.14 Nothing
+        , generatedInstrument "lead" 31 0.90 0.08 0.12 Nothing
+        ]
   | normalizeName genre == "cinematic" =
       pure
         [ generatedInstrument "drums" 9 0.96 0 0.38 (Just (FillGeneratorSpec 0.48 0.54 1.5))
@@ -2161,7 +2615,7 @@ arrangeGeneratedInstruments genre sections
         , generatedInstrument "arp" 48 0.44 0.08 0.10 Nothing
         , generatedInstrument "lead" 61 0.78 0 0.08 Nothing
         ]
-  | otherwise = Left ("unsupported song.genre: " <> genre <> " (expected electronic|cinematic)")
+  | otherwise = Left ("unsupported song.genre: " <> genre <> " (expected electronic|ambient|blackmetal|cinematic)")
   where
     sectionNeedsArrangement spec =
       not (null (ssChordBars spec)) || not (null (ssMelodyPhrase spec))
@@ -2180,7 +2634,7 @@ arrangeGeneratedInstruments genre sections
 isSupportedGenre ∷ String → Bool
 isSupportedGenre genre =
   let g = normalizeName genre
-  in g == "electronic" || g == "cinematic"
+  in g == "electronic" || g == "ambient" || g == "blackmetal" || g == "cinematic"
 
 parsePatternNotes ∷ String → String → Either String [PatternNote]
 parsePatternNotes _sectionName rawPattern =
