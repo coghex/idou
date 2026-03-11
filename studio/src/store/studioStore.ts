@@ -4,7 +4,9 @@ import { createDefaultSong, normalizeSectionName } from '../lib/song';
 
 type PlaybackSnapshot = {
   running: boolean;
+  transportState: 'stopped' | 'playing' | 'paused';
   stagedPath: string | null;
+  loopSectionName: string | null;
   logLines: string[];
 };
 
@@ -86,7 +88,9 @@ function initialState(): Omit<
     selectedNoteId: null,
     playback: {
       running: false,
+      transportState: 'stopped',
       stagedPath: null,
+      loopSectionName: null,
       logLines: [],
     },
     statusMessage: 'Ready.',

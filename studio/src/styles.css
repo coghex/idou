@@ -254,6 +254,51 @@ p {
   padding-top: 1rem;
 }
 
+.generated-strip {
+  margin-top: 1rem;
+  border-top: 1px solid #1e293b;
+  padding-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.8rem;
+}
+
+.legend-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.6rem;
+  border-radius: 999px;
+  background: #0b1220;
+  border: 1px solid #334155;
+  color: #cbd5e1;
+  font-size: 0.88rem;
+}
+
+.legend-dot {
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.layer-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  color: #cbd5e1;
+}
+
+.validation-inline {
+  color: #fca5a5;
+}
+
 .log-panel {
   min-height: 220px;
   max-height: 320px;

@@ -3,18 +3,28 @@ import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { MelodyNote } from '../lib/song';
 import { clamp, quantizeBeat } from '../lib/note';
 
-const MIN_MIDI = 48;
-const MAX_MIDI = 84;
+const MIN_MIDI = 36;
+const MAX_MIDI = 96;
 const BEAT_WIDTH = 40;
 const ROW_HEIGHT = 18;
 const HEADER_WIDTH = 48;
 const GRID_PADDING = 8;
 const HANDLE_WIDTH = 8;
 
+export type OverlayNote = {
+  id: string;
+  beat: number;
+  note: number;
+  duration: number;
+  color: string;
+  accentColor?: string;
+};
+
 type Props = {
   beatsPerBar: number;
   totalBeats: number;
   notes: MelodyNote[];
+  overlayNotes?: OverlayNote[];
   selectedNoteId: string | null;
   onSelectNote: (noteId: string | null) => void;
   onUpsertNote: (note: MelodyNote) => void;
@@ -37,7 +47,7 @@ type DragState =
     }
   | null;
 
-function noteRect(note: MelodyNote) {
+function noteRect(note: Pick<MelodyNote, 'beat' | 'note' | 'duration'>) {
   return {
     x: HEADER_WIDTH + GRID_PADDING + note.beat * BEAT_WIDTH,
     y: GRID_PADDING + (MAX_MIDI - note.note) * ROW_HEIGHT,
@@ -58,7 +68,7 @@ function pointerToMidi(clientY: number, bounds: DOMRect): number {
 }
 
 export default function MelodyGrid(props: Props) {
-  const { beatsPerBar, totalBeats, notes, selectedNoteId, onSelectNote, onUpsertNote } = props;
+  const { beatsPerBar, totalBeats, notes, overlayNotes = [], selectedNoteId, onSelectNote, onUpsertNote } = props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<DragState>(null);
@@ -119,6 +129,15 @@ export default function MelodyGrid(props: Props) {
       ctx.fillText(`Bar ${bar + 1}`, x, 14);
     }
 
+    overlayNotes.forEach((note) => {
+      const rect = noteRect(note);
+      ctx.fillStyle = note.color;
+      ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+      ctx.strokeStyle = note.accentColor ?? note.color;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);
+    });
+
     notes.forEach((note) => {
       const rect = noteRect(note);
       const selected = note.id === selectedNoteId;
@@ -130,7 +149,7 @@ export default function MelodyGrid(props: Props) {
       ctx.lineWidth = 1.5;
       ctx.strokeRect(rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);
     });
-  }, [beatsPerBar, height, notes, selectedNoteId, totalBeats, width]);
+  }, [beatsPerBar, height, notes, overlayNotes, selectedNoteId, totalBeats, width]);
 
   useEffect(() => {
     const host = hostRef.current;

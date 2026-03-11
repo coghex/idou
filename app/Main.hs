@@ -1,4 +1,4 @@
-{-# LANGUAGE Strict, UnicodeSyntax #-}
+{-# LANGUAGE OverloadedStrings, Strict, UnicodeSyntax #-}
 
 module Main where
 
@@ -6,53 +6,81 @@ import Control.Concurrent (forkIO, threadDelay)
 import Control.Exception (bracket)
 import Control.Monad (forM_)
 import Data.Char (isSpace, toLower)
-import Data.List (isSuffixOf, stripPrefix)
+import Data.List (isSuffixOf, nub, stripPrefix)
+import Data.Word (Word64)
 import System.Environment (getArgs)
-import System.Exit (exitSuccess)
+import System.Exit (exitFailure, exitSuccess)
 import System.IO
+
+import qualified Data.Aeson as Aeson
+import qualified Data.ByteString.Lazy.Char8 as BL
+import qualified Data.Map.Strict as M
 
 import Audio.Config (audioConfigPath, loadAudioConfig)
 import Audio.Patch (defaultMidiProgram, gmChannelInstrument)
 import Audio.Thread
 import Audio.Types
 import Player.Thread
+import Player.Timeline
+  ( InstrumentPatternSpec(..)
+  , SectionSpec(..)
+  , SongSpec(..)
+  , TimelineBar(..)
+  , TimelineNote(..)
+  , compileTimelineBars
+  , cueSectionOrder
+  , loadSongSpec
+  )
 
 import Midi.Play (playMidiFile, defaultChannelMap)
+
+data CliMode
+  = CliPlay !AudioHealthVerbosity !FilePath
+  | CliDumpTimeline !FilePath
 
 main ∷ IO ()
 main = do
   args <- getArgs
   case parseCliArgs args of
-    Right (healthVerbosity, inputPath) -> do
-      audioCfg <- loadAudioConfig audioConfigPath
-      bracket (startAudioSystem audioCfg healthVerbosity) stopAudioSystem $ \sys -> do
-        bracket (startPlayerThread sys) stopPlayerThread $ \player -> do
-          -- Preload instruments 0..15 (MIDI channels) with the same patch for now.
-          preloadChannels sys
-          runInputMode sys player inputPath
+    Right cliMode ->
+      case cliMode of
+        CliPlay healthVerbosity inputPath -> do
+          audioCfg <- loadAudioConfig audioConfigPath
+          bracket (startAudioSystem audioCfg healthVerbosity) stopAudioSystem $ \sys -> do
+            bracket (startPlayerThread sys) stopPlayerThread $ \player -> do
+              -- Preload instruments 0..15 (MIDI channels) with the same patch for now.
+              preloadChannels sys
+              runInputMode sys player inputPath
+        CliDumpTimeline inputPath ->
+          dumpTimelineJson inputPath
     Left usage -> do
       putStrLn usage
       exitSuccess
 
 --------------------------------------------------------------------------------
 
-parseCliArgs ∷ [String] → Either String (AudioHealthVerbosity, FilePath)
-parseCliArgs = go AudioHealthNormal Nothing
+parseCliArgs ∷ [String] → Either String CliMode
+parseCliArgs = go AudioHealthNormal False Nothing
   where
-    go verbosity inputPath [] =
-      case inputPath of
-        Just p -> Right (verbosity, p)
-        Nothing -> Left usageText
-    go verbosity inputPath (arg : rest) =
+    go verbosity dumpTimeline inputPath [] =
+      case (dumpTimeline, inputPath) of
+        (False, Just p) -> Right (CliPlay verbosity p)
+        (True, Just p) -> Right (CliDumpTimeline p)
+        _ -> Left usageText
+    go verbosity dumpTimeline inputPath (arg : rest) =
       case arg of
+        "--dump-timeline-json" ->
+          if dumpTimeline
+            then Left usageText
+            else go verbosity True inputPath rest
         "--audio-health" ->
-          go AudioHealthNormal inputPath rest
+          go AudioHealthNormal dumpTimeline inputPath rest
         "--audio-health=off" ->
-          go AudioHealthOff inputPath rest
+          go AudioHealthOff dumpTimeline inputPath rest
         "--audio-health=normal" ->
-          go AudioHealthNormal inputPath rest
+          go AudioHealthNormal dumpTimeline inputPath rest
         "--audio-health=verbose" ->
-          go AudioHealthVerbose inputPath rest
+          go AudioHealthVerbose dumpTimeline inputPath rest
         _ ->
           case stripPrefix "--audio-health=" arg of
             Just _ ->
@@ -62,15 +90,120 @@ parseCliArgs = go AudioHealthNormal Nothing
                 then Left ("Unknown option " <> arg <> "\n" <> usageText)
                 else
                   case inputPath of
-                    Nothing -> go verbosity (Just arg) rest
+                    Nothing -> go verbosity dumpTimeline (Just arg) rest
                     Just _ -> Left usageText
 
 usageText ∷ String
 usageText =
   unlines
     [ "usage: idou [--audio-health|--audio-health=off|--audio-health=normal|--audio-health=verbose] <file.mid|file.midi|file.wav|song.yaml>"
+    , "   or: idou --dump-timeline-json <song.yaml>"
     , "  --audio-health defaults to normal and reports runtime health on anomalies."
     ]
+
+dumpTimelineJson ∷ FilePath → IO ()
+dumpTimelineJson inputPath = do
+  loaded <- loadSongSpec inputPath
+  case loaded of
+    Left err -> do
+      hPutStrLn stderr err
+      exitFailure
+    Right spec ->
+      BL.putStrLn (Aeson.encode (timelinePreviewValue spec))
+
+timelinePreviewValue ∷ SongSpec → Aeson.Value
+timelinePreviewValue spec =
+  let
+    bars = compileTimelineBars 48000 spec
+    sectionOrder = nub (cueSectionOrder spec <> M.keys (sgSections spec))
+    instrumentNameMap =
+      M.fromList
+        [ let InstrumentId iid = ipInstrumentId inst
+          in (iid, ipName inst)
+        | inst <- sgInstruments spec
+        ]
+  in
+    Aeson.object
+      [ "sections"
+          Aeson..=
+            [ previewSectionValue instrumentNameMap spec bars sectionName
+            | sectionName <- sectionOrder
+            , M.member sectionName (sgSections spec)
+            ]
+      ]
+
+previewSectionValue
+  ∷ M.Map Int String
+  → SongSpec
+  → [TimelineBar]
+  → String
+  → Aeson.Value
+previewSectionValue instrumentNameMap spec bars sectionName =
+  let
+    sectionSpec = sgSections spec M.! sectionName
+    sectionBars = filter ((== sectionName) . tbSectionName) bars
+    totalBeats =
+      fromIntegral (ssBarsPerPhrase sectionSpec * ssPhraseCount sectionSpec * ssBeatsPerBar sectionSpec) ∷ Double
+  in
+    Aeson.object
+      [ "name" Aeson..= sectionName
+      , "beatsPerBar" Aeson..= ssBeatsPerBar sectionSpec
+      , "totalBeats" Aeson..= totalBeats
+      , "notes"
+          Aeson..=
+            concatMap
+              (previewBarNotes instrumentNameMap sectionSpec)
+              sectionBars
+      ]
+
+previewBarNotes
+  ∷ M.Map Int String
+  → SectionSpec
+  → TimelineBar
+  → [Aeson.Value]
+previewBarNotes instrumentNameMap sectionSpec bar =
+  let
+    barIx = tbPhraseIx bar * ssBarsPerPhrase sectionSpec + tbBarInPhrase bar
+    beatsPerBar = tbBeatsPerBar bar
+    baseBeat = fromIntegral (barIx * beatsPerBar) ∷ Double
+    framesPerBar = max 1 (tbLengthFrames bar)
+    framesToBeats frames =
+      (fromIntegral frames ∷ Double) * fromIntegral beatsPerBar / fromIntegral framesPerBar
+  in
+    map
+      (previewNoteValue instrumentNameMap barIx baseBeat framesToBeats)
+      (tbNotes bar)
+
+previewNoteValue
+  ∷ M.Map Int String
+  → Int
+  → Double
+  → (Word64 → Double)
+  → TimelineNote
+  → Aeson.Value
+previewNoteValue instrumentNameMap barIx baseBeat framesToBeats note =
+  let
+    InstrumentId iid = tnInstrumentId note
+    NoteKey key = tnKey note
+    onFrames = tnOnOffsetFrames note
+    offFrames = tnOffOffsetFrames note
+    durationFrames =
+      if offFrames >= onFrames
+        then offFrames - onFrames
+        else 0
+    instrumentName = M.findWithDefault ("instrument-" <> show iid) iid instrumentNameMap
+  in
+    Aeson.object
+      [ "instrumentId" Aeson..= iid
+      , "instrumentName" Aeson..= instrumentName
+      , "key" Aeson..= key
+      , "velocity" Aeson..= tnVelocity note
+      , "amp" Aeson..= tnAmp note
+      , "pan" Aeson..= tnPan note
+      , "barIndex" Aeson..= barIx
+      , "startBeat" Aeson..= (baseBeat + framesToBeats onFrames)
+      , "durationBeats" Aeson..= framesToBeats durationFrames
+      ]
 
 runInputMode ∷ AudioSystem → PlayerSystem → FilePath → IO ()
 runInputMode sys player inputPath

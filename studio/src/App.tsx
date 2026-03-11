@@ -1,10 +1,17 @@
-import { useEffect, useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import CodeMirror from '@uiw/react-codemirror';
 import { yaml as yamlLanguage } from '@codemirror/lang-yaml';
 import { invoke } from '@tauri-apps/api/core';
-import MelodyGrid from './components/MelodyGrid';
+import MelodyGrid, { type OverlayNote } from './components/MelodyGrid';
 import { midiToNoteName, noteNameToMidi } from './lib/note';
-import { normalizeSectionName, parseSongText, sectionTotalBeats, serializeSong, validateSong } from './lib/song';
+import {
+  buildSectionLoopDocument,
+  normalizeSectionName,
+  parseSongText,
+  sectionTotalBeats,
+  serializeSong,
+  validateSong,
+} from './lib/song';
 import type { MelodyNote, SongSection } from './lib/song';
 import { useStudioStore } from './store/studioStore';
 
@@ -19,9 +26,95 @@ type SaveSongResponse = {
 
 type PlaybackSnapshot = {
   running: boolean;
+  transportState: 'stopped' | 'playing' | 'paused';
   stagedPath: string | null;
+  loopSectionName: string | null;
   logLines: string[];
 };
+
+type TimelinePreview = {
+  sections: TimelinePreviewSection[];
+};
+
+type TimelinePreviewSection = {
+  name: string;
+  beatsPerBar: number;
+  totalBeats: number;
+  notes: TimelinePreviewNote[];
+};
+
+type TimelinePreviewNote = {
+  instrumentId: number;
+  instrumentName: string;
+  key: number;
+  velocity: number;
+  amp: number;
+  pan: number;
+  barIndex: number;
+  startBeat: number;
+  durationBeats: number;
+};
+
+const INSTRUMENT_COLORS: Record<string, string> = {
+  drums: 'rgba(168, 85, 247, 0.26)',
+  bass: 'rgba(34, 197, 94, 0.26)',
+  pad: 'rgba(59, 130, 246, 0.23)',
+  arp: 'rgba(236, 72, 153, 0.24)',
+  lead: 'rgba(249, 115, 22, 0.25)',
+  'auto-drums': 'rgba(168, 85, 247, 0.26)',
+};
+
+const INSTRUMENT_ACCENTS: Record<string, string> = {
+  drums: 'rgba(196, 181, 253, 0.82)',
+  bass: 'rgba(134, 239, 172, 0.82)',
+  pad: 'rgba(147, 197, 253, 0.82)',
+  arp: 'rgba(249, 168, 212, 0.82)',
+  lead: 'rgba(253, 186, 116, 0.82)',
+  'auto-drums': 'rgba(196, 181, 253, 0.82)',
+};
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  return Boolean(target.closest('input, textarea, select, button, .cm-editor')) || target.isContentEditable;
+}
+
+function fallbackInstrumentColor(name: string): string {
+  const palette = [
+    'rgba(14, 165, 233, 0.22)',
+    'rgba(99, 102, 241, 0.22)',
+    'rgba(234, 88, 12, 0.22)',
+    'rgba(16, 185, 129, 0.22)',
+    'rgba(244, 63, 94, 0.22)',
+  ];
+  let hash = 0;
+  for (const char of name) {
+    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  }
+  return palette[hash % palette.length];
+}
+
+function instrumentColor(name: string): string {
+  return INSTRUMENT_COLORS[name] ?? fallbackInstrumentColor(name);
+}
+
+function instrumentAccent(name: string): string {
+  return INSTRUMENT_ACCENTS[name] ?? 'rgba(226, 232, 240, 0.72)';
+}
+
+function transportLabel(playback: PlaybackSnapshot): string {
+  if (!playback.running) {
+    return 'Engine preview idle';
+  }
+  if (playback.transportState === 'playing') {
+    return playback.loopSectionName ? `Looping section ${playback.loopSectionName}` : 'Playing song preview';
+  }
+  if (playback.transportState === 'paused') {
+    return 'Preview paused';
+  }
+  return 'Preview loaded';
+}
 
 function App() {
   const document = useStudioStore((state) => state.document);
@@ -29,7 +122,7 @@ function App() {
   const dirty = useStudioStore((state) => state.dirty);
   const selectedSectionName = useStudioStore((state) => state.selectedSectionName);
   const selectedNoteId = useStudioStore((state) => state.selectedNoteId);
-  const playback = useStudioStore((state) => state.playback);
+  const playback = useStudioStore((state) => state.playback) as PlaybackSnapshot;
   const statusMessage = useStudioStore((state) => state.statusMessage);
   const loadDocument = useStudioStore((state) => state.loadDocument);
   const newDocument = useStudioStore((state) => state.newDocument);
@@ -47,11 +140,22 @@ function App() {
   const removeNote = useStudioStore((state) => state.removeNote);
   const setPlayback = useStudioStore((state) => state.setPlayback);
 
+  const [timelinePreview, setTimelinePreview] = useState<TimelinePreview>({ sections: [] });
+  const [accompanimentLoading, setAccompanimentLoading] = useState(false);
+  const [accompanimentDirty, setAccompanimentDirty] = useState(true);
+  const [accompanimentError, setAccompanimentError] = useState<string | null>(null);
+
   const selectedSection =
     document.sections.find((section) => section.name === selectedSectionName) ?? document.sections[0] ?? null;
   const selectedNote = selectedSection?.melody.find((note) => note.id === selectedNoteId) ?? null;
   const yamlPreview = useMemo(() => serializeSong(document), [document]);
   const validationIssues = useMemo(() => validateSong(document), [document]);
+  const selectedTimelineSection =
+    timelinePreview.sections.find((section) => section.name === selectedSection?.name) ?? null;
+
+  useEffect(() => {
+    setAccompanimentDirty(true);
+  }, [yamlPreview]);
 
   useEffect(() => {
     const timer = window.setInterval(async () => {
@@ -66,6 +170,28 @@ function App() {
     return () => window.clearInterval(timer);
   }, [setPlayback]);
 
+  const refreshAccompaniment = useCallback(
+    async (contents = yamlPreview, suggestedName = selectedSection?.name ?? 'preview') => {
+      try {
+        setAccompanimentLoading(true);
+        setAccompanimentError(null);
+        const preview = await invoke<TimelinePreview>('dump_song_timeline', {
+          request: {
+            contents,
+            suggestedName,
+          },
+        });
+        setTimelinePreview(preview);
+        setAccompanimentDirty(false);
+      } catch (error) {
+        setAccompanimentError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setAccompanimentLoading(false);
+      }
+    },
+    [selectedSection?.name, yamlPreview],
+  );
+
   async function openSong() {
     try {
       const payload = await invoke<FilePayload | null>('open_song_file');
@@ -74,6 +200,9 @@ function App() {
       }
       const parsed = parseSongText(payload.contents);
       loadDocument(parsed, payload.path);
+      setTimelinePreview({ sections: [] });
+      setAccompanimentError(null);
+      setAccompanimentDirty(true);
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : String(error));
     }
@@ -98,22 +227,56 @@ function App() {
     }
   }
 
-  async function playPreview() {
+  const playPreview = useCallback(
+    async (loopSelectedSection: boolean) => {
+      const previewDocument =
+        loopSelectedSection && selectedSection ? buildSectionLoopDocument(document, selectedSection.name) : document;
+      const previewText = serializeSong(previewDocument);
+      const suggestedName = loopSelectedSection && selectedSection ? selectedSection.name : selectedSection?.name ?? 'preview';
+
+      try {
+        const snapshot = await invoke<PlaybackSnapshot>('play_song_preview', {
+          request: {
+            contents: previewText,
+            suggestedName,
+            loopSectionName: loopSelectedSection && selectedSection ? selectedSection.name : null,
+          },
+        });
+        setPlayback(snapshot);
+        void refreshAccompaniment(previewText, suggestedName);
+        setStatusMessage(
+          loopSelectedSection && selectedSection
+            ? `Looping section ${selectedSection.name}.`
+            : 'Started preview playback through the headless Idou engine.',
+        );
+      } catch (error) {
+        setStatusMessage(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [document, refreshAccompaniment, selectedSection, setPlayback, setStatusMessage],
+  );
+
+  const pausePreview = useCallback(async () => {
     try {
-      const snapshot = await invoke<PlaybackSnapshot>('play_song_preview', {
-        request: {
-          contents: yamlPreview,
-          suggestedName: selectedSection?.name ?? 'preview',
-        },
-      });
+      const snapshot = await invoke<PlaybackSnapshot>('pause_song_preview');
       setPlayback(snapshot);
-      setStatusMessage('Started preview playback through the headless Idou engine.');
+      setStatusMessage('Paused preview playback.');
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : String(error));
     }
-  }
+  }, [setPlayback, setStatusMessage]);
 
-  async function stopPreview() {
+  const resumePreview = useCallback(async () => {
+    try {
+      const snapshot = await invoke<PlaybackSnapshot>('resume_song_preview');
+      setPlayback(snapshot);
+      setStatusMessage('Resumed preview playback.');
+    } catch (error) {
+      setStatusMessage(error instanceof Error ? error.message : String(error));
+    }
+  }, [setPlayback, setStatusMessage]);
+
+  const stopPreview = useCallback(async () => {
     try {
       const snapshot = await invoke<PlaybackSnapshot>('stop_song_preview');
       setPlayback(snapshot);
@@ -121,7 +284,30 @@ function App() {
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : String(error));
     }
-  }
+  }, [setPlayback, setStatusMessage]);
+
+  const togglePlayback = useCallback(async () => {
+    if (playback.running && playback.transportState === 'playing') {
+      await pausePreview();
+    } else if (playback.running) {
+      await resumePreview();
+    } else {
+      await playPreview(false);
+    }
+  }, [pausePreview, playPreview, playback.running, playback.transportState, resumePreview]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== 'Space' || isEditableTarget(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      void togglePlayback();
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [togglePlayback]);
 
   function updateSelectedSection(updater: (section: SongSection) => SongSection) {
     if (!selectedSection) {
@@ -149,29 +335,68 @@ function App() {
 
   const totalBeats = selectedSection ? sectionTotalBeats(document, selectedSection) : 0;
 
+  const overlayNotes = useMemo<OverlayNote[]>(() => {
+    if (!selectedTimelineSection) {
+      return [];
+    }
+
+    return selectedTimelineSection.notes.map((note, index) => ({
+      id: `overlay-${note.instrumentName}-${index}`,
+      beat: note.startBeat,
+      note: note.key,
+      duration: Math.max(0.1, note.durationBeats),
+      color: instrumentColor(note.instrumentName),
+      accentColor: instrumentAccent(note.instrumentName),
+    }));
+  }, [selectedTimelineSection]);
+
+  const accompanimentLegend = useMemo(() => {
+    if (!selectedTimelineSection) {
+      return [];
+    }
+    const counts = new Map<string, number>();
+    for (const note of selectedTimelineSection.notes) {
+      counts.set(note.instrumentName, (counts.get(note.instrumentName) ?? 0) + 1);
+    }
+    return [...counts.entries()].map(([name, count]) => ({
+      name,
+      count,
+      color: instrumentColor(name),
+      accentColor: instrumentAccent(name),
+    }));
+  }, [selectedTimelineSection]);
+
   return (
     <div className="app-shell">
       <header className="topbar">
         <div>
           <h1>Idou Studio</h1>
-          <p>Visual song-intent editor and preview tool for your headless synth engine.</p>
+          <p>Visual song-intent editor, loop-preview tool, and generated accompaniment viewer for your headless synth engine.</p>
         </div>
         <div className="toolbar-actions">
           <button onClick={() => newDocument()}>New</button>
           <button onClick={() => void openSong()}>Open</button>
           <button onClick={() => void saveSong(false)}>Save</button>
           <button onClick={() => void saveSong(true)}>Save As</button>
-          <button className="primary" onClick={() => void playPreview()}>
-            Play
+          <button className="primary" onClick={() => void playPreview(false)}>
+            Play song
           </button>
+          <button onClick={() => void playPreview(true)} disabled={!selectedSection}>
+            Loop section
+          </button>
+          <button onClick={() => void togglePlayback()}>{playback.running && playback.transportState === 'playing' ? 'Pause (Space)' : 'Play / Resume (Space)'}</button>
           <button onClick={() => void stopPreview()}>Stop</button>
+          <button onClick={() => void refreshAccompaniment()} disabled={accompanimentLoading}>
+            {accompanimentLoading ? 'Refreshing…' : accompanimentDirty ? 'Refresh layers *' : 'Refresh layers'}
+          </button>
         </div>
       </header>
 
       <div className="status-strip">
         <span>{dirty ? 'Unsaved changes' : 'Saved'}</span>
         <span>{currentPath ?? 'Untitled song'}</span>
-        <span>{playback.running ? 'Engine preview running' : 'Engine preview idle'}</span>
+        <span>{transportLabel(playback)}</span>
+        <span>Space toggles play/pause</span>
       </div>
 
       <main className="workspace">
@@ -268,6 +493,7 @@ function App() {
                   <div className="inline-actions">
                     <button onClick={() => moveSection(selectedSection.name, -1)}>Move up</button>
                     <button onClick={() => moveSection(selectedSection.name, 1)}>Move down</button>
+                    <button onClick={() => void playPreview(true)}>Loop this section</button>
                     <button className="danger" onClick={() => removeSection(selectedSection.name)}>
                       Delete
                     </button>
@@ -366,17 +592,48 @@ function App() {
 
               <div className="panel melody-panel">
                 <div className="panel-header">
-                  <h2>Melody editor</h2>
+                  <h2>Melody + accompaniment</h2>
                   <span>{totalBeats} beats visible</span>
                 </div>
                 <MelodyGrid
                   beatsPerBar={selectedSection.beatsPerBar ?? document.song.beatsPerBar}
                   totalBeats={totalBeats}
                   notes={selectedSection.melody}
+                  overlayNotes={overlayNotes}
                   selectedNoteId={selectedNoteId}
                   onSelectNote={setSelectedNoteId}
                   onUpsertNote={(note) => upsertNote(selectedSection.name, note)}
                 />
+
+                <div className="generated-strip">
+                  <div>
+                    <strong>Generated accompaniment</strong>
+                    <span className="hint">
+                      {accompanimentLoading
+                        ? ' Refreshing generated layers...'
+                        : accompanimentDirty
+                          ? ' Overlay is stale until you refresh it or start playback.'
+                          : ' Overlay matches the latest generated arrangement.'}
+                    </span>
+                  </div>
+                  {selectedTimelineSection ? (
+                    <div className="legend-list">
+                      {accompanimentLegend.map((entry) => (
+                        <span key={entry.name} className="legend-chip">
+                          <span
+                            className="legend-dot"
+                            style={{ background: entry.color, borderColor: entry.accentColor }}
+                          />
+                          {entry.name} ({entry.count})
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="hint">No generated layer preview loaded for this section yet.</div>
+                  )}
+                  {accompanimentError ? <div className="validation-inline">{accompanimentError}</div> : null}
+                </div>
+
                 {selectedNote ? (
                   <div className="note-editor">
                     <h3>Selected note</h3>
@@ -454,7 +711,7 @@ function App() {
             <div className="panel-header">
               <h2>YAML preview</h2>
             </div>
-            <CodeMirror value={yamlPreview} height="360px" extensions={[yamlLanguage()]} editable={false} />
+            <CodeMirror value={yamlPreview} height="340px" extensions={[yamlLanguage()]} editable={false} />
           </section>
           <section>
             <div className="panel-header">
@@ -468,6 +725,20 @@ function App() {
                   <li key={issue}>{issue}</li>
                 ))}
               </ul>
+            )}
+          </section>
+          <section>
+            <div className="panel-header">
+              <h2>Layer stats</h2>
+            </div>
+            {selectedTimelineSection ? (
+              <div className="layer-stats">
+                <div>{selectedTimelineSection.notes.length} generated notes</div>
+                <div>{selectedTimelineSection.beatsPerBar} beats per bar</div>
+                <div>{selectedTimelineSection.totalBeats} total beats</div>
+              </div>
+            ) : (
+              <div className="hint">Refresh generated layers to inspect the current section arrangement.</div>
             )}
           </section>
           <section>

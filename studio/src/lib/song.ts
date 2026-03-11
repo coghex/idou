@@ -202,6 +202,24 @@ export function createDefaultSong(): SongDocument {
   };
 }
 
+export function buildSectionLoopDocument(document: SongDocument, sectionName: string): SongDocument {
+  const section = document.sections.find((entry) => entry.name === sectionName);
+  if (!section) {
+    return document;
+  }
+
+  return {
+    song: { ...document.song },
+    sections: [
+      {
+        ...section,
+        chords: [...section.chords],
+        melody: section.melody.map((note) => ({ ...note })),
+      },
+    ],
+  };
+}
+
 export function parseSongText(contents: string): SongDocument {
   const parsed = (yaml.load(contents) ?? {}) as RawSongFile;
   if (!parsed.song || typeof parsed.song !== 'object') {

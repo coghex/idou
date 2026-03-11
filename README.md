@@ -25,6 +25,8 @@ Current studio workflow:
 - section/form editing with reorderable sections
 - chord editing per section
 - canvas-based melody grid for note entry and reshaping
+- looped selected-section playback plus play/pause transport control (`Space` toggles play/pause)
+- generated accompaniment visualization overlaid on the melody grid, using the Haskell arranger output
 - generated YAML preview
 - open/save dialogs for `.yaml` / `.yml`
 - preview playback by staging YAML and launching the existing headless `idou` engine
