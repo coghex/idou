@@ -63,6 +63,13 @@ const SNAP_OPTIONS = [
   { label: '1/32', value: 0.125 },
 ] as const;
 
+const AUDITION_INSTRUMENT_OPTIONS = [
+  { label: 'Lead', value: 'lead' },
+  { label: 'Pad', value: 'pad' },
+  { label: 'Arp', value: 'arp' },
+  { label: 'Bass', value: 'bass' },
+] as const;
+
 const INSTRUMENT_COLORS: Record<string, string> = {
   drums: 'rgba(168, 85, 247, 0.26)',
   bass: 'rgba(34, 197, 94, 0.26)',
@@ -164,6 +171,7 @@ function App() {
   const [snapStep, setSnapStep] = useState<number>(0.25);
   const [beatWidth, setBeatWidth] = useState<number>(42);
   const [showAccompaniment, setShowAccompaniment] = useState(true);
+  const [auditionInstrument, setAuditionInstrument] = useState<string>('lead');
 
   const selectedSection =
     document.sections.find((section) => section.name === selectedSectionName) ?? document.sections[0] ?? null;
@@ -324,6 +332,23 @@ function App() {
       await playPreview(false);
     }
   }, [pausePreview, playPreview, playback.running, playback.transportState, resumePreview]);
+
+  const previewPianoNote = useCallback(
+    async (midi: number) => {
+      try {
+        await invoke('preview_song_note', {
+          request: {
+            genre: document.song.genre,
+            instrumentName: auditionInstrument,
+            midi,
+          },
+        });
+      } catch (error) {
+        setStatusMessage(error instanceof Error ? error.message : String(error));
+      }
+    },
+    [auditionInstrument, document.song.genre, setStatusMessage],
+  );
 
   const removeSelectedNote = useCallback(() => {
     if (!selectedSection || !selectedNote) {
@@ -784,6 +809,16 @@ function App() {
                       ))}
                     </select>
                   </label>
+                  <label className="toolbar-control">
+                    <span>Audition</span>
+                    <select value={auditionInstrument} onChange={(event) => setAuditionInstrument(event.target.value)}>
+                      {AUDITION_INSTRUMENT_OPTIONS.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                   <label className="toolbar-control zoom-control">
                     <span>Zoom</span>
                     <input
@@ -816,6 +851,7 @@ function App() {
                   selectedNoteId={selectedNoteId}
                   onSelectNote={setSelectedNoteId}
                   onUpsertNote={(note) => upsertNote(selectedSection.name, note)}
+                  onPreviewNote={(midi) => void previewPianoNote(midi)}
                 />
 
                 <div className="generated-strip">
@@ -925,6 +961,7 @@ function App() {
                       </label>
                     </div>
                     <div className="shortcut-strip">
+                      <span>Click piano keys audition {auditionInstrument}</span>
                       <span>Space play/pause</span>
                       <span>⌘/Ctrl+D duplicate</span>
                       <span>Delete remove</span>

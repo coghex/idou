@@ -21,6 +21,8 @@ module Player.Timeline
   , popTransitionTelemetry
   , setTimelineGenre
   , validateSongGenre
+  , generatedInstrumentSpecs
+  , lookupGeneratedInstrument
   , timelineNextBarBoundaryFrame
   , timelineBoundarySpanFromNextBar
   , timelineRuntimeDone
@@ -31,7 +33,7 @@ import Control.Exception (evaluate)
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, toLower)
 import Data.Foldable (toList)
 import Data.Bits (xor)
-import Data.List (isInfixOf, nub, sortOn)
+import Data.List (find, isInfixOf, nub, sortOn)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq, (|>))
@@ -2597,6 +2599,13 @@ parseInstruments sectionNames entries = do
 arrangeGeneratedInstruments ∷ String → Map String SectionSpec → Either String [InstrumentPatternSpec]
 arrangeGeneratedInstruments genre sections
   | not (any sectionNeedsArrangement (M.elems sections)) = pure []
+  | otherwise = generatedInstrumentSpecs genre
+  where
+    sectionNeedsArrangement spec =
+      not (null (ssChordBars spec)) || not (null (ssMelodyPhrase spec))
+
+generatedInstrumentSpecs ∷ String → Either String [InstrumentPatternSpec]
+generatedInstrumentSpecs genre
   | null genre = Left "song.genre is required when using section chords/melody without explicit instruments"
   | normalizeName genre == "electronic" =
       pure
@@ -2631,20 +2640,33 @@ arrangeGeneratedInstruments genre sections
         , generatedInstrument "lead" 61 0.78 0 0.08 Nothing
         ]
   | otherwise = Left ("unsupported song.genre: " <> genre <> " (expected electronic|ambient|blackmetal|cinematic)")
-  where
-    sectionNeedsArrangement spec =
-      not (null (ssChordBars spec)) || not (null (ssMelodyPhrase spec))
-    generatedInstrument name iid amp pan velocityVariation fillGenerator =
-      InstrumentPatternSpec
-        { ipName = name
-        , ipInstrumentId = InstrumentId iid
-        , ipAmp = amp
-        , ipPan = pan
-        , ipVelocityVariation = velocityVariation
-        , ipPatterns = M.empty
-        , ipFills = M.empty
-        , ipFillGenerator = fillGenerator
-        }
+
+lookupGeneratedInstrument ∷ String → String → Either String InstrumentPatternSpec
+lookupGeneratedInstrument genre instrumentName = do
+  instruments <- generatedInstrumentSpecs genre
+  case find ((== normalizeName instrumentName) . normalizeName . ipName) instruments of
+    Just instrumentSpec -> pure instrumentSpec
+    Nothing ->
+      Left
+        ( "unsupported generated instrument `" <> instrumentName <> "` for genre "
+            <> normalizeName genre
+            <> " (expected one of: "
+            <> unwords (map ipName instruments)
+            <> ")"
+        )
+
+generatedInstrument ∷ String → Int → Float → Float → Float → Maybe FillGeneratorSpec → InstrumentPatternSpec
+generatedInstrument name iid amp pan velocityVariation fillGenerator =
+  InstrumentPatternSpec
+    { ipName = name
+    , ipInstrumentId = InstrumentId iid
+    , ipAmp = amp
+    , ipPan = pan
+    , ipVelocityVariation = velocityVariation
+    , ipPatterns = M.empty
+    , ipFills = M.empty
+    , ipFillGenerator = fillGenerator
+    }
 
 isSupportedGenre ∷ String → Bool
 isSupportedGenre genre =

@@ -31,6 +31,7 @@ type Props = {
   selectedNoteId: string | null;
   onSelectNote: (noteId: string | null) => void;
   onUpsertNote: (note: MelodyNote) => void;
+  onPreviewNote?: (midi: number) => void;
 };
 
 type DragState =
@@ -80,7 +81,18 @@ function pointerToMidi(clientY: number, bounds: DOMRect): number {
 }
 
 export default function MelodyGrid(props: Props) {
-  const { beatsPerBar, totalBeats, beatWidth, quantizeStep, notes, overlayNotes = [], selectedNoteId, onSelectNote, onUpsertNote } =
+  const {
+    beatsPerBar,
+    totalBeats,
+    beatWidth,
+    quantizeStep,
+    notes,
+    overlayNotes = [],
+    selectedNoteId,
+    onSelectNote,
+    onUpsertNote,
+    onPreviewNote,
+  } =
     props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -232,9 +244,16 @@ export default function MelodyGrid(props: Props) {
 
     const beat = clamp(pointerToBeat(event.clientX, bounds, beatWidth, quantizeStep), 0, totalBeats - quantizeStep);
     const midi = pointerToMidi(event.clientY, bounds);
+    const x = event.clientX - bounds.left;
+
+    if (x <= HEADER_WIDTH) {
+      onSelectNote(null);
+      onPreviewNote?.(midi);
+      return;
+    }
+
     const hit = [...notes].reverse().find((note) => {
       const rect = noteRect(note, beatWidth);
-      const x = event.clientX - bounds.left;
       const y = event.clientY - bounds.top;
       return x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height;
     });
@@ -263,7 +282,6 @@ export default function MelodyGrid(props: Props) {
 
     onSelectNote(hit.id);
     const rect = noteRect(hit, beatWidth);
-    const x = event.clientX - bounds.left;
     dragStateRef.current =
       x >= rect.x + rect.width - HANDLE_WIDTH
         ? {

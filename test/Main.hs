@@ -68,12 +68,15 @@ import Player.Automation
   )
 import Player.Timeline
   ( SongMode(..)
+  , InstrumentPatternSpec(..)
   , SongSpec
   , TimelineBar(..)
   , TimelineNote(..)
   , TimelineTransitionTelemetry(..)
   , TimelineRuntime(..)
   , compileTimelineBars
+  , generatedInstrumentSpecs
+  , lookupGeneratedInstrument
   , parseSongSpecText
   , setTimelineGenre
   , timelineBoundarySpanFromNextBar
@@ -138,6 +141,8 @@ testCases =
   , TestCase "timeline-song-intent-schema-supports-ambient-genre" testTimelineSongIntentSchemaSupportsAmbientGenre
   , TestCase "timeline-song-intent-schema-supports-blackmetal-genre" testTimelineSongIntentSchemaSupportsBlackmetalGenre
   , TestCase "timeline-song-intent-schema-supports-cinematic-genre" testTimelineSongIntentSchemaSupportsCinematicGenre
+  , TestCase "timeline-generated-instrument-lookup-follows-genre" testTimelineGeneratedInstrumentLookupFollowsGenre
+  , TestCase "timeline-generated-instrument-lookup-rejects-unknown-layer" testTimelineGeneratedInstrumentLookupRejectsUnknownLayer
   , TestCase "timeline-live-genre-switch-updates-future-bars" testTimelineLiveGenreSwitchUpdatesFutureBars
   , TestCase "timeline-harmony-aware-bass-approaches-next-chord" testTimelineHarmonyAwareBassApproachesNextChord
   , TestCase "timeline-melody-anchor-guides-generated-harmony" testTimelineMelodyAnchorGuidesGeneratedHarmony
@@ -429,6 +434,25 @@ testTimelineSongIntentSchemaSupportsCinematicGenre = do
   assertEqual "cinematic genre should be recorded on the song spec" "cinematic" (sgGenre spec)
   assertBool "cinematic arrangement should use its own lead instrument" (not (null leadPrograms))
   assertBool "cinematic arrangement should use its own pad instrument" (not (null padPrograms))
+
+testTimelineGeneratedInstrumentLookupFollowsGenre ∷ IO ()
+testTimelineGeneratedInstrumentLookupFollowsGenre = do
+  ambient <- either (\err -> error ("expected ambient palette lookup to succeed, got " <> err)) pure $
+    generatedInstrumentSpecs "ambient"
+  assertEqual "ambient generated palette should keep five layers" 5 (length ambient)
+  lead <- either (\err -> error ("expected ambient lead lookup to succeed, got " <> err)) pure $
+    lookupGeneratedInstrument "ambient" "lead"
+  let InstrumentId leadProgram = ipInstrumentId lead
+  assertEqual "ambient lead lookup should follow the genre palette" 88 leadProgram
+  assertNear "ambient lead amp should come from the generated palette" 0.38 (ipAmp lead)
+
+testTimelineGeneratedInstrumentLookupRejectsUnknownLayer ∷ IO ()
+testTimelineGeneratedInstrumentLookupRejectsUnknownLayer =
+  case lookupGeneratedInstrument "electronic" "choir" of
+    Left err ->
+      assertBool "unknown generated layer should explain valid options" ("lead" `isInfixOf` err && "pad" `isInfixOf` err)
+    Right inst ->
+      error ("expected generated instrument lookup to fail, got " <> show (ipName inst))
 
 testTimelineLiveGenreSwitchUpdatesFutureBars ∷ IO ()
 testTimelineLiveGenreSwitchUpdatesFutureBars = do

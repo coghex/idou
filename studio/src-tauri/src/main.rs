@@ -25,6 +25,7 @@ enum TransportState {
 #[derive(Default)]
 struct SharedState {
     playback: Arc<Mutex<Option<ManagedPlayback>>>,
+    audition: Arc<Mutex<Option<ManagedAudition>>>,
     logs: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -33,6 +34,10 @@ struct ManagedPlayback {
     staged_path: PathBuf,
     transport_state: TransportState,
     loop_section_name: Option<String>,
+}
+
+struct ManagedAudition {
+    child: Child,
 }
 
 #[derive(Serialize)]
@@ -65,6 +70,14 @@ struct PlaySongRequest {
 struct TimelineDumpRequest {
     contents: String,
     suggested_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewNoteRequest {
+    genre: String,
+    instrument_name: String,
+    midi: i32,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -231,6 +244,24 @@ fn spawn_log_reader<T: std::io::Read + Send + 'static>(
     });
 }
 
+fn spawn_plain_log_reader<T: std::io::Read + Send + 'static>(
+    reader: T,
+    label: &'static str,
+    logs: Arc<Mutex<VecDeque<String>>>,
+) {
+    thread::spawn(move || {
+        for line in BufReader::new(reader).lines() {
+            match line {
+                Ok(line) => push_log(&logs, format!("[{label}] {line}")),
+                Err(error) => {
+                    push_log(&logs, format!("[{label}] log stream error: {error}"));
+                    break;
+                }
+            }
+        }
+    });
+}
+
 fn stop_playback_internal(state: &SharedState) -> Result<(), String> {
     let mut guard = state
         .playback
@@ -380,6 +411,123 @@ fn send_transport_command(
             }
         }
         Err(error) => Err(format!("Failed to poll preview process: {error}")),
+    }
+}
+
+fn ensure_note_preview_process(state: &SharedState) -> Result<(), String> {
+    {
+        let mut guard = state
+            .audition
+            .lock()
+            .map_err(|_| "Note preview state lock poisoned.".to_string())?;
+
+        if let Some(mut managed) = guard.take() {
+            match managed.child.try_wait() {
+                Ok(Some(status)) => {
+                    push_log(
+                        &state.logs,
+                        format!("Note preview process exited with {status}. Restarting."),
+                    );
+                }
+                Ok(None) => {
+                    *guard = Some(managed);
+                    return Ok(());
+                }
+                Err(error) => {
+                    return Err(format!("Failed to poll note preview process: {error}"));
+                }
+            }
+        }
+    }
+
+    let repo_root = repo_root()?;
+    push_log(
+        &state.logs,
+        format!("Launching note preview engine from {}.", repo_root.display()),
+    );
+
+    let mut command = Command::new("cabal");
+    command
+        .current_dir(&repo_root)
+        .arg("run")
+        .arg("idou")
+        .arg("--")
+        .arg("--note-preview-shell")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Failed to launch note preview engine: {error}"))?;
+
+    if let Some(stdout) = child.stdout.take() {
+        spawn_plain_log_reader(stdout, "preview-stdout", state.logs.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_plain_log_reader(stderr, "preview-stderr", state.logs.clone());
+    }
+
+    let pid = child.id();
+    push_log(
+        &state.logs,
+        format!("Note preview process started with pid {pid}."),
+    );
+
+    let mut guard = state
+        .audition
+        .lock()
+        .map_err(|_| "Note preview state lock poisoned.".to_string())?;
+    *guard = Some(ManagedAudition { child });
+    Ok(())
+}
+
+#[tauri::command]
+fn preview_song_note(request: PreviewNoteRequest, state: State<'_, SharedState>) -> Result<(), String> {
+    ensure_note_preview_process(&state)?;
+
+    let mut guard = state
+        .audition
+        .lock()
+        .map_err(|_| "Note preview state lock poisoned.".to_string())?;
+    let Some(managed) = guard.as_mut() else {
+        return Err("Note preview process is unavailable.".to_string());
+    };
+
+    match managed.child.try_wait() {
+        Ok(Some(status)) => {
+            guard.take();
+            push_log(
+                &state.logs,
+                format!("Note preview process exited with {status}."),
+            );
+            Err("Note preview process is no longer running.".to_string())
+        }
+        Ok(None) => {
+            let command = format!(
+                "note {} {} {}\n",
+                request.genre.trim(),
+                request.instrument_name.trim(),
+                request.midi
+            );
+            if let Some(stdin) = managed.child.stdin.as_mut() {
+                stdin
+                    .write_all(command.as_bytes())
+                    .and_then(|_| stdin.flush())
+                    .map_err(|error| format!("Failed to send note preview command: {error}"))?;
+                push_log(
+                    &state.logs,
+                    format!(
+                        "[studio] Audition note {} on {} ({})",
+                        request.midi, request.instrument_name, request.genre
+                    ),
+                );
+                Ok(())
+            } else {
+                Err("Note preview process stdin is unavailable.".to_string())
+            }
+        }
+        Err(error) => Err(format!("Failed to poll note preview process: {error}")),
     }
 }
 
@@ -583,6 +731,7 @@ fn main() {
             stop_song_preview,
             playback_snapshot,
             dump_song_timeline,
+            preview_song_note,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Idou Studio");
