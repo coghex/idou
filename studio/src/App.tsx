@@ -146,12 +146,15 @@ function App() {
   const dirty = useStudioStore((state) => state.dirty);
   const selectedSectionName = useStudioStore((state) => state.selectedSectionName);
   const selectedNoteId = useStudioStore((state) => state.selectedNoteId);
+  const canUndo = useStudioStore((state) => state.historyPast.length > 0);
+  const canRedo = useStudioStore((state) => state.historyFuture.length > 0);
+  const hasClipboard = useStudioStore((state) => state.clipboardNote !== null);
   const playback = useStudioStore((state) => state.playback) as PlaybackSnapshot;
   const statusMessage = useStudioStore((state) => state.statusMessage);
   const loadDocument = useStudioStore((state) => state.loadDocument);
   const newDocument = useStudioStore((state) => state.newDocument);
   const setCurrentPath = useStudioStore((state) => state.setCurrentPath);
-  const setDirty = useStudioStore((state) => state.setDirty);
+  const markSaved = useStudioStore((state) => state.markSaved);
   const setStatusMessage = useStudioStore((state) => state.setStatusMessage);
   const setSongField = useStudioStore((state) => state.setSongField);
   const addSection = useStudioStore((state) => state.addSection);
@@ -162,6 +165,11 @@ function App() {
   const setSelectedNoteId = useStudioStore((state) => state.setSelectedNoteId);
   const upsertNote = useStudioStore((state) => state.upsertNote);
   const removeNote = useStudioStore((state) => state.removeNote);
+  const undo = useStudioStore((state) => state.undo);
+  const redo = useStudioStore((state) => state.redo);
+  const copySelectedNote = useStudioStore((state) => state.copySelectedNote);
+  const cutSelectedNote = useStudioStore((state) => state.cutSelectedNote);
+  const pasteClipboard = useStudioStore((state) => state.pasteClipboard);
   const setPlayback = useStudioStore((state) => state.setPlayback);
 
   const [timelinePreview, setTimelinePreview] = useState<TimelinePreview>({ sections: [] });
@@ -254,13 +262,13 @@ function App() {
           return;
         }
         setCurrentPath(response.path);
-        setDirty(false);
+        markSaved();
         setStatusMessage(`Saved ${response.path}`);
       } catch (error) {
         setStatusMessage(error instanceof Error ? error.message : String(error));
       }
     },
-    [currentPath, setCurrentPath, setDirty, setStatusMessage, yamlPreview],
+    [currentPath, markSaved, setCurrentPath, setStatusMessage, yamlPreview],
   );
 
   const playPreview = useCallback(
@@ -419,6 +427,40 @@ function App() {
         return;
       }
 
+      if (modifier && event.code === 'KeyZ') {
+        event.preventDefault();
+        if (event.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+        return;
+      }
+
+      if (modifier && event.code === 'KeyY') {
+        event.preventDefault();
+        redo();
+        return;
+      }
+
+      if (modifier && event.code === 'KeyC') {
+        event.preventDefault();
+        copySelectedNote();
+        return;
+      }
+
+      if (modifier && event.code === 'KeyX') {
+        event.preventDefault();
+        cutSelectedNote();
+        return;
+      }
+
+      if (modifier && event.code === 'KeyV') {
+        event.preventDefault();
+        pasteClipboard();
+        return;
+      }
+
       if (event.code === 'Space') {
         if (event.repeat) {
           return;
@@ -484,12 +526,17 @@ function App() {
     duplicateSelectedNote,
     nudgeSelectedNote,
     openSong,
+    copySelectedNote,
+    cutSelectedNote,
+    pasteClipboard,
     removeSelectedNote,
+    redo,
     saveSong,
     selectedNote,
     setSelectedNoteId,
     snapStep,
     togglePlayback,
+    undo,
   ]);
 
   function updateSelectedSection(updater: (section: SongSection) => SongSection) {
@@ -559,6 +606,12 @@ function App() {
           <button onClick={() => void openSong()}>Open</button>
           <button onClick={() => void saveSong(false)}>Save</button>
           <button onClick={() => void saveSong(true)}>Save As</button>
+          <button onClick={() => undo()} disabled={!canUndo}>
+            Undo
+          </button>
+          <button onClick={() => redo()} disabled={!canRedo}>
+            Redo
+          </button>
         </div>
 
         <div className="toolbar-group transport-group">
@@ -591,6 +644,7 @@ function App() {
       <div className="status-strip">
         <span>{dirty ? 'Unsaved' : 'Saved'}</span>
         <span>{showAccompaniment ? 'Layers visible' : 'Layers hidden'}</span>
+        <span>{hasClipboard ? 'Clipboard armed' : 'Clipboard empty'}</span>
         <span>{selectedNote ? `Selected ${midiToNoteName(selectedNote.note)}` : 'No note selected'}</span>
       </div>
 
@@ -789,6 +843,15 @@ function App() {
                 <div className="panel-header">
                   <h2>Piano roll</h2>
                   <div className="toolbar-group compact-toolbar">
+                    <button onClick={() => copySelectedNote()} disabled={!selectedNote}>
+                      Copy
+                    </button>
+                    <button onClick={() => cutSelectedNote()} disabled={!selectedNote}>
+                      Cut
+                    </button>
+                    <button onClick={() => pasteClipboard()} disabled={!hasClipboard}>
+                      Paste
+                    </button>
                     <button onClick={() => duplicateSelectedNote()} disabled={!selectedNote}>
                       Duplicate
                     </button>
@@ -962,6 +1025,9 @@ function App() {
                     </div>
                     <div className="shortcut-strip">
                       <span>Click piano keys audition {auditionInstrument}</span>
+                      <span>⌘/Ctrl+Z undo</span>
+                      <span>⇧⌘/Ctrl+Z redo</span>
+                      <span>⌘/Ctrl+C/X/V clipboard</span>
                       <span>Space play/pause</span>
                       <span>⌘/Ctrl+D duplicate</span>
                       <span>Delete remove</span>
@@ -1027,7 +1093,7 @@ function App() {
 
       <footer className="footer-strip">
         <span>{statusMessage}</span>
-        <span>⌘/Ctrl+S Save · Space Play/Pause · Delete Remove · Arrows Nudge</span>
+        <span>⌘/Ctrl+S Save · ⌘/Ctrl+Z Undo · ⌘/Ctrl+C/X/V Clipboard · Space Play/Pause</span>
       </footer>
     </div>
   );

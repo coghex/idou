@@ -28,7 +28,7 @@ Current studio workflow:
 - DAW-style transport-first layout with snap and zoom controls for the piano roll
 - piano-key auditioning for generated `lead`, `pad`, `arp`, and `bass` layers using the current song genre
 - looped selected-section playback plus play/pause transport control (`Space` toggles play/pause)
-- common editor shortcuts for save/open, note duplication, deletion, and keyboard nudging
+- common editor shortcuts for save/open, undo/redo, note clipboard, duplication, deletion, and keyboard nudging
 - generated accompaniment visualization overlaid on the melody grid, using the Haskell arranger output
 - generated YAML preview
 - open/save dialogs for `.yaml` / `.yml`
