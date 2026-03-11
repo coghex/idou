@@ -16,6 +16,29 @@ cabal run idou -- song1.yaml
 cabal run idou -- config/song.yaml
 ```
 
+## Idou Studio
+
+The repository now also includes a companion desktop editor in `studio/` for authoring the high-level song-intent YAML format visually.
+
+Current studio workflow:
+- song-level editing for `genre`, `mood`, `tempo_bpm`, `beats_per_bar`, and `beat_unit`
+- section/form editing with reorderable sections
+- chord editing per section
+- canvas-based melody grid for note entry and reshaping
+- generated YAML preview
+- open/save dialogs for `.yaml` / `.yml`
+- preview playback by staging YAML and launching the existing headless `idou` engine
+
+To run the studio in development:
+
+```bash
+cd studio
+npm install
+npm run tauri dev
+```
+
+The studio is intentionally a separate tool: the Haskell engine remains the playback source of truth, and the GUI shells out to `cabal run idou -- <staged-preview.yaml>` for preview.
+
 When launching with `.yaml`/`.yml`, the CLI opens an interactive prompt (`idou>`) for live control (`help` shows commands like `genre`, `mood`, `energy`, `auto-energy`, `auto-mood`, `tempo`, `meter`, `start`, `stop`, `panic`, `quit`).
 
 Optional runtime health telemetry:
