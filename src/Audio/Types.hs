@@ -31,6 +31,7 @@ module Audio.Types
   ) where
 
 import Data.Word (Word32, Word64)
+import qualified Data.Vector.Unboxed as VU
 import Engine.Core.Queue (Queue)
 import Audio.Envelope (ADSR)
 import Audio.Filter.Types (FilterSpec)
@@ -207,7 +208,7 @@ data AudioMsg
   | AudioLoadClip
       { clipId       ∷ !ClipId
       , clipChannels ∷ !Int
-      , clipSamples  ∷ ![Float]
+      , clipSamples  ∷ !(VU.Vector Float)
       }
 
   | AudioUnloadClip

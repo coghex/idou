@@ -6,16 +6,17 @@ module Sound.Miniaudio.Decode
   , decodeAudioFileStereoF32
   ) where
 
-import Control.Exception (bracket)
 import Control.Monad (when)
 import Foreign
 import Foreign.C
+import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Unboxed.Mutable as VUM
 
 data DecodedAudio = DecodedAudio
   { daChannels   ∷ !Int
   , daSampleRate ∷ !Word32
   , daFrames     ∷ !Int
-  , daSamples    ∷ ![Float]
+  , daSamples    ∷ !(VU.Vector Float)
   } deriving (Eq, Show)
 
 foreign import ccall "hs_ma_decode_file_f32"
@@ -57,8 +58,16 @@ decodeAudioFileF32 targetChannels path = do
             frames <- peek pFrames
             sampleRate <- peek pSampleRate
             let sampleCount = fromIntegral (frames * fromIntegral channels) ∷ Int
-            samples <- bracket (pure samplesPtr) c_hs_ma_free_decoded_audio $ \ptr ->
-              map realToFrac <$> peekArray sampleCount ptr
+            mvec <- VUM.new sampleCount
+            let copyLoop i
+                  | i >= sampleCount = pure ()
+                  | otherwise = do
+                      cf <- peekElemOff samplesPtr i
+                      VUM.unsafeWrite mvec i (realToFrac cf)
+                      copyLoop (i + 1)
+            copyLoop 0
+            c_hs_ma_free_decoded_audio samplesPtr
+            samples <- VU.unsafeFreeze mvec
 
             pure DecodedAudio
               { daChannels = fromIntegral channels

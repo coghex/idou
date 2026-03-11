@@ -285,14 +285,14 @@ runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telem
         ThreadStopped -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
-          writeIORef transportFrameRef (stTransportFrame st1)
+          atomicWriteIORef transportFrameRef (stTransportFrame st1)
           writeIORef stRef st1
         ThreadPaused  -> threadDelay 10000 >> go lastUnderruns lastPartialWrites lastZeroWrites lastVerboseLogLoop health
         ThreadRunning -> do
           st0 <- readIORef stRef
           st1 <- processMsgs h rb st0
           (st2, rs) <- Audio.Thread.Render.renderIfNeeded (audioEventQueue h) (applyScheduledAction h) rb chunkFrames st1
-          writeIORef transportFrameRef (stTransportFrame st2)
+          atomicWriteIORef transportFrameRef (stTransportFrame st2)
           writeIORef stRef st2
 
           let health' = absorbRenderStats health rs
@@ -457,16 +457,15 @@ processMsgs h rb st = do
         AudioSetNoteAftertouch iid instId aft ->
           setInstrumentNoteAftertouch iid instId aft st >>= processMsgs h rb
 
-loadClipAsset ∷ ClipId → Int → [Float] → AudioState → IO AudioState
+loadClipAsset ∷ ClipId → Int → VU.Vector Float → AudioState → IO AudioState
 loadClipAsset (ClipId clipIx) channels samples st = do
   let assets = stClipAssets st
-  if clipIx < 0 || clipIx >= MV.length assets || channels <= 0
+  if clipIx < 0 || clipIx >= MV.length assets || channels <= 0 || channels > 2
     then pure st
     else do
-      let sampleVec = VU.fromList samples
-          sampleCount = VU.length sampleVec
+      let sampleCount = VU.length samples
           alignedCount = sampleCount - (sampleCount `mod` channels)
-          alignedSamples = VU.take alignedCount sampleVec
+          alignedSamples = VU.take alignedCount samples
           frameCount =
             if channels > 0
               then alignedCount `div` channels

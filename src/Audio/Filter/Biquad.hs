@@ -116,6 +116,6 @@ biquadCoeffs ftype sampleRate cutoffHz0 q0
 biquadStep ∷ BiquadCoeffs → BiquadState → Float → (BiquadState, Float)
 biquadStep c s x =
   let y  = b0 c * x + z1 s
-      z1' = b1 c * x - a1 c * y + z2 s
-      z2' = b2 c * x - a2 c * y
+      z1' = b1 c * x - a1 c * y + z2 s + 1e-25
+      z2' = b2 c * x - a2 c * y + 1e-25
   in (BiquadState z1' z2', y)

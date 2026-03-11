@@ -29,13 +29,16 @@ module Player.Timeline
 
 import Control.Exception (evaluate)
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, toLower)
+import Data.Foldable (toList)
 import Data.Bits (xor)
 import Data.List (isInfixOf, nub, sortOn)
 import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Map.Strict (Map)
+import Data.Sequence (Seq, (|>))
 import Data.Word (Word32, Word64)
 
 import qualified Data.Map.Strict as M
+import qualified Data.Sequence as Seq
 
 import Audio.Types (InstrumentId(..), NoteKey(..))
 
@@ -144,10 +147,11 @@ data TimelineTransitionTelemetry = TimelineTransitionTelemetry
   deriving (Eq, Show)
 
 data TimelineRuntime = TimelineRuntime
-  { trBars               ∷ ![TimelineBar]
+  { trBars               ∷ !(Seq TimelineBar)
   , trStartFrame         ∷ !Word64
   , trLookaheadBars      ∷ !Int
   , trNextBarIx          ∷ !Int
+  , trBarOffset          ∷ !Int
   , trSampleRateHz       ∷ !Word32
   , trMode               ∷ !SongMode
   , trSongGenre          ∷ !String
@@ -279,10 +283,11 @@ prepareTimelineRuntime sampleRateHz startFrame spec =
   let firstSection = initialSectionName spec
       seed0 = startFrame * 0x9E3779B97F4A7C15 + fromIntegral (length (sgSections spec))
   in TimelineRuntime
-       { trBars = []
+       { trBars = Seq.empty
        , trStartFrame = startFrame
        , trLookaheadBars = max 1 (sgLookaheadBars spec)
        , trNextBarIx = 0
+       , trBarOffset = 0
        , trSampleRateHz = sampleRateHz
        , trMode = sgMode spec
        , trSongGenre = sgGenre spec
@@ -331,7 +336,7 @@ popReadyBars now runtime = go [] (ensureGeneratedToHorizon now runtime)
   where
     go acc rt =
       case nextBar rt of
-        Nothing -> (reverse acc, rt)
+        Nothing -> (reverse acc, dropConsumedBars rt)
         Just bar ->
           let barStartAbs = trStartFrame rt + tbStartOffsetFrames bar
               lookaheadFrames = fromIntegral (trLookaheadBars rt) * tbLengthFrames bar
@@ -342,16 +347,16 @@ popReadyBars now runtime = go [] (ensureGeneratedToHorizon now runtime)
                    (bar : acc)
                    rt { trNextBarIx = trNextBarIx rt + 1 }
                else
-                 (reverse acc, rt)
+                 (reverse acc, dropConsumedBars rt)
 
 timelineRuntimeDone ∷ TimelineRuntime → Bool
-timelineRuntimeDone rt = trDone rt && trNextBarIx rt >= length (trBars rt)
+timelineRuntimeDone rt = trDone rt && trNextBarIx rt >= trBarOffset rt + Seq.length (trBars rt)
 
 timelineRuntimeEndFrame ∷ TimelineRuntime → Maybe Word64
 timelineRuntimeEndFrame rt =
-  case reverse (trBars rt) of
-    [] -> Nothing
-    bar : _ ->
+  case Seq.viewr (trBars rt) of
+    Seq.EmptyR -> Nothing
+    _ Seq.:> bar ->
       Just (trStartFrame rt + tbStartOffsetFrames bar + tbLengthFrames bar)
 
 timelineNextBarBoundaryFrame ∷ Word64 → TimelineRuntime → (Maybe Word64, TimelineRuntime)
@@ -396,11 +401,13 @@ firstFutureBoundary now rt =
 
 futureBarStartFrames ∷ Word64 → TimelineRuntime → [Word64]
 futureBarStartFrames now rt =
-  [ frame
-  | bar <- trBars rt
-  , let frame = trStartFrame rt + tbStartOffsetFrames bar
-  , frame > now
-  ]
+  let seqIx = trNextBarIx rt - trBarOffset rt
+      futureBars = Seq.drop seqIx (trBars rt)
+  in [ frame
+     | bar <- toList futureBars
+     , let frame = trStartFrame rt + tbStartOffsetFrames bar
+     , frame > now
+     ]
 
 ensureFutureBarStarts ∷ Word64 → Int → TimelineRuntime → TimelineRuntime
 ensureFutureBarStarts now needed rt
@@ -480,7 +487,7 @@ appendGeneratedBar rt =
           finishedSection = phraseBoundary && nextBarInSection >= sectionBarCount
           rtBase =
             rt
-              { trBars = trBars rt <> [bar]
+              { trBars = trBars rt |> bar
               , trGeneratedBarCount = trGeneratedBarCount rt + 1
               , trNextBarOffset = nextOffset
               , trRngState = nextBarSeed
@@ -2447,11 +2454,17 @@ sectionBarFrames sampleRateHz sectionSpec =
 
 nextBar ∷ TimelineRuntime → Maybe TimelineBar
 nextBar rt =
-  let i = trNextBarIx rt
-      xs = trBars rt
-  in if i < 0 || i >= length xs
-       then Nothing
-       else Just (xs !! i)
+  let seqIx = trNextBarIx rt - trBarOffset rt
+  in Seq.lookup seqIx (trBars rt)
+
+dropConsumedBars ∷ TimelineRuntime → TimelineRuntime
+dropConsumedBars rt =
+  let toDrop = min (trNextBarIx rt - trBarOffset rt) (Seq.length (trBars rt) - 1)
+  in if toDrop <= 0
+       then rt
+       else rt { trBars = Seq.drop toDrop (trBars rt)
+               , trBarOffset = trBarOffset rt + toDrop
+               }
 
 parseSections ∷ String → FlatYaml → Either String (Map String SectionSpec)
 parseSections songMood entries = do
@@ -2973,8 +2986,8 @@ ensure ∷ Bool → String → Either String ()
 ensure cond msg =
   if cond then pure () else Left msg
 
-lastTimelineBar ∷ [TimelineBar] → Maybe TimelineBar
+lastTimelineBar ∷ Seq TimelineBar → Maybe TimelineBar
 lastTimelineBar bars =
-  case reverse bars of
-    bar : _ -> Just bar
-    [] -> Nothing
+  case Seq.viewr bars of
+    Seq.EmptyR -> Nothing
+    _ Seq.:> bar -> Just bar

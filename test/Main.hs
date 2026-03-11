@@ -2323,12 +2323,12 @@ testWavDecoderLoadsStereoF32 =
     assertEqual "decoded target channels" 2 (daChannels decoded)
     assertEqual "decoded frame count" 4 (daFrames decoded)
     let samples = daSamples decoded
-    assertEqual "decoded sample count" 8 (length samples)
-    assertNear "mono to stereo duplicates L/R 0" (samples !! 0) (samples !! 1)
-    assertNear "mono to stereo duplicates L/R 1" (samples !! 2) (samples !! 3)
-    assertNear "zero sample remains zero" 0 (samples !! 0)
-    assertBool "max positive sample is normalized near 1" (samples !! 2 > 0.99)
-    assertBool "negative sample is preserved" (samples !! 4 < -0.99)
+    assertEqual "decoded sample count" 8 (VU.length samples)
+    assertNear "mono to stereo duplicates L/R 0" (samples VU.! 0) (samples VU.! 1)
+    assertNear "mono to stereo duplicates L/R 1" (samples VU.! 2) (samples VU.! 3)
+    assertNear "zero sample remains zero" 0 (samples VU.! 0)
+    assertBool "max positive sample is normalized near 1" (samples VU.! 2 > 0.99)
+    assertBool "negative sample is preserved" (samples VU.! 4 < -0.99)
 
 withTempWav ∷ [Int] → (FilePath → IO a) → IO a
 withTempWav monoSamples action = do

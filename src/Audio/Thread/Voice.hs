@@ -271,6 +271,38 @@ findStealVoiceIxQuietest iid st = do
     Just _ -> pure r1
     Nothing -> go 0 Nothing 1e30 False
 
+findStealVoiceIxGlobal ∷ AudioState → IO (Maybe Int)
+findStealVoiceIxGlobal st = do
+  let vec = stVoices st
+      n   = stActiveCount st
+
+      loudness v =
+        let envLvl = max 0 (eLevel (vEnv v))
+            amp    = 0.5 * (abs (vAmpL v) + abs (vAmpR v))
+        in envLvl * amp
+
+      go i bestIx bestVal onlyRelease
+        | i >= n = pure bestIx
+        | otherwise = do
+            v <- MV.read vec i
+            if eStage (vEnv v) == EnvDone
+              then go (i+1) bestIx bestVal onlyRelease
+              else do
+                let isRel = eStage (vEnv v) == EnvRelease
+                    ok = (not onlyRelease) || isRel
+                if not ok
+                  then go (i+1) bestIx bestVal onlyRelease
+                  else do
+                    let l = loudness v
+                    if bestIx == Nothing || l < bestVal
+                      then go (i+1) (Just i) l onlyRelease
+                      else go (i+1) bestIx bestVal onlyRelease
+
+  r1 <- go 0 Nothing 1e30 True
+  case r1 of
+    Just _ -> pure r1
+    Nothing -> go 0 Nothing 1e30 False
+
 -- Voice creation -------------------------------------------------------------
 
 addBeepVoice ∷ AudioHandle → AudioState → Float → Float → Float → Float → ADSR → IO AudioState
@@ -716,7 +748,10 @@ addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
       pure st { stActiveCount = nActive + 1, stNow = now' }
     else do
       mIx <- findStealVoiceIxQuietest iid st
-      case mIx of
+      mIx' <- case mIx of
+        Just _  -> pure mIx
+        Nothing -> findStealVoiceIxGlobal st
+      case mIx' of
         Nothing ->
           pure st { stNow = now' }
         Just ix -> do
