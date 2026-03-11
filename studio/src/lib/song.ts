@@ -46,6 +46,10 @@ function makeId(prefix: string): string {
   return `${prefix}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+export function createNoteId(): string {
+  return makeId('note');
+}
+
 export function normalizeSectionName(name: string): string {
   const normalized = name
     .trim()
@@ -106,7 +110,7 @@ function parseMelody(value: unknown): MelodyNote[] {
       const [beatText, noteText, durationText, velocityText] = token.split('/');
       const midi = noteNameToMidi(noteText) ?? 60;
       return {
-        id: makeId('note'),
+        id: createNoteId(),
         beat: asFiniteNumber(beatText, 0),
         note: midi,
         duration: Math.max(0.25, asFiniteNumber(durationText, 1)),
@@ -159,9 +163,9 @@ export function createDefaultSong(): SongDocument {
         feel: 'sparse',
         chords: ['Am(add9)', 'Fmaj7', 'Dm7', 'Esus4'],
         melody: [
-          { id: makeId('note'), beat: 2, note: 69, duration: 1, velocity: 0.54 },
-          { id: makeId('note'), beat: 3, note: 72, duration: 0.75, velocity: 0.58 },
-          { id: makeId('note'), beat: 3.75, note: 76, duration: 0.25, velocity: 0.62 },
+          { id: createNoteId(), beat: 2, note: 69, duration: 1, velocity: 0.54 },
+          { id: createNoteId(), beat: 3, note: 72, duration: 0.75, velocity: 0.58 },
+          { id: createNoteId(), beat: 3.75, note: 76, duration: 0.25, velocity: 0.62 },
         ],
       },
       {
@@ -175,10 +179,10 @@ export function createDefaultSong(): SongDocument {
         feel: 'driving',
         chords: ['Am', 'F', 'C', 'G'],
         melody: [
-          { id: makeId('note'), beat: 0, note: 69, duration: 0.5, velocity: 0.6 },
-          { id: makeId('note'), beat: 1, note: 72, duration: 0.5, velocity: 0.62 },
-          { id: makeId('note'), beat: 2, note: 76, duration: 1, velocity: 0.65 },
-          { id: makeId('note'), beat: 6, note: 74, duration: 0.5, velocity: 0.58 },
+          { id: createNoteId(), beat: 0, note: 69, duration: 0.5, velocity: 0.6 },
+          { id: createNoteId(), beat: 1, note: 72, duration: 0.5, velocity: 0.62 },
+          { id: createNoteId(), beat: 2, note: 76, duration: 1, velocity: 0.65 },
+          { id: createNoteId(), beat: 6, note: 74, duration: 0.5, velocity: 0.58 },
         ],
       },
       {
@@ -192,10 +196,10 @@ export function createDefaultSong(): SongDocument {
         feel: 'anthemic',
         chords: ['F', 'G', 'Am', 'C'],
         melody: [
-          { id: makeId('note'), beat: 0, note: 72, duration: 1, velocity: 0.72 },
-          { id: makeId('note'), beat: 1.5, note: 76, duration: 0.5, velocity: 0.76 },
-          { id: makeId('note'), beat: 2, note: 79, duration: 1, velocity: 0.82 },
-          { id: makeId('note'), beat: 6, note: 77, duration: 0.5, velocity: 0.75 },
+          { id: createNoteId(), beat: 0, note: 72, duration: 1, velocity: 0.72 },
+          { id: createNoteId(), beat: 1.5, note: 76, duration: 0.5, velocity: 0.76 },
+          { id: createNoteId(), beat: 2, note: 79, duration: 1, velocity: 0.82 },
+          { id: createNoteId(), beat: 6, note: 77, duration: 0.5, velocity: 0.75 },
         ],
       },
     ],

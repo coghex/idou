@@ -3,9 +3,10 @@ import CodeMirror from '@uiw/react-codemirror';
 import { yaml as yamlLanguage } from '@codemirror/lang-yaml';
 import { invoke } from '@tauri-apps/api/core';
 import MelodyGrid, { type OverlayNote } from './components/MelodyGrid';
-import { midiToNoteName, noteNameToMidi } from './lib/note';
+import { clamp, midiToNoteName, noteNameToMidi, quantizeBeat } from './lib/note';
 import {
   buildSectionLoopDocument,
+  createNoteId,
   normalizeSectionName,
   parseSongText,
   sectionTotalBeats,
@@ -55,6 +56,13 @@ type TimelinePreviewNote = {
   durationBeats: number;
 };
 
+const SNAP_OPTIONS = [
+  { label: '1/4', value: 1 },
+  { label: '1/8', value: 0.5 },
+  { label: '1/16', value: 0.25 },
+  { label: '1/32', value: 0.125 },
+] as const;
+
 const INSTRUMENT_COLORS: Record<string, string> = {
   drums: 'rgba(168, 85, 247, 0.26)',
   bass: 'rgba(34, 197, 94, 0.26)',
@@ -103,17 +111,26 @@ function instrumentAccent(name: string): string {
   return INSTRUMENT_ACCENTS[name] ?? 'rgba(226, 232, 240, 0.72)';
 }
 
+function basename(path: string | null): string {
+  if (!path) {
+    return 'Untitled song';
+  }
+  const normalized = path.replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  return parts[parts.length - 1] || 'Untitled song';
+}
+
 function transportLabel(playback: PlaybackSnapshot): string {
   if (!playback.running) {
-    return 'Engine preview idle';
+    return 'Stopped';
   }
   if (playback.transportState === 'playing') {
-    return playback.loopSectionName ? `Looping section ${playback.loopSectionName}` : 'Playing song preview';
+    return playback.loopSectionName ? `Loop: ${playback.loopSectionName}` : 'Playing';
   }
   if (playback.transportState === 'paused') {
-    return 'Preview paused';
+    return 'Paused';
   }
-  return 'Preview loaded';
+  return 'Loaded';
 }
 
 function App() {
@@ -144,6 +161,9 @@ function App() {
   const [accompanimentLoading, setAccompanimentLoading] = useState(false);
   const [accompanimentDirty, setAccompanimentDirty] = useState(true);
   const [accompanimentError, setAccompanimentError] = useState<string | null>(null);
+  const [snapStep, setSnapStep] = useState<number>(0.25);
+  const [beatWidth, setBeatWidth] = useState<number>(42);
+  const [showAccompaniment, setShowAccompaniment] = useState(true);
 
   const selectedSection =
     document.sections.find((section) => section.name === selectedSectionName) ?? document.sections[0] ?? null;
@@ -152,6 +172,11 @@ function App() {
   const validationIssues = useMemo(() => validateSong(document), [document]);
   const selectedTimelineSection =
     timelinePreview.sections.find((section) => section.name === selectedSection?.name) ?? null;
+  const totalBeats = selectedSection ? sectionTotalBeats(document, selectedSection) : 0;
+  const activeBeatsPerBar = selectedSection?.beatsPerBar ?? document.song.beatsPerBar;
+  const currentFileLabel = useMemo(() => basename(currentPath), [currentPath]);
+  const currentSnapLabel =
+    SNAP_OPTIONS.find((option) => option.value === snapStep)?.label ?? `${snapStep.toFixed(3)} beat`;
 
   useEffect(() => {
     setAccompanimentDirty(true);
@@ -192,7 +217,7 @@ function App() {
     [selectedSection?.name, yamlPreview],
   );
 
-  async function openSong() {
+  const openSong = useCallback(async () => {
     try {
       const payload = await invoke<FilePayload | null>('open_song_file');
       if (!payload) {
@@ -206,33 +231,37 @@ function App() {
     } catch (error) {
       setStatusMessage(error instanceof Error ? error.message : String(error));
     }
-  }
+  }, [loadDocument, setStatusMessage]);
 
-  async function saveSong(forceDialog = false) {
-    try {
-      const response = await invoke<SaveSongResponse | null>('save_song_file', {
-        request: {
-          path: forceDialog ? null : currentPath,
-          contents: yamlPreview,
-        },
-      });
-      if (!response) {
-        return;
+  const saveSong = useCallback(
+    async (forceDialog = false) => {
+      try {
+        const response = await invoke<SaveSongResponse | null>('save_song_file', {
+          request: {
+            path: forceDialog ? null : currentPath,
+            contents: yamlPreview,
+          },
+        });
+        if (!response) {
+          return;
+        }
+        setCurrentPath(response.path);
+        setDirty(false);
+        setStatusMessage(`Saved ${response.path}`);
+      } catch (error) {
+        setStatusMessage(error instanceof Error ? error.message : String(error));
       }
-      setCurrentPath(response.path);
-      setDirty(false);
-      setStatusMessage(`Saved ${response.path}`);
-    } catch (error) {
-      setStatusMessage(error instanceof Error ? error.message : String(error));
-    }
-  }
+    },
+    [currentPath, setCurrentPath, setDirty, setStatusMessage, yamlPreview],
+  );
 
   const playPreview = useCallback(
     async (loopSelectedSection: boolean) => {
       const previewDocument =
         loopSelectedSection && selectedSection ? buildSectionLoopDocument(document, selectedSection.name) : document;
       const previewText = serializeSong(previewDocument);
-      const suggestedName = loopSelectedSection && selectedSection ? selectedSection.name : selectedSection?.name ?? 'preview';
+      const suggestedName =
+        loopSelectedSection && selectedSection ? selectedSection.name : selectedSection?.name ?? 'preview';
 
       try {
         const snapshot = await invoke<PlaybackSnapshot>('play_song_preview', {
@@ -247,7 +276,7 @@ function App() {
         setStatusMessage(
           loopSelectedSection && selectedSection
             ? `Looping section ${selectedSection.name}.`
-            : 'Started preview playback through the headless Idou engine.',
+            : 'Started preview playback.',
         );
       } catch (error) {
         setStatusMessage(error instanceof Error ? error.message : String(error));
@@ -296,18 +325,147 @@ function App() {
     }
   }, [pausePreview, playPreview, playback.running, playback.transportState, resumePreview]);
 
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.code !== 'Space' || isEditableTarget(event.target)) {
+  const removeSelectedNote = useCallback(() => {
+    if (!selectedSection || !selectedNote) {
+      return;
+    }
+    removeNote(selectedSection.name, selectedNote.id);
+    setStatusMessage(`Deleted ${midiToNoteName(selectedNote.note)}.`);
+  }, [removeNote, selectedNote, selectedSection, setStatusMessage]);
+
+  const duplicateSelectedNote = useCallback(() => {
+    if (!selectedSection || !selectedNote) {
+      return;
+    }
+
+    const nextBeat = clamp(
+      quantizeBeat(selectedNote.beat + selectedNote.duration, snapStep),
+      0,
+      Math.max(0, totalBeats - selectedNote.duration),
+    );
+    const duplicated: MelodyNote = {
+      ...selectedNote,
+      id: createNoteId(),
+      beat: nextBeat,
+    };
+    upsertNote(selectedSection.name, duplicated);
+    setSelectedNoteId(duplicated.id);
+    setStatusMessage(`Duplicated ${midiToNoteName(selectedNote.note)}.`);
+  }, [selectedNote, selectedSection, setSelectedNoteId, setStatusMessage, snapStep, totalBeats, upsertNote]);
+
+  const nudgeSelectedNote = useCallback(
+    (beatDelta: number, noteDelta: number) => {
+      if (!selectedSection || !selectedNote) {
         return;
       }
-      event.preventDefault();
-      void togglePlayback();
+
+      const nextBeat = clamp(
+        quantizeBeat(selectedNote.beat + beatDelta, snapStep),
+        0,
+        Math.max(0, totalBeats - selectedNote.duration),
+      );
+      const nextNote = clamp(selectedNote.note + noteDelta, 0, 127);
+      upsertNote(selectedSection.name, {
+        ...selectedNote,
+        beat: nextBeat,
+        note: nextNote,
+      });
+    },
+    [selectedNote, selectedSection, snapStep, totalBeats, upsertNote],
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const modifier = event.metaKey || event.ctrlKey;
+
+      if (modifier && event.code === 'KeyS') {
+        event.preventDefault();
+        void saveSong(false);
+        return;
+      }
+
+      if (modifier && event.code === 'KeyO') {
+        event.preventDefault();
+        void openSong();
+        return;
+      }
+
+      if (isEditableTarget(event.target)) {
+        return;
+      }
+
+      if (event.code === 'Space') {
+        if (event.repeat) {
+          return;
+        }
+        event.preventDefault();
+        void togglePlayback();
+        return;
+      }
+
+      if (modifier && event.code === 'KeyD') {
+        if (event.repeat) {
+          return;
+        }
+        event.preventDefault();
+        duplicateSelectedNote();
+        return;
+      }
+
+      switch (event.code) {
+        case 'Delete':
+        case 'Backspace':
+          if (selectedNote) {
+            event.preventDefault();
+            removeSelectedNote();
+          }
+          break;
+        case 'Escape':
+          setSelectedNoteId(null);
+          break;
+        case 'ArrowLeft':
+          if (selectedNote) {
+            event.preventDefault();
+            nudgeSelectedNote(-(event.shiftKey ? activeBeatsPerBar : snapStep), 0);
+          }
+          break;
+        case 'ArrowRight':
+          if (selectedNote) {
+            event.preventDefault();
+            nudgeSelectedNote(event.shiftKey ? activeBeatsPerBar : snapStep, 0);
+          }
+          break;
+        case 'ArrowUp':
+          if (selectedNote) {
+            event.preventDefault();
+            nudgeSelectedNote(0, event.shiftKey ? 12 : 1);
+          }
+          break;
+        case 'ArrowDown':
+          if (selectedNote) {
+            event.preventDefault();
+            nudgeSelectedNote(0, event.shiftKey ? -12 : -1);
+          }
+          break;
+        default:
+          break;
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [togglePlayback]);
+  }, [
+    activeBeatsPerBar,
+    duplicateSelectedNote,
+    nudgeSelectedNote,
+    openSong,
+    removeSelectedNote,
+    saveSong,
+    selectedNote,
+    setSelectedNoteId,
+    snapStep,
+    togglePlayback,
+  ]);
 
   function updateSelectedSection(updater: (section: SongSection) => SongSection) {
     if (!selectedSection) {
@@ -333,10 +491,8 @@ function App() {
     upsertNote(selectedSection.name, updater(selectedNote));
   }
 
-  const totalBeats = selectedSection ? sectionTotalBeats(document, selectedSection) : 0;
-
   const overlayNotes = useMemo<OverlayNote[]>(() => {
-    if (!selectedTimelineSection) {
+    if (!showAccompaniment || !selectedTimelineSection) {
       return [];
     }
 
@@ -344,11 +500,11 @@ function App() {
       id: `overlay-${note.instrumentName}-${index}`,
       beat: note.startBeat,
       note: note.key,
-      duration: Math.max(0.1, note.durationBeats),
+      duration: Math.max(snapStep / 2, note.durationBeats),
       color: instrumentColor(note.instrumentName),
       accentColor: instrumentAccent(note.instrumentName),
     }));
-  }, [selectedTimelineSection]);
+  }, [selectedTimelineSection, showAccompaniment, snapStep]);
 
   const accompanimentLegend = useMemo(() => {
     if (!selectedTimelineSection) {
@@ -369,34 +525,48 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <h1>Idou Studio</h1>
-          <p>Visual song-intent editor, loop-preview tool, and generated accompaniment viewer for your headless synth engine.</p>
-        </div>
-        <div className="toolbar-actions">
+        <div className="toolbar-group">
+          <div className="file-pill">
+            <span className={dirty ? 'dirty-indicator dirty' : 'dirty-indicator'} />
+            <span>{currentFileLabel}</span>
+          </div>
           <button onClick={() => newDocument()}>New</button>
           <button onClick={() => void openSong()}>Open</button>
           <button onClick={() => void saveSong(false)}>Save</button>
           <button onClick={() => void saveSong(true)}>Save As</button>
-          <button className="primary" onClick={() => void playPreview(false)}>
-            Play song
+        </div>
+
+        <div className="toolbar-group transport-group">
+          <button className="transport-button primary" title="Play song" onClick={() => void playPreview(false)}>
+            ▶
           </button>
-          <button onClick={() => void playPreview(true)} disabled={!selectedSection}>
-            Loop section
+          <button className="transport-button" title="Pause or resume" onClick={() => void togglePlayback()}>
+            {playback.running && playback.transportState === 'playing' ? '⏸' : '▶'}
           </button>
-          <button onClick={() => void togglePlayback()}>{playback.running && playback.transportState === 'playing' ? 'Pause (Space)' : 'Play / Resume (Space)'}</button>
-          <button onClick={() => void stopPreview()}>Stop</button>
-          <button onClick={() => void refreshAccompaniment()} disabled={accompanimentLoading}>
-            {accompanimentLoading ? 'Refreshing…' : accompanimentDirty ? 'Refresh layers *' : 'Refresh layers'}
+          <button className="transport-button" title="Stop" onClick={() => void stopPreview()}>
+            ■
           </button>
+          <button
+            className={playback.loopSectionName ? 'transport-button active' : 'transport-button'}
+            title="Loop selected section"
+            onClick={() => void playPreview(true)}
+            disabled={!selectedSection}
+          >
+            ↻
+          </button>
+        </div>
+
+        <div className="toolbar-group toolbar-readout">
+          <span className="status-chip">{transportLabel(playback)}</span>
+          <span className="status-chip">{selectedSection ? selectedSection.name : 'no section'}</span>
+          <span className="status-chip">{currentSnapLabel}</span>
         </div>
       </header>
 
       <div className="status-strip">
-        <span>{dirty ? 'Unsaved changes' : 'Saved'}</span>
-        <span>{currentPath ?? 'Untitled song'}</span>
-        <span>{transportLabel(playback)}</span>
-        <span>Space toggles play/pause</span>
+        <span>{dirty ? 'Unsaved' : 'Saved'}</span>
+        <span>{showAccompaniment ? 'Layers visible' : 'Layers hidden'}</span>
+        <span>{selectedNote ? `Selected ${midiToNoteName(selectedNote.note)}` : 'No note selected'}</span>
       </div>
 
       <main className="workspace">
@@ -450,7 +620,7 @@ function App() {
           <section>
             <div className="panel-header">
               <h2>Sections</h2>
-              <button onClick={() => addSection()}>Add section</button>
+              <button onClick={() => addSection()}>Add</button>
             </div>
             <div className="section-list">
               {document.sections.map((section, index) => (
@@ -475,8 +645,8 @@ function App() {
                 <li key={section.name}>
                   <span>{section.name}</span>
                   <div className="inline-actions">
-                    <button onClick={() => moveSection(section.name, -1)}>Up</button>
-                    <button onClick={() => moveSection(section.name, 1)}>Down</button>
+                    <button onClick={() => moveSection(section.name, -1)}>↑</button>
+                    <button onClick={() => moveSection(section.name, 1)}>↓</button>
                   </div>
                 </li>
               ))}
@@ -489,11 +659,11 @@ function App() {
             <>
               <div className="panel section-editor">
                 <div className="panel-header">
-                  <h2>Section editor</h2>
+                  <h2>Section</h2>
                   <div className="inline-actions">
                     <button onClick={() => moveSection(selectedSection.name, -1)}>Move up</button>
                     <button onClick={() => moveSection(selectedSection.name, 1)}>Move down</button>
-                    <button onClick={() => void playPreview(true)}>Loop this section</button>
+                    <button onClick={() => void playPreview(true)}>Loop section</button>
                     <button className="danger" onClick={() => removeSection(selectedSection.name)}>
                       Delete
                     </button>
@@ -532,7 +702,7 @@ function App() {
                       min={20}
                       max={280}
                       value={selectedSection.tempoBpm ?? ''}
-                      placeholder="Use song default"
+                      placeholder="Song default"
                       onChange={(event) =>
                         setSelectedSectionField('tempoBpm', event.target.value === '' ? null : Number(event.target.value))
                       }
@@ -545,7 +715,7 @@ function App() {
                       min={1}
                       max={16}
                       value={selectedSection.beatsPerBar ?? ''}
-                      placeholder="Use song default"
+                      placeholder="Song default"
                       onChange={(event) =>
                         setSelectedSectionField('beatsPerBar', event.target.value === '' ? null : Number(event.target.value))
                       }
@@ -558,7 +728,7 @@ function App() {
                       min={1}
                       max={16}
                       value={selectedSection.beatUnit ?? ''}
-                      placeholder="Use song default"
+                      placeholder="Song default"
                       onChange={(event) =>
                         setSelectedSectionField('beatUnit', event.target.value === '' ? null : Number(event.target.value))
                       }
@@ -592,12 +762,55 @@ function App() {
 
               <div className="panel melody-panel">
                 <div className="panel-header">
-                  <h2>Melody + accompaniment</h2>
-                  <span>{totalBeats} beats visible</span>
+                  <h2>Piano roll</h2>
+                  <div className="toolbar-group compact-toolbar">
+                    <button onClick={() => duplicateSelectedNote()} disabled={!selectedNote}>
+                      Duplicate
+                    </button>
+                    <button onClick={() => removeSelectedNote()} disabled={!selectedNote}>
+                      Delete
+                    </button>
+                  </div>
                 </div>
+
+                <div className="editor-toolbar">
+                  <label className="toolbar-control">
+                    <span>Snap</span>
+                    <select value={snapStep} onChange={(event) => setSnapStep(Number(event.target.value))}>
+                      {SNAP_OPTIONS.map((option) => (
+                        <option key={option.label} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="toolbar-control zoom-control">
+                    <span>Zoom</span>
+                    <input
+                      type="range"
+                      min={24}
+                      max={84}
+                      step={2}
+                      value={beatWidth}
+                      onChange={(event) => setBeatWidth(Number(event.target.value))}
+                    />
+                  </label>
+                  <button
+                    className={showAccompaniment ? 'toggle-button active' : 'toggle-button'}
+                    onClick={() => setShowAccompaniment((value) => !value)}
+                  >
+                    Layers
+                  </button>
+                  <button onClick={() => void refreshAccompaniment()} disabled={accompanimentLoading}>
+                    {accompanimentLoading ? 'Refreshing…' : 'Refresh'}
+                  </button>
+                </div>
+
                 <MelodyGrid
-                  beatsPerBar={selectedSection.beatsPerBar ?? document.song.beatsPerBar}
+                  beatsPerBar={activeBeatsPerBar}
                   totalBeats={totalBeats}
+                  beatWidth={beatWidth}
+                  quantizeStep={snapStep}
                   notes={selectedSection.melody}
                   overlayNotes={overlayNotes}
                   selectedNoteId={selectedNoteId}
@@ -606,17 +819,17 @@ function App() {
                 />
 
                 <div className="generated-strip">
-                  <div>
-                    <strong>Generated accompaniment</strong>
+                  <div className="strip-head">
+                    <strong>Generated layers</strong>
                     <span className="hint">
                       {accompanimentLoading
-                        ? ' Refreshing generated layers...'
+                        ? 'Refreshing...'
                         : accompanimentDirty
-                          ? ' Overlay is stale until you refresh it or start playback.'
-                          : ' Overlay matches the latest generated arrangement.'}
+                          ? 'Refresh after edits'
+                          : `${selectedTimelineSection?.notes.length ?? 0} notes`}
                     </span>
                   </div>
-                  {selectedTimelineSection ? (
+                  {selectedTimelineSection && showAccompaniment ? (
                     <div className="legend-list">
                       {accompanimentLegend.map((entry) => (
                         <span key={entry.name} className="legend-chip">
@@ -629,25 +842,39 @@ function App() {
                       ))}
                     </div>
                   ) : (
-                    <div className="hint">No generated layer preview loaded for this section yet.</div>
+                    <div className="hint">
+                      {showAccompaniment ? 'No generated layer preview loaded for this section.' : 'Generated layers hidden.'}
+                    </div>
                   )}
                   {accompanimentError ? <div className="validation-inline">{accompanimentError}</div> : null}
                 </div>
 
                 {selectedNote ? (
                   <div className="note-editor">
-                    <h3>Selected note</h3>
+                    <div className="panel-header">
+                      <h3>Selected note</h3>
+                      <span className="hint">
+                        {midiToNoteName(selectedNote.note)} · beat {selectedNote.beat}
+                      </span>
+                    </div>
                     <div className="field-grid compact-grid">
                       <label>
                         Start beat
                         <input
                           type="number"
-                          step={0.25}
+                          step={snapStep}
                           min={0}
-                          max={Math.max(0, totalBeats - 0.25)}
+                          max={Math.max(0, totalBeats - snapStep)}
                           value={selectedNote.beat}
                           onChange={(event) =>
-                            updateSelectedNote((note) => ({ ...note, beat: Number(event.target.value) || 0 }))
+                            updateSelectedNote((note) => ({
+                              ...note,
+                              beat: clamp(
+                                quantizeBeat(Number(event.target.value) || 0, snapStep),
+                                0,
+                                Math.max(0, totalBeats - note.duration),
+                              ),
+                            }))
                           }
                         />
                       </label>
@@ -655,17 +882,24 @@ function App() {
                         Duration
                         <input
                           type="number"
-                          step={0.25}
-                          min={0.25}
+                          step={snapStep}
+                          min={snapStep}
                           max={totalBeats}
                           value={selectedNote.duration}
                           onChange={(event) =>
-                            updateSelectedNote((note) => ({ ...note, duration: Number(event.target.value) || 0.25 }))
+                            updateSelectedNote((note) => ({
+                              ...note,
+                              duration: clamp(
+                                quantizeBeat(Number(event.target.value) || snapStep, snapStep),
+                                snapStep,
+                                Math.max(snapStep, totalBeats - note.beat),
+                              ),
+                            }))
                           }
                         />
                       </label>
                       <label>
-                        Note name
+                        Note
                         <input
                           value={midiToNoteName(selectedNote.note)}
                           onChange={(event) => {
@@ -690,14 +924,16 @@ function App() {
                         />
                       </label>
                     </div>
-                    <div className="inline-actions">
-                      <button className="danger" onClick={() => removeNote(selectedSection.name, selectedNote.id)}>
-                        Delete note
-                      </button>
+                    <div className="shortcut-strip">
+                      <span>Space play/pause</span>
+                      <span>⌘/Ctrl+D duplicate</span>
+                      <span>Delete remove</span>
+                      <span>Arrows nudge</span>
+                      <span>Shift+Arrows large nudge</span>
                     </div>
                   </div>
                 ) : (
-                  <div className="note-editor empty-state">Select a melody note to edit its exact values.</div>
+                  <div className="note-editor empty-state">Select a note, or click in the grid to create one.</div>
                 )}
               </div>
             </>
@@ -709,16 +945,16 @@ function App() {
         <aside className="sidebar panel right-sidebar">
           <section>
             <div className="panel-header">
-              <h2>YAML preview</h2>
+              <h2>YAML</h2>
             </div>
-            <CodeMirror value={yamlPreview} height="340px" extensions={[yamlLanguage()]} editable={false} />
+            <CodeMirror value={yamlPreview} height="320px" extensions={[yamlLanguage()]} editable={false} />
           </section>
           <section>
             <div className="panel-header">
               <h2>Validation</h2>
             </div>
             {validationIssues.length === 0 ? (
-              <div className="validation-ok">No validation issues detected.</div>
+              <div className="validation-ok">No validation issues.</div>
             ) : (
               <ul className="validation-list">
                 {validationIssues.map((issue) => (
@@ -729,31 +965,33 @@ function App() {
           </section>
           <section>
             <div className="panel-header">
-              <h2>Layer stats</h2>
+              <h2>Inspector</h2>
             </div>
             {selectedTimelineSection ? (
               <div className="layer-stats">
                 <div>{selectedTimelineSection.notes.length} generated notes</div>
-                <div>{selectedTimelineSection.beatsPerBar} beats per bar</div>
-                <div>{selectedTimelineSection.totalBeats} total beats</div>
+                <div>{selectedTimelineSection.beatsPerBar} beats / bar</div>
+                <div>{selectedTimelineSection.totalBeats} visible beats</div>
               </div>
             ) : (
-              <div className="hint">Refresh generated layers to inspect the current section arrangement.</div>
+              <div className="hint">Refresh generated layers to inspect the current arrangement.</div>
             )}
           </section>
           <section>
             <div className="panel-header">
-              <h2>Engine logs</h2>
+              <h2>Engine</h2>
             </div>
             <div className="log-panel">
               {playback.logLines.length === 0 ? 'No engine output yet.' : playback.logLines.join('\n')}
             </div>
-            {playback.stagedPath ? <div className="hint">Preview file: {playback.stagedPath}</div> : null}
           </section>
         </aside>
       </main>
 
-      <footer className="footer-strip">{statusMessage}</footer>
+      <footer className="footer-strip">
+        <span>{statusMessage}</span>
+        <span>⌘/Ctrl+S Save · Space Play/Pause · Delete Remove · Arrows Nudge</span>
+      </footer>
     </div>
   );
 }

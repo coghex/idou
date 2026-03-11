@@ -24,8 +24,10 @@ Current studio workflow:
 - song-level editing for `genre`, `mood`, `tempo_bpm`, `beats_per_bar`, and `beat_unit`
 - section/form editing with reorderable sections
 - chord editing per section
-- canvas-based melody grid for note entry and reshaping
+- canvas-based melody grid for note entry, drag/resize editing, and selection
+- DAW-style transport-first layout with snap and zoom controls for the piano roll
 - looped selected-section playback plus play/pause transport control (`Space` toggles play/pause)
+- common editor shortcuts for save/open, note duplication, deletion, and keyboard nudging
 - generated accompaniment visualization overlaid on the melody grid, using the Haskell arranger output
 - generated YAML preview
 - open/save dialogs for `.yaml` / `.yml`
