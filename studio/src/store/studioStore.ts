@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import type { PatchRole } from '../lib/patch';
 import type { MelodyNote, SongDocument, SongSection } from '../lib/song';
 import { createDefaultSong, createNoteId, normalizeSectionName, sectionTotalBeats } from '../lib/song';
 import { midiToNoteName } from '../lib/note';
@@ -19,12 +20,16 @@ type EditorSnapshot = {
 
 type ClipboardNote = Pick<MelodyNote, 'beat' | 'note' | 'duration' | 'velocity'>;
 
+export type EditorMode = 'arrangement' | 'patch';
+
 type StudioState = {
   document: SongDocument;
   currentPath: string | null;
   dirty: boolean;
   selectedSectionName: string;
   selectedNoteId: string | null;
+  editorMode: EditorMode;
+  activePatchRole: PatchRole | null;
   playback: PlaybackSnapshot;
   statusMessage: string;
   savedDocumentSignature: string;
@@ -41,7 +46,10 @@ type StudioState = {
   updateSection: (sectionName: string, updater: (section: SongSection) => SongSection) => void;
   removeSection: (sectionName: string) => void;
   moveSection: (sectionName: string, direction: -1 | 1) => void;
+  reorderSection: (sectionName: string, nextIndex: number) => void;
   selectSection: (sectionName: string) => void;
+  enterPatchEditor: (role: PatchRole) => void;
+  returnToArrangement: () => void;
   setSelectedNoteId: (selectedNoteId: string | null) => void;
   upsertNote: (sectionName: string, note: MelodyNote) => void;
   removeNote: (sectionName: string, noteId: string) => void;
@@ -77,6 +85,7 @@ function defaultSection(existing: SongSection[]): SongSection {
     mood: '',
     feel: '',
     chords: ['Am', 'F', 'C', 'G'],
+    chordRegions: [],
     melody: [],
   };
 }
@@ -89,13 +98,17 @@ function cloneSection(section: SongSection): SongSection {
   return {
     ...section,
     chords: [...section.chords],
+    chordRegions: section.chordRegions.map((region) => ({ ...region })),
     melody: section.melody.map(cloneNote),
   };
 }
 
 function cloneDocument(document: SongDocument): SongDocument {
   return {
-    song: { ...document.song },
+    song: {
+      ...document.song,
+      patches: { ...document.song.patches },
+    },
     sections: document.sections.map(cloneSection),
   };
 }
@@ -147,6 +160,8 @@ function resetEditorState(document: SongDocument, currentPath: string | null, st
     dirty: false,
     selectedSectionName: selection.selectedSectionName,
     selectedNoteId: selection.selectedNoteId,
+    editorMode: 'arrangement' as EditorMode,
+    activePatchRole: null,
     savedDocumentSignature: documentSignature(cloned),
     historyPast: [],
     historyFuture: [],
@@ -182,6 +197,8 @@ function applySnapshot(
     document: nextSnapshot.document,
     selectedSectionName: nextSnapshot.selectedSectionName,
     selectedNoteId: nextSnapshot.selectedNoteId,
+    editorMode: state.editorMode,
+    activePatchRole: state.activePatchRole,
     dirty: documentSignature(nextSnapshot.document) !== state.savedDocumentSignature,
     historyPast: pushedPast,
     historyFuture,
@@ -212,6 +229,7 @@ function initialState(): Omit<
   | 'updateSection'
   | 'removeSection'
   | 'moveSection'
+  | 'reorderSection'
   | 'selectSection'
   | 'setSelectedNoteId'
   | 'upsertNote'
@@ -222,6 +240,8 @@ function initialState(): Omit<
   | 'cutSelectedNote'
   | 'pasteClipboard'
   | 'setPlayback'
+  | 'enterPatchEditor'
+  | 'returnToArrangement'
 > {
   const document = createDefaultSong();
   const cloned = cloneDocument(document);
@@ -231,6 +251,8 @@ function initialState(): Omit<
     dirty: false,
     selectedSectionName: cloned.sections[0]?.name ?? 'intro',
     selectedNoteId: null,
+    editorMode: 'arrangement',
+    activePatchRole: null,
     playback: {
       running: false,
       transportState: 'stopped',
@@ -358,7 +380,44 @@ export const useStudioStore = create<StudioState>((set, get) => ({
         { pushHistory: true },
       );
     }),
+  reorderSection: (sectionName, nextIndex) =>
+    set((state) => {
+      const document = cloneDocument(state.document);
+      const index = document.sections.findIndex((section) => section.name === sectionName);
+      if (index < 0) {
+        return state;
+      }
+
+      const boundedIndex = Math.max(0, Math.min(nextIndex, document.sections.length - 1));
+      if (index === boundedIndex) {
+        return state;
+      }
+
+      const [section] = document.sections.splice(index, 1);
+      document.sections.splice(boundedIndex, 0, section);
+      return applySnapshot(
+        state,
+        {
+          document,
+          selectedSectionName: state.selectedSectionName,
+          selectedNoteId: state.selectedNoteId,
+        },
+        { pushHistory: true, statusMessage: `Moved section ${sectionName}.` },
+      );
+    }),
   selectSection: (selectedSectionName) => set({ selectedSectionName, selectedNoteId: null }),
+  enterPatchEditor: (role) =>
+    set({
+      editorMode: 'patch',
+      activePatchRole: role,
+      statusMessage: `Editing the ${role} sound.`,
+    }),
+  returnToArrangement: () =>
+    set({
+      editorMode: 'arrangement',
+      activePatchRole: null,
+      statusMessage: 'Returned to song view.',
+    }),
   setSelectedNoteId: (selectedNoteId) => set({ selectedNoteId }),
   upsertNote: (sectionName, note) =>
     set((state) => {

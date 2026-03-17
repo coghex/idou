@@ -38,6 +38,7 @@ import Data.Maybe (fromMaybe, mapMaybe)
 import Data.Map.Strict (Map)
 import Data.Sequence (Seq, (|>))
 import Data.Word (Word32, Word64)
+import System.FilePath ((</>), isAbsolute, normalise, takeDirectory)
 
 import qualified Data.Map.Strict as M
 import qualified Data.Sequence as Seq
@@ -71,9 +72,16 @@ data ChordSpec = ChordSpec
   }
   deriving (Eq, Show)
 
+data ChordRegionSpec = ChordRegionSpec
+  { crStartBeat ∷ !Float
+  , crChord     ∷ !ChordSpec
+  }
+  deriving (Eq, Show)
+
 data InstrumentPatternSpec = InstrumentPatternSpec
   { ipName        ∷ !String
   , ipInstrumentId ∷ !InstrumentId
+  , ipPatchPath   ∷ !(Maybe FilePath)
   , ipAmp         ∷ !Float
   , ipPan         ∷ !Float
   , ipVelocityVariation ∷ !Float
@@ -93,6 +101,7 @@ data SectionSpec = SectionSpec
   , ssMood          ∷ !String
   , ssFeel          ∷ !String
   , ssChordBars     ∷ ![ChordSpec]
+  , ssChordRegions  ∷ ![ChordRegionSpec]
   , ssMelodyPhrase  ∷ ![PatternNote]
   }
   deriving (Eq, Show)
@@ -176,7 +185,7 @@ loadSongSpec ∷ FilePath → IO (Either String SongSpec)
 loadSongSpec path = do
   text <- readFile path
   _ <- evaluate (length text)
-  pure (parseSongSpecText text)
+  pure (parseSongSpecText text >>= resolveSongSpecPatchPaths (takeDirectory path))
 
 parseSongSpecText ∷ String → Either String SongSpec
 parseSongSpecText contents = do
@@ -185,6 +194,7 @@ parseSongSpecText contents = do
       genre = normalizeName (lookupTextDefault ["song", "genre"] "" entries)
       mood = normalizeName (lookupTextDefault ["song", "mood"] "" entries)
       form = parseNameList (lookupTextDefault ["song", "form"] "" entries)
+      patchOverrides = parseGeneratedPatchOverrides entries
   lookaheadBars <- max 1 <$> lookupIntKeyDefault ["song", "lookahead_bars"] 2 entries
   mode <-
     case modeRaw of
@@ -197,7 +207,7 @@ parseSongSpecText contents = do
   instruments0 <- parseInstruments sectionNames entries
   instruments <-
     if null instruments0
-      then arrangeGeneratedInstruments genre sections
+      then arrangeGeneratedInstruments genre patchOverrides sections
       else pure instruments0
   ensure (not (null instruments)) "song must define at least one instrument under instruments.<name>"
   pure
@@ -319,7 +329,7 @@ setTimelineGenre genreRaw rt = do
   genre <- validateSongGenre genreRaw
   instruments <-
     if any sectionHasArrangement (M.elems (trSections rt))
-      then arrangeGeneratedInstruments genre (trSections rt)
+      then arrangeGeneratedInstruments genre (instrumentPatchOverrides (trInstruments rt)) (trSections rt)
       else pure (trInstruments rt)
   pure
     rt
@@ -1215,7 +1225,7 @@ arrangeInstrumentBar songGenre targetMood sectionSpec absoluteBarIx barInPhrase 
     beatsPerBar = fromIntegral (max 1 (ssBeatsPerBar sectionSpec)) ∷ Float
 
 sectionHasArrangement ∷ SectionSpec → Bool
-sectionHasArrangement spec = not (null (ssChordBars spec)) || not (null (ssMelodyPhrase spec))
+sectionHasArrangement spec = (not (null (ssChordBars spec)) || not (null (ssChordRegions spec))) || not (null (ssMelodyPhrase spec))
 
 arrangeElectronicLead ∷ SectionSpec → Int → [PatternNote]
 arrangeElectronicLead sectionSpec barInPhrase =
@@ -1736,12 +1746,22 @@ arrangementDescriptorWords targetMood sectionSpec =
 
 chordForBar ∷ SectionSpec → Int → ChordSpec
 chordForBar sectionSpec barInPhrase =
-  case ssChordBars sectionSpec of
-    [] -> ChordSpec "C" 0 [0, 4, 7]
-    chords -> chords !! (barInPhrase `mod` length chords)
+  chordForPhraseBeat sectionSpec (fromIntegral (max 0 barInPhrase * max 1 (ssBeatsPerBar sectionSpec)))
 
 nextChordForBar ∷ SectionSpec → Int → ChordSpec
 nextChordForBar sectionSpec barInPhrase = chordForBar sectionSpec (barInPhrase + 1)
+
+chordForPhraseBeat ∷ SectionSpec → Float → ChordSpec
+chordForPhraseBeat sectionSpec beatInPhrase =
+  case reverse [ region | region <- ssChordRegions sectionSpec, crStartBeat region <= beatInPhrase ] of
+    region : _ -> crChord region
+    [] ->
+      case ssChordBars sectionSpec of
+        [] -> ChordSpec "C" 0 [0, 4, 7]
+        chords ->
+          let beatsPerBar = max 1 (ssBeatsPerBar sectionSpec)
+              barIx = floor (beatInPhrase / fromIntegral beatsPerBar)
+          in chords !! (barIx `mod` length chords)
 
 melodyNotesForBar ∷ SectionSpec → Int → [PatternNote]
 melodyNotesForBar sectionSpec barInPhrase =
@@ -2001,6 +2021,7 @@ compileFallbackDrumNotes sectionName sectionSpec absoluteBarIx barInPhrase barsP
         InstrumentPatternSpec
           { ipName = "auto-drums"
           , ipInstrumentId = InstrumentId 9
+          , ipPatchPath = Nothing
           , ipAmp = 1
           , ipPan = 0
           , ipVelocityVariation = 0
@@ -2493,6 +2514,7 @@ parseSections songMood entries = do
           chordRaw = lookupTextDefault ["sections", name, "chords"] "" entries
           melodyRaw = lookupTextDefault ["sections", name, "melody"] "" entries
       chordBars <- parseChordProgression name chordRaw
+      chordRegions <- parseChordRegions name beats barsPerPhrase entries
       melodyPhrase <- parsePatternNotes name melodyRaw
       ensure (tempo > 0) ("sections." <> name <> ".tempo_bpm must be > 0")
       ensure (beats > 0) ("sections." <> name <> ".beats_per_bar must be > 0")
@@ -2511,6 +2533,7 @@ parseSections songMood entries = do
             , ssMood = mood
             , ssFeel = feel
             , ssChordBars = chordBars
+            , ssChordRegions = chordRegions
             , ssMelodyPhrase = melodyPhrase
             }
         )
@@ -2527,6 +2550,7 @@ parseInstruments sectionNames entries = do
   where
     parseInstrument name = do
       iid <- lookupIntKey ["instruments", name, "instrument_id"] entries
+      let patchPath = lookupMaybePatchPath ["instruments", name] entries
       amp <- lookupFloatKeyDefault ["instruments", name, "amp"] 1 entries
       pan <- lookupFloatKeyDefault ["instruments", name, "pan"] 0 entries
       velocityVariation <- lookupFloatKeyDefault ["instruments", name, "velocity_variation"] 0 entries
@@ -2541,6 +2565,7 @@ parseInstruments sectionNames entries = do
         InstrumentPatternSpec
           { ipName = name
           , ipInstrumentId = InstrumentId iid
+          , ipPatchPath = patchPath
           , ipAmp = amp
           , ipPan = pan
           , ipVelocityVariation = velocityVariation
@@ -2596,48 +2621,52 @@ parseInstruments sectionNames entries = do
       notes <- parsePatternNotes sectionName raw
       pure (sectionName, notes)
 
-arrangeGeneratedInstruments ∷ String → Map String SectionSpec → Either String [InstrumentPatternSpec]
-arrangeGeneratedInstruments genre sections
+arrangeGeneratedInstruments ∷ String → Map String FilePath → Map String SectionSpec → Either String [InstrumentPatternSpec]
+arrangeGeneratedInstruments genre patchOverrides sections
   | not (any sectionNeedsArrangement (M.elems sections)) = pure []
-  | otherwise = generatedInstrumentSpecs genre
+  | otherwise = generatedInstrumentSpecsWithPatches genre patchOverrides
   where
     sectionNeedsArrangement spec =
       not (null (ssChordBars spec)) || not (null (ssMelodyPhrase spec))
+        || not (null (ssChordRegions spec))
 
 generatedInstrumentSpecs ∷ String → Either String [InstrumentPatternSpec]
-generatedInstrumentSpecs genre
+generatedInstrumentSpecs genre = generatedInstrumentSpecsWithPatches genre M.empty
+
+generatedInstrumentSpecsWithPatches ∷ String → Map String FilePath → Either String [InstrumentPatternSpec]
+generatedInstrumentSpecsWithPatches genre patchOverrides
   | null genre = Left "song.genre is required when using section chords/melody without explicit instruments"
   | normalizeName genre == "electronic" =
       pure
-        [ generatedInstrument "drums" 9 1.0 0 0.7 (Just (FillGeneratorSpec 0.62 0.74 2.0))
-        , generatedInstrument "bass" 38 0.88 0 0.22 Nothing
-        , generatedInstrument "pad" 88 0.52 0 0.10 Nothing
-        , generatedInstrument "arp" 81 0.46 0.12 0.18 Nothing
-        , generatedInstrument "lead" 80 0.86 (-0.05) 0.12 Nothing
+        [ generatedInstrument patchOverrides "drums" 9 1.0 0 0.7 (Just (FillGeneratorSpec 0.62 0.74 2.0))
+        , generatedInstrument patchOverrides "bass" 38 0.88 0 0.22 Nothing
+        , generatedInstrument patchOverrides "pad" 88 0.52 0 0.10 Nothing
+        , generatedInstrument patchOverrides "arp" 81 0.46 0.12 0.18 Nothing
+        , generatedInstrument patchOverrides "lead" 80 0.86 (-0.05) 0.12 Nothing
         ]
   | normalizeName genre == "ambient" =
       pure
-        [ generatedInstrument "drums" 9 0.76 0 0.24 (Just (FillGeneratorSpec 0.30 0.24 1.0))
-        , generatedInstrument "bass" 39 0.54 0 0.10 Nothing
-        , generatedInstrument "pad" 94 0.68 0 0.04 Nothing
-        , generatedInstrument "arp" 98 0.32 0.10 0.06 Nothing
-        , generatedInstrument "lead" 88 0.38 0 0.04 Nothing
+        [ generatedInstrument patchOverrides "drums" 9 0.76 0 0.24 (Just (FillGeneratorSpec 0.30 0.24 1.0))
+        , generatedInstrument patchOverrides "bass" 39 0.54 0 0.10 Nothing
+        , generatedInstrument patchOverrides "pad" 94 0.68 0 0.04 Nothing
+        , generatedInstrument patchOverrides "arp" 98 0.32 0.10 0.06 Nothing
+        , generatedInstrument patchOverrides "lead" 88 0.38 0 0.04 Nothing
         ]
   | normalizeName genre == "blackmetal" =
       pure
-        [ generatedInstrument "drums" 9 1.0 0 0.58 (Just (FillGeneratorSpec 0.78 0.84 2.0))
-        , generatedInstrument "bass" 34 0.92 0 0.18 Nothing
-        , generatedInstrument "pad" 48 0.58 0 0.08 Nothing
-        , generatedInstrument "arp" 30 0.84 (-0.08) 0.14 Nothing
-        , generatedInstrument "lead" 31 0.90 0.08 0.12 Nothing
+        [ generatedInstrument patchOverrides "drums" 9 1.0 0 0.58 (Just (FillGeneratorSpec 0.78 0.84 2.0))
+        , generatedInstrument patchOverrides "bass" 34 0.92 0 0.18 Nothing
+        , generatedInstrument patchOverrides "pad" 48 0.58 0 0.08 Nothing
+        , generatedInstrument patchOverrides "arp" 30 0.84 (-0.08) 0.14 Nothing
+        , generatedInstrument patchOverrides "lead" 31 0.90 0.08 0.12 Nothing
         ]
   | normalizeName genre == "cinematic" =
       pure
-        [ generatedInstrument "drums" 9 0.96 0 0.38 (Just (FillGeneratorSpec 0.48 0.54 1.5))
-        , generatedInstrument "bass" 43 0.82 0 0.12 Nothing
-        , generatedInstrument "pad" 91 0.62 0 0.06 Nothing
-        , generatedInstrument "arp" 48 0.44 0.08 0.10 Nothing
-        , generatedInstrument "lead" 61 0.78 0 0.08 Nothing
+        [ generatedInstrument patchOverrides "drums" 9 0.96 0 0.38 (Just (FillGeneratorSpec 0.48 0.54 1.5))
+        , generatedInstrument patchOverrides "bass" 43 0.82 0 0.12 Nothing
+        , generatedInstrument patchOverrides "pad" 91 0.62 0 0.06 Nothing
+        , generatedInstrument patchOverrides "arp" 48 0.44 0.08 0.10 Nothing
+        , generatedInstrument patchOverrides "lead" 61 0.78 0 0.08 Nothing
         ]
   | otherwise = Left ("unsupported song.genre: " <> genre <> " (expected electronic|ambient|blackmetal|cinematic)")
 
@@ -2655,11 +2684,12 @@ lookupGeneratedInstrument genre instrumentName = do
             <> ")"
         )
 
-generatedInstrument ∷ String → Int → Float → Float → Float → Maybe FillGeneratorSpec → InstrumentPatternSpec
-generatedInstrument name iid amp pan velocityVariation fillGenerator =
+generatedInstrument ∷ Map String FilePath → String → Int → Float → Float → Float → Maybe FillGeneratorSpec → InstrumentPatternSpec
+generatedInstrument patchOverrides name iid amp pan velocityVariation fillGenerator =
   InstrumentPatternSpec
     { ipName = name
     , ipInstrumentId = InstrumentId iid
+    , ipPatchPath = M.lookup (normalizeName name) patchOverrides
     , ipAmp = amp
     , ipPan = pan
     , ipVelocityVariation = velocityVariation
@@ -2667,6 +2697,68 @@ generatedInstrument name iid amp pan velocityVariation fillGenerator =
     , ipFills = M.empty
     , ipFillGenerator = fillGenerator
     }
+
+parseGeneratedPatchOverrides ∷ FlatYaml → Map String FilePath
+parseGeneratedPatchOverrides entries =
+  M.fromList
+    [ (normalizeName role, patchPath)
+    | path <- M.keys entries
+    , Just role <- [songPatchRole path]
+    , Just patchPath <- [lookupMaybeGeneratedPatchPath role entries]
+    ]
+
+songPatchRole ∷ [String] → Maybe String
+songPatchRole path =
+  case path of
+    ["song", "patches", role] -> Just role
+    ["song", "patches", role, "patch"] -> Just role
+    ["song", "patches", role, "patch_file"] -> Just role
+    _ -> Nothing
+
+lookupMaybePatchPath ∷ [String] → FlatYaml → Maybe FilePath
+lookupMaybePatchPath basePath entries =
+  case nonEmptyText (lookupTextDefault (basePath <> ["patch"]) "" entries) of
+    Just patchPath -> Just patchPath
+    Nothing -> nonEmptyText (lookupTextDefault (basePath <> ["patch_file"]) "" entries)
+
+lookupMaybeGeneratedPatchPath ∷ String → FlatYaml → Maybe FilePath
+lookupMaybeGeneratedPatchPath role entries =
+  case nonEmptyText (lookupTextDefault ["song", "patches", role] "" entries) of
+    Just patchPath -> Just patchPath
+    Nothing -> lookupMaybePatchPath ["song", "patches", role] entries
+
+instrumentPatchOverrides ∷ [InstrumentPatternSpec] → Map String FilePath
+instrumentPatchOverrides instruments =
+  M.fromList
+    [ (normalizeName (ipName inst), patchPath)
+    | inst <- instruments
+    , Just patchPath <- [ipPatchPath inst]
+    ]
+
+resolveSongSpecPatchPaths ∷ FilePath → SongSpec → Either String SongSpec
+resolveSongSpecPatchPaths baseDir spec =
+  pure
+    spec
+      { sgInstruments = map (resolveInstrumentPatchPath baseDir) (sgInstruments spec)
+      }
+
+resolveInstrumentPatchPath ∷ FilePath → InstrumentPatternSpec → InstrumentPatternSpec
+resolveInstrumentPatchPath baseDir inst =
+  inst
+    { ipPatchPath = fmap (resolvePatchPath baseDir) (ipPatchPath inst)
+    }
+
+resolvePatchPath ∷ FilePath → FilePath → FilePath
+resolvePatchPath baseDir rawPath =
+  let path = trim rawPath
+  in if null path
+       then path
+       else
+         normalise
+           ( if isAbsolute path
+               then path
+               else baseDir </> path
+           )
 
 isSupportedGenre ∷ String → Bool
 isSupportedGenre genre =
@@ -2706,6 +2798,41 @@ parseChordProgression ∷ String → String → Either String [ChordSpec]
 parseChordProgression _sectionName rawChords =
   let tokens = filter (not . null) (map trim (splitOn ',' rawChords))
   in mapM parseChordSymbol tokens
+
+parseChordRegions ∷ String → Int → Int → FlatYaml → Either String [ChordRegionSpec]
+parseChordRegions sectionName beatsPerBar barsPerPhrase entries = do
+  let regionNames =
+        nub
+          [ regionName
+          | path <- M.keys entries
+          , Just ("sections", name, "chord_regions", regionName) <- [prefix4 path]
+          , name == sectionName
+          ]
+  regions <- sortOn crStartBeat <$> mapM parseRegion regionNames
+  case regions of
+    [] -> pure []
+    firstRegion : _ -> do
+      ensure (abs (crStartBeat firstRegion) < 0.0001) ("sections." <> sectionName <> ".chord_regions must start at beat 0")
+      pure regions
+  where
+    phraseBeats = fromIntegral (max 1 beatsPerBar * max 1 barsPerPhrase)
+    parseRegion regionName = do
+      let basePath = ["sections", sectionName, "chord_regions", regionName]
+          symbol =
+            let fromSymbol = lookupTextDefault (basePath <> ["symbol"]) "" entries
+            in if null fromSymbol
+                 then lookupTextDefault (basePath <> ["chord"]) "" entries
+                 else fromSymbol
+      ensure (not (null symbol)) ("missing key " <> renderPath (basePath <> ["symbol"]))
+      startBeat <- lookupFloatKey (basePath <> ["start_beat"]) entries
+      ensure (startBeat >= 0) ("sections." <> sectionName <> ".chord_regions." <> regionName <> ".start_beat must be >= 0")
+      ensure (startBeat < phraseBeats) ("sections." <> sectionName <> ".chord_regions." <> regionName <> ".start_beat must be inside the phrase")
+      chord <- parseChordSymbol symbol
+      pure
+        ChordRegionSpec
+          { crStartBeat = startBeat
+          , crChord = chord
+          }
 
 type FlatYaml = Map [String] String
 
@@ -2753,6 +2880,10 @@ parseKeyValue lineNo content =
 prefix2 ∷ [a] → Maybe (a, a)
 prefix2 (a : b : _) = Just (a, b)
 prefix2 _ = Nothing
+
+prefix4 ∷ [a] → Maybe (a, a, a, a)
+prefix4 (a : b : c : d : _) = Just (a, b, c, d)
+prefix4 _ = Nothing
 
 lookupIntKey ∷ [String] → FlatYaml → Either String Int
 lookupIntKey key entries =

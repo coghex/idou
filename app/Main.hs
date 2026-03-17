@@ -3,7 +3,7 @@
 module Main where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Exception (bracket)
+import Control.Exception (SomeException, bracket, displayException, try)
 import Control.Monad (forM_)
 import Data.Char (isSpace, toLower)
 import Data.IORef (IORef, atomicModifyIORef', newIORef)
@@ -18,9 +18,11 @@ import qualified Data.ByteString.Lazy.Char8 as BL
 import qualified Data.Map.Strict as M
 
 import Audio.Config (audioConfigPath, loadAudioConfig)
-import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmDrumInstrument, gmProgramInstrument)
+import Audio.Patch.Loader (loadInstrumentPatch)
+import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmDrumInstrument)
 import Audio.Thread
 import Audio.Types
+import Player.Instrument (loadResolvedInstrument, usesBuiltInDrumPatch)
 import Player.Thread
 import Player.Timeline
   ( InstrumentPatternSpec(..)
@@ -40,6 +42,7 @@ data CliMode
   = CliPlay !AudioHealthVerbosity !FilePath
   | CliDumpTimeline !FilePath
   | CliNotePreview !AudioHealthVerbosity
+  | CliCheckPatch !FilePath
 
 main ∷ IO ()
 main = do
@@ -62,6 +65,8 @@ main = do
             bracket (startPlayerThread sys) stopPlayerThread $ \player -> do
               preloadChannels sys
               runNotePreviewShell sys player
+        CliCheckPatch patchPath ->
+          checkPatchFile patchPath
     Left usage -> do
       putStrLn usage
       exitSuccess
@@ -69,32 +74,37 @@ main = do
 --------------------------------------------------------------------------------
 
 parseCliArgs ∷ [String] → Either String CliMode
-parseCliArgs = go AudioHealthNormal False False Nothing
+parseCliArgs = go AudioHealthNormal False False False Nothing
   where
-    go verbosity dumpTimeline notePreview inputPath [] =
-      case (dumpTimeline, notePreview, inputPath) of
-        (False, False, Just p) -> Right (CliPlay verbosity p)
-        (True, False, Just p) -> Right (CliDumpTimeline p)
-        (False, True, Nothing) -> Right (CliNotePreview verbosity)
+    go verbosity dumpTimeline notePreview checkPatch inputPath [] =
+      case (dumpTimeline, notePreview, checkPatch, inputPath) of
+        (False, False, False, Just p) -> Right (CliPlay verbosity p)
+        (True, False, False, Just p) -> Right (CliDumpTimeline p)
+        (False, True, False, Nothing) -> Right (CliNotePreview verbosity)
+        (False, False, True, Just p) -> Right (CliCheckPatch p)
         _ -> Left usageText
-    go verbosity dumpTimeline notePreview inputPath (arg : rest) =
+    go verbosity dumpTimeline notePreview checkPatch inputPath (arg : rest) =
       case arg of
         "--dump-timeline-json" ->
           if dumpTimeline
             then Left usageText
-            else go verbosity True notePreview inputPath rest
+            else go verbosity True notePreview checkPatch inputPath rest
         "--note-preview-shell" ->
           if notePreview
             then Left usageText
-            else go verbosity dumpTimeline True inputPath rest
+            else go verbosity dumpTimeline True checkPatch inputPath rest
+        "--check-patch" ->
+          if checkPatch
+            then Left usageText
+            else go verbosity dumpTimeline notePreview True inputPath rest
         "--audio-health" ->
-          go AudioHealthNormal dumpTimeline notePreview inputPath rest
+          go AudioHealthNormal dumpTimeline notePreview checkPatch inputPath rest
         "--audio-health=off" ->
-          go AudioHealthOff dumpTimeline notePreview inputPath rest
+          go AudioHealthOff dumpTimeline notePreview checkPatch inputPath rest
         "--audio-health=normal" ->
-          go AudioHealthNormal dumpTimeline notePreview inputPath rest
+          go AudioHealthNormal dumpTimeline notePreview checkPatch inputPath rest
         "--audio-health=verbose" ->
-          go AudioHealthVerbose dumpTimeline notePreview inputPath rest
+          go AudioHealthVerbose dumpTimeline notePreview checkPatch inputPath rest
         _ ->
           case stripPrefix "--audio-health=" arg of
             Just _ ->
@@ -104,7 +114,7 @@ parseCliArgs = go AudioHealthNormal False False Nothing
                 then Left ("Unknown option " <> arg <> "\n" <> usageText)
                 else
                   case inputPath of
-                    Nothing -> go verbosity dumpTimeline notePreview (Just arg) rest
+                    Nothing -> go verbosity dumpTimeline notePreview checkPatch (Just arg) rest
                     Just _ -> Left usageText
 
 usageText ∷ String
@@ -113,8 +123,19 @@ usageText =
     [ "usage: idou [--audio-health|--audio-health=off|--audio-health=normal|--audio-health=verbose] <file.mid|file.midi|file.wav|song.yaml>"
     , "   or: idou --dump-timeline-json <song.yaml>"
     , "   or: idou [--audio-health=off|--audio-health=normal|--audio-health=verbose] --note-preview-shell"
+    , "   or: idou --check-patch <patch.yaml>"
     , "  --audio-health defaults to normal and reports runtime health on anomalies."
     ]
+
+checkPatchFile ∷ FilePath → IO ()
+checkPatchFile patchPath = do
+  result <- try (loadInstrumentPatch patchPath) ∷ IO (Either SomeException Instrument)
+  case result of
+    Left ex -> do
+      hPutStrLn stderr (displayException ex)
+      exitFailure
+    Right _ ->
+      putStrLn ("Patch OK: " <> patchPath)
 
 dumpTimelineJson ∷ FilePath → IO ()
 dumpTimelineJson inputPath = do
@@ -263,6 +284,7 @@ data PromptCmd
   | PromptStop
   | PromptPanic
   | PromptPreviewNote !String !String !Int !Float !Int
+  | PromptPreviewPatch !FilePath !Int !Float !Int
   | PromptUnknown !String
 
 playSongTimelineInteractive ∷ AudioSystem → PlayerSystem → FilePath → IO ()
@@ -351,6 +373,9 @@ runPromptCommand sys player instCounterRef cmd =
     PromptPreviewNote genre instrumentName key velocity durationMs -> do
       previewGeneratedNote sys instCounterRef genre instrumentName key velocity durationMs
       pure False
+    PromptPreviewPatch patchPath key velocity durationMs -> do
+      previewPatchNote sys instCounterRef patchPath key velocity durationMs
+      pure False
     PromptUnknown msg -> do
       putStrLn msg
       pure False
@@ -359,6 +384,7 @@ parsePromptCmd ∷ String → PromptCmd
 parsePromptCmd raw =
   let ws = words raw
       lower = map (map toLower) ws
+      tabs = splitTabs raw
       parseFloat s = case reads s of
         [(x, "")] -> Just x
         _ -> Nothing
@@ -376,59 +402,83 @@ parsePromptCmd raw =
         let m = trim s
             lowered = map toLower m
         in if null m || lowered == "none" || lowered == "default"
-              then Nothing
-              else Just m
+             then Nothing
+             else Just m
   in
-    case lower of
-      [] -> PromptHelp
-      ["help"] -> PromptHelp
-      ["h"] -> PromptHelp
-      ["q"] -> PromptQuit
-      ["quit"] -> PromptQuit
-      ["exit"] -> PromptQuit
-      ["panic"] -> PromptPanic
-      ["start"] -> PromptStart
-      ["stop"] -> PromptStop
-      ["note", genre, instrumentName, keyS] ->
+    case tabs of
+      ["patch", patchPath, keyS] ->
         case parseInt keyS of
-          Just key -> PromptPreviewNote genre instrumentName key 0.72 360
-          Nothing -> PromptUnknown "Usage: note <genre> <instrument> <midi-key> [velocity 0..1] [duration-ms]"
-      ["note", genre, instrumentName, keyS, velocityS] ->
+          Just key -> PromptPreviewPatch patchPath key 0.72 360
+          Nothing -> PromptUnknown "Usage: patch <path> <midi-key> [velocity 0..1] [duration-ms]"
+      ["patch", patchPath, keyS, velocityS] ->
         case (parseInt keyS, parseFloat velocityS) of
-          (Just key, Just velocity) -> PromptPreviewNote genre instrumentName key velocity 360
-          _ -> PromptUnknown "Usage: note <genre> <instrument> <midi-key> [velocity 0..1] [duration-ms]"
-      ["note", genre, instrumentName, keyS, velocityS, durationS] ->
+          (Just key, Just velocity) -> PromptPreviewPatch patchPath key velocity 360
+          _ -> PromptUnknown "Usage: patch <path> <midi-key> [velocity 0..1] [duration-ms]"
+      ["patch", patchPath, keyS, velocityS, durationS] ->
         case (parseInt keyS, parseFloat velocityS, parseInt durationS) of
-          (Just key, Just velocity, Just durationMs) ->
-            PromptPreviewNote genre instrumentName key velocity durationMs
-          _ -> PromptUnknown "Usage: note <genre> <instrument> <midi-key> [velocity 0..1] [duration-ms]"
-      ["cancel-energy"] -> PromptCancelEnergy
-      ["cancel-mood"] -> PromptCancelMood
-      ("genre" : genreParts) ->
-        PromptGenre (parseMaybeLabel (unwords genreParts))
-      ("mood" : moodParts) ->
-        PromptMood (parseMaybeLabel (unwords moodParts))
-      ["energy", x] ->
-        maybe (PromptUnknown "Usage: energy <0..1>") PromptEnergy (parseFloat x)
-      ["tempo", x] ->
-        maybe (PromptUnknown "Usage: tempo <bpm>") PromptTempo (parseFloat x)
-      ["meter", x] ->
-        maybe (PromptUnknown "Usage: meter <beats-per-bar>") PromptMeter (parseInt x)
-      ["auto-energy", targetS, barsS] ->
-        case (parseFloat targetS, parseInt barsS) of
-          (Just target, Just bars) -> PromptAutoEnergy target bars AutomationLinear
-          _ -> PromptUnknown "Usage: auto-energy <target 0..1> <bars> [step|linear|ease]"
-      ["auto-energy", targetS, barsS, curveS] ->
-        case (parseFloat targetS, parseInt barsS, parseCurve curveS) of
-          (Just target, Just bars, Just curve) -> PromptAutoEnergy target bars curve
-          _ -> PromptUnknown "Usage: auto-energy <target 0..1> <bars> [step|linear|ease]"
-      ("auto-mood" : barsS : moodPartsRev) ->
-        case parseInt barsS of
-          Nothing -> PromptUnknown "Usage: auto-mood <bars> <mood|none>"
-          Just bars ->
-            let moodText = unwords moodPartsRev
-            in PromptAutoMood (parseMaybeLabel moodText) bars
-      _ -> PromptUnknown "Unknown command. Type `help` for available commands."
+          (Just key, Just velocity, Just durationMs) -> PromptPreviewPatch patchPath key velocity durationMs
+          _ -> PromptUnknown "Usage: patch <path> <midi-key> [velocity 0..1] [duration-ms]"
+      _ ->
+        case lower of
+          [] -> PromptHelp
+          ["help"] -> PromptHelp
+          ["h"] -> PromptHelp
+          ["q"] -> PromptQuit
+          ["quit"] -> PromptQuit
+          ["exit"] -> PromptQuit
+          ["panic"] -> PromptPanic
+          ["start"] -> PromptStart
+          ["stop"] -> PromptStop
+          ["note", genre, instrumentName, keyS] ->
+            case parseInt keyS of
+              Just key -> PromptPreviewNote genre instrumentName key 0.72 360
+              Nothing -> PromptUnknown "Usage: note <genre> <instrument> <midi-key> [velocity 0..1] [duration-ms]"
+          ["note", genre, instrumentName, keyS, velocityS] ->
+            case (parseInt keyS, parseFloat velocityS) of
+              (Just key, Just velocity) -> PromptPreviewNote genre instrumentName key velocity 360
+              _ -> PromptUnknown "Usage: note <genre> <instrument> <midi-key> [velocity 0..1] [duration-ms]"
+          ["note", genre, instrumentName, keyS, velocityS, durationS] ->
+            case (parseInt keyS, parseFloat velocityS, parseInt durationS) of
+              (Just key, Just velocity, Just durationMs) ->
+                PromptPreviewNote genre instrumentName key velocity durationMs
+              _ -> PromptUnknown "Usage: note <genre> <instrument> <midi-key> [velocity 0..1] [duration-ms]"
+          ["cancel-energy"] -> PromptCancelEnergy
+          ["cancel-mood"] -> PromptCancelMood
+          ("genre" : genreParts) ->
+            PromptGenre (parseMaybeLabel (unwords genreParts))
+          ("mood" : moodParts) ->
+            PromptMood (parseMaybeLabel (unwords moodParts))
+          ["energy", x] ->
+            maybe (PromptUnknown "Usage: energy <0..1>") PromptEnergy (parseFloat x)
+          ["tempo", x] ->
+            maybe (PromptUnknown "Usage: tempo <bpm>") PromptTempo (parseFloat x)
+          ["meter", x] ->
+            maybe (PromptUnknown "Usage: meter <beats-per-bar>") PromptMeter (parseInt x)
+          ["auto-energy", targetS, barsS] ->
+            case (parseFloat targetS, parseInt barsS) of
+              (Just target, Just bars) -> PromptAutoEnergy target bars AutomationLinear
+              _ -> PromptUnknown "Usage: auto-energy <target 0..1> <bars> [step|linear|ease]"
+          ["auto-energy", targetS, barsS, curveS] ->
+            case (parseFloat targetS, parseInt barsS, parseCurve curveS) of
+              (Just target, Just bars, Just curve) -> PromptAutoEnergy target bars curve
+              _ -> PromptUnknown "Usage: auto-energy <target 0..1> <bars> [step|linear|ease]"
+          ("auto-mood" : barsS : moodPartsRev) ->
+            case parseInt barsS of
+              Nothing -> PromptUnknown "Usage: auto-mood <bars> <mood|none>"
+              Just bars ->
+                let moodText = unwords moodPartsRev
+                in PromptAutoMood (parseMaybeLabel moodText) bars
+          _ -> PromptUnknown "Unknown command. Type `help` for available commands."
+  where
+    splitTabs line =
+      case map trim (splitOnTabs line) of
+        [] -> []
+        parts -> filter (not . null) parts
+
+    splitOnTabs line =
+      case break (== '\t') line of
+        (chunk, []) -> [chunk]
+        (chunk, _ : rest) -> chunk : splitOnTabs rest
 
 printPromptHelp ∷ IO ()
 printPromptHelp =
@@ -442,6 +492,8 @@ printPromptHelp =
       , "  panic                    Stop all audio voices/clips immediately"
       , "  note <genre> <instrument> <midi-key> [velocity] [duration-ms]"
       , "                           Preview one generated instrument note"
+      , "  patch <path> <midi-key> [velocity] [duration-ms]"
+      , "                           Preview one external patch file"
       , "  genre <name|default>     Set/clear live genre override"
       , "  mood <name|none>         Set/clear mood target"
       , "  energy <0..1>            Set energy target immediately"
@@ -553,27 +605,84 @@ previewGeneratedNote sys instCounterRef genre instrumentName key velocity durati
           velocity' = max 0 (min 1 velocity)
           durationUs = max 1 durationMs * 1000
           baseIid = ipInstrumentId instrumentSpec
+          useBuiltInDrums = usesBuiltInDrumPatch instrumentSpec
           previewIid =
-            if map toLower (ipName instrumentSpec) == "drums"
+            if useBuiltInDrums
               then previewDrumInstrumentId normalizedKey
               else baseIid
           previewKey =
-            if map toLower (ipName instrumentSpec) == "drums"
+            if useBuiltInDrums
               then NoteKey 60
               else NoteKey normalizedKey
       noteInst <- nextPreviewInstanceId instCounterRef
-      case map toLower (ipName instrumentSpec) of
-        "drums" ->
-          sendAudio sys (AudioLoadInstrument previewIid (gmDrumInstrument normalizedKey))
-        _ ->
-          let InstrumentId program = baseIid
-          in sendAudio sys (AudioLoadInstrument previewIid (gmProgramInstrument program))
+      loadResult <- try (loadPreviewInstrument instrumentSpec normalizedKey previewIid) ∷ IO (Either SomeException ())
+      case loadResult of
+        Left ex ->
+          putStrLn ("[preview] " <> displayException ex)
+        Right () -> do
+          sendAudio
+            sys
+            (AudioNoteOn
+              { instrumentId = previewIid
+              , amp = ipAmp instrumentSpec
+              , pan = ipPan instrumentSpec
+              , noteKey = previewKey
+              , noteInstanceId = noteInst
+              , velocity = velocity'
+              , adsrOverride = Nothing
+              })
+          _ <- forkIO $ do
+            threadDelay durationUs
+            sendAudio sys (AudioNoteOff previewIid noteInst)
+          putStrLn
+            ( "[preview] note "
+                <> show normalizedKey
+                <> " on "
+                <> ipName instrumentSpec
+                <> " (genre="
+                <> genre
+                <> ", velocity="
+                <> show velocity'
+                <> ", durationMs="
+                <> show (max 1 durationMs)
+                <> ")"
+            )
+  where
+    loadPreviewInstrument instrumentSpec normalizedKey previewIid =
+      if usesBuiltInDrumPatch instrumentSpec
+        then sendAudio sys (AudioLoadInstrument previewIid (gmDrumInstrument normalizedKey))
+        else do
+          inst <- loadResolvedInstrument instrumentSpec
+          sendAudio sys (AudioLoadInstrument previewIid inst)
+
+nextPreviewInstanceId ∷ IORef Word64 → IO NoteInstanceId
+nextPreviewInstanceId ref =
+  NoteInstanceId <$> atomicModifyIORef' ref (\n -> (n + 1, n))
+
+previewDrumInstrumentId ∷ Int → InstrumentId
+previewDrumInstrumentId key =
+  InstrumentId (128 + max 0 (min 127 key))
+
+previewPatchNote ∷ AudioSystem → IORef Word64 → FilePath → Int → Float → Int → IO ()
+previewPatchNote sys instCounterRef patchPath key velocity durationMs = do
+  let normalizedKey = max 0 (min 127 key)
+      velocity' = max 0 (min 1 velocity)
+      durationUs = max 1 durationMs * 1000
+      previewIid = InstrumentId 255
+      previewKey = NoteKey normalizedKey
+  noteInst <- nextPreviewInstanceId instCounterRef
+  loadResult <- try (loadInstrumentPatch patchPath) ∷ IO (Either SomeException Instrument)
+  case loadResult of
+    Left ex ->
+      putStrLn ("[preview] " <> displayException ex)
+    Right inst -> do
+      sendAudio sys (AudioLoadInstrument previewIid inst)
       sendAudio
         sys
         (AudioNoteOn
           { instrumentId = previewIid
-          , amp = ipAmp instrumentSpec
-          , pan = ipPan instrumentSpec
+          , amp = 1
+          , pan = 0
           , noteKey = previewKey
           , noteInstanceId = noteInst
           , velocity = velocity'
@@ -583,26 +692,15 @@ previewGeneratedNote sys instCounterRef genre instrumentName key velocity durati
         threadDelay durationUs
         sendAudio sys (AudioNoteOff previewIid noteInst)
       putStrLn
-        ( "[preview] note "
+        ( "[preview] patch "
+            <> patchPath
+            <> " note "
             <> show normalizedKey
-            <> " on "
-            <> ipName instrumentSpec
-            <> " (genre="
-            <> genre
-            <> ", velocity="
+            <> " velocity="
             <> show velocity'
-            <> ", durationMs="
+            <> " durationMs="
             <> show (max 1 durationMs)
-            <> ")"
         )
-
-nextPreviewInstanceId ∷ IORef Word64 → IO NoteInstanceId
-nextPreviewInstanceId ref =
-  NoteInstanceId <$> atomicModifyIORef' ref (\n -> (n + 1, n))
-
-previewDrumInstrumentId ∷ Int → InstrumentId
-previewDrumInstrumentId key =
-  InstrumentId (128 + max 0 (min 127 key))
 
 waitForQuit ∷ AudioSystem → IO ()
 waitForQuit sys = do

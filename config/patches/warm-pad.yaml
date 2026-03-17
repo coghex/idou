@@ -1,0 +1,77 @@
+patch:
+  name: Warm Pad
+  nodes:
+    osc1:
+      type: oscillator
+      waveform: saw
+      level: 0.62
+      pitch:
+        cents: -7
+    osc2:
+      type: oscillator
+      waveform: saw
+      level: 0.58
+      pitch:
+        cents: 7
+    noise1:
+      type: noise
+      color: mix
+      mix: 0.35
+      level: 0.08
+    amp_env:
+      type: envelope
+      attack: 0.08
+      decay: 1.20
+      sustain: 0.72
+      release: 1.80
+    filter_env:
+      type: envelope
+      attack: 0.02
+      decay: 0.90
+      sustain: 0.14
+      release: 1.30
+    filter1:
+      type: filter
+      mode: lowpass
+      cutoff_hz: 1800
+      q: 0.74
+      slope: 24
+      key_track: 0.38
+      env_amount_oct: 1.45
+      q_env_amount: 0.08
+    out:
+      type: output
+      gain: 0.82
+      layer_spread: 0.18
+      play_mode: poly
+      poly_max: 12
+      voice_steal: quietest
+  connections:
+    osc1_to_filter:
+      from: osc1
+      to: filter1
+      kind: signal
+    osc2_to_filter:
+      from: osc2
+      to: filter1
+      kind: signal
+    noise_to_filter:
+      from: noise1
+      to: filter1
+      kind: signal
+    filter_to_out:
+      from: filter1
+      to: out
+      kind: signal
+    amp_to_out:
+      from: amp_env
+      to: out
+      kind: amp_envelope
+    filter_env_to_filter:
+      from: filter_env
+      to: filter1
+      kind: filter_envelope
+    osc1_syncs_osc2:
+      from: osc1
+      to: osc2
+      kind: hard_sync

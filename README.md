@@ -22,11 +22,13 @@ The repository now also includes a companion desktop editor in `studio/` for aut
 
 Current studio workflow:
 - song-level editing for `genre`, `mood`, `tempo_bpm`, `beats_per_bar`, and `beat_unit`
+- generated-role patch assignment via `song.patches.*`, with patch library browsing and portable relative-path saves where possible
 - section/form editing with reorderable sections
 - chord editing per section, with compact presets, roman-numeral feedback, and transpose helpers
 - canvas-based melody grid for note entry, drag/resize editing, and selection
 - DAW-style transport-first layout with snap and zoom controls for the piano roll
 - piano-key auditioning for generated `lead`, `pad`, `arp`, and `bass` layers using the current song genre
+- patch editing for the modular YAML format: node/connection browser, graph-canvas patcher with drag-to-wire cables, inline node controls, inline wire editing, inspector controls, YAML preview, runtime validation, and direct patch audition
 - looped selected-section playback plus play/pause transport control (`Space` toggles play/pause)
 - common editor shortcuts for save/open, undo/redo, note clipboard, duplication, deletion, and keyboard nudging
 - generated accompaniment visualization overlaid on the melody grid, using the Haskell arranger output
@@ -43,6 +45,7 @@ npm run tauri dev
 ```
 
 The studio is intentionally a separate tool: the Haskell engine remains the playback source of truth, and the GUI shells out to `cabal run idou -- <staged-preview.yaml>` for preview.
+Patch validation uses `cabal run idou -- --check-patch <patch.yaml>`, and patch auditioning uses the note-preview shell with direct external patch-file preview commands.
 
 When launching with `.yaml`/`.yml`, the CLI opens an interactive prompt (`idou>`) for live control (`help` shows commands like `genre`, `mood`, `energy`, `auto-energy`, `auto-mood`, `tempo`, `meter`, `start`, `stop`, `panic`, `quit`).
 
@@ -56,6 +59,24 @@ Telemetry behavior can be tuned in `config/audio.yaml` under `audio.telemetry`:
 - `verbose_report_every_loops`
 - `partial_write_alert_threshold`
 
+## Experimental patch graph YAML
+
+The repository now includes an experimental voice-local patch loader/compiler in `Audio.Patch.Loader`.
+
+- Patch files live separately from songs, for example `config/patches/warm-pad.yaml`
+- The current schema uses explicit typed `nodes` and `connections`
+- Supported node types in this first pass are `oscillator`, `noise`, `envelope`, `filter`, and `output`
+- The compiler lowers those graphs into the current runtime `Instrument` type
+- Signal graphs are intentionally constrained to the current engine model: up to 4 signal layers, at most one compiled filter stage in the active path, and no global/shared FX routing yet
+- Song YAML can now point at external patch files:
+  - explicit pattern instruments may set `instruments.<name>.patch` or `instruments.<name>.patch_file`
+  - generated song-intent roles may set `song.patches.<role>` or `song.patches.<role>.patch`
+  - supported generated roles currently match the arranger layers: `drums`, `bass`, `pad`, `arp`, and `lead`
+- Patch paths are resolved relative to the loaded song file, so song folders can carry their own patch assets
+- Runtime playback, live genre switching, and the note-preview shell all preserve those patch overrides instead of falling back to the baked-in GM-style defaults
+
+This loader/compiler now powers the first studio patch browser/editor pass, including a graph-canvas patcher; the next step is improving higher-level sound-design ergonomics on top of these external patch definitions.
+
 ## Timeline song YAML
 
 The recommended schema is now a higher-level song-intent format:
@@ -65,6 +86,7 @@ The recommended schema is now a higher-level song-intent format:
 - `song.form` is a comma-separated section order such as `intro,verse,chorus,bridge,outro`
 - `sections.<name>` defines `bars_per_phrase`, `phrase_count`, optional `mood`, `feel`, plus:
   - `chords: Am,F,C,G` for one chord per bar in the phrase
+  - or `chord_regions.<change>.start_beat` + `symbol` for beat-level chord changes within the phrase
   - `melody: 0.0/A4/0.5/0.62,1.5/C5/0.5/0.58,...` where beat offsets are phrase-relative
 
 Example:
@@ -83,6 +105,20 @@ sections:
     phrase_count: 1
     chords: Am(add9),Fmaj7,Dm7,Esus4
     melody: 2.0/A4/1.0/0.54,3.0/C5/0.75/0.58,3.75/E5/0.25/0.62
+
+  verse:
+    bars_per_phrase: 2
+    phrase_count: 1
+    chord_regions:
+      change_1:
+        start_beat: 0
+        symbol: Am
+      change_2:
+        start_beat: 2
+        symbol: F
+      change_3:
+        start_beat: 6
+        symbol: G
 ```
 
 For the new schema, the arranger generates drums, bass, pad, arp, and lead layers in Haskell from genre + mood + harmony/melody, and drum fills still honor the existing generated-fill system. Basslines and accompaniment now use chord-aware support tones, melody-guided extension tones, approach notes into upcoming roots, and smoother pad voicings so the generated harmony reacts to both the progression and the authored melodic anchor instead of repeating a fixed root/fifth loop. While the timeline is playing, `genre <name|default>` swaps the active arranger pack for newly generated bars, so you can move between supported genres live.
@@ -91,7 +127,7 @@ The older deterministic per-instrument schema is still supported:
 - `song.mode: cue|drone`
 - `song.lookahead_bars`
 - `sections.<name>` with `tempo_bpm`, `beats_per_bar`, optional `beat_unit`, `bars_per_phrase`, `phrase_count`, `mood`, `feel`
-- `instruments.<name>` with `instrument_id`, optional `amp`, `pan`, optional `velocity_variation` (0..1), and section patterns via either:
+- `instruments.<name>` with `instrument_id`, optional `patch` / `patch_file`, optional `amp`, `pan`, optional `velocity_variation` (0..1), and section patterns via either:
   - `patterns.<section>: ...`
   - `pattern_<section>: ...`
   - optional drum fill patterns per section via either:

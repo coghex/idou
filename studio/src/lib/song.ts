@@ -1,5 +1,6 @@
 import yaml from 'js-yaml';
 import { midiToNoteName, noteNameToMidi } from './note';
+import { PATCH_ROLE_OPTIONS, type PatchRole } from './patch';
 
 const CHORD_ROOTS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const;
 const CHORD_ROOT_INDEX = new Map<string, number>([
@@ -87,6 +88,17 @@ export type MelodyNote = {
   velocity: number;
 };
 
+export type ChordRegion = {
+  id: string;
+  symbol: string;
+  startBeat: number;
+};
+
+export type ChordRegionSpan = ChordRegion & {
+  endBeat: number;
+  durationBeats: number;
+};
+
 export type SongSection = {
   name: string;
   barsPerPhrase: number;
@@ -97,6 +109,7 @@ export type SongSection = {
   mood: string;
   feel: string;
   chords: string[];
+  chordRegions: ChordRegion[];
   melody: MelodyNote[];
 };
 
@@ -107,6 +120,7 @@ export type SongDocument = {
     tempoBpm: number;
     beatsPerBar: number;
     beatUnit: number;
+    patches: Record<PatchRole, string | null>;
   };
   sections: SongSection[];
 };
@@ -194,6 +208,10 @@ type RawSongFile = {
   instruments?: unknown;
 };
 
+function emptyPatchAssignments(): Record<PatchRole, string | null> {
+  return Object.fromEntries(PATCH_ROLE_OPTIONS.map((role) => [role, null])) as Record<PatchRole, string | null>;
+}
+
 function makeId(prefix: string): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -203,6 +221,10 @@ function makeId(prefix: string): string {
 
 export function createNoteId(): string {
   return makeId('note');
+}
+
+export function createChordRegionId(): string {
+  return makeId('chord');
 }
 
 export function normalizeSectionName(name: string): string {
@@ -275,6 +297,33 @@ function parseMelody(value: unknown): MelodyNote[] {
     .sort((left, right) => left.beat - right.beat || left.note - right.note);
 }
 
+function parseChordRegions(value: unknown): Omit<ChordRegion, 'id'>[] {
+  const rawEntries =
+    Array.isArray(value)
+      ? value
+      : value && typeof value === 'object'
+        ? Object.values(value as Record<string, unknown>)
+        : [];
+
+  return rawEntries
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
+      }
+      const record = entry as Record<string, unknown>;
+      const symbol = asText(record.symbol ?? record.chord);
+      const startBeat = asOptionalNumber(record.start_beat ?? record.startBeat);
+      if (!symbol || startBeat === null) {
+        return null;
+      }
+      return {
+        symbol,
+        startBeat,
+      };
+    })
+    .filter((entry): entry is Omit<ChordRegion, 'id'> => entry !== null);
+}
+
 function trimFloat(value: number): string {
   const rounded = Math.round(value * 1000) / 1000;
   return String(rounded);
@@ -305,6 +354,7 @@ export function createDefaultSong(): SongDocument {
       tempoBpm: 100,
       beatsPerBar: 4,
       beatUnit: 4,
+      patches: emptyPatchAssignments(),
     },
     sections: [
       {
@@ -317,6 +367,12 @@ export function createDefaultSong(): SongDocument {
         mood: 'anticipatory',
         feel: 'sparse',
         chords: ['Am(add9)', 'Fmaj7', 'Dm7', 'Esus4'],
+        chordRegions: [
+          { id: createChordRegionId(), symbol: 'Am(add9)', startBeat: 0 },
+          { id: createChordRegionId(), symbol: 'Fmaj7', startBeat: 4 },
+          { id: createChordRegionId(), symbol: 'Dm7', startBeat: 8 },
+          { id: createChordRegionId(), symbol: 'Esus4', startBeat: 12 },
+        ],
         melody: [
           { id: createNoteId(), beat: 2, note: 69, duration: 1, velocity: 0.54 },
           { id: createNoteId(), beat: 3, note: 72, duration: 0.75, velocity: 0.58 },
@@ -333,6 +389,12 @@ export function createDefaultSong(): SongDocument {
         mood: 'restless',
         feel: 'driving',
         chords: ['Am', 'F', 'C', 'G'],
+        chordRegions: [
+          { id: createChordRegionId(), symbol: 'Am', startBeat: 0 },
+          { id: createChordRegionId(), symbol: 'F', startBeat: 4 },
+          { id: createChordRegionId(), symbol: 'C', startBeat: 8 },
+          { id: createChordRegionId(), symbol: 'G', startBeat: 12 },
+        ],
         melody: [
           { id: createNoteId(), beat: 0, note: 69, duration: 0.5, velocity: 0.6 },
           { id: createNoteId(), beat: 1, note: 72, duration: 0.5, velocity: 0.62 },
@@ -350,6 +412,12 @@ export function createDefaultSong(): SongDocument {
         mood: 'wide',
         feel: 'anthemic',
         chords: ['F', 'G', 'Am', 'C'],
+        chordRegions: [
+          { id: createChordRegionId(), symbol: 'F', startBeat: 0 },
+          { id: createChordRegionId(), symbol: 'G', startBeat: 4 },
+          { id: createChordRegionId(), symbol: 'Am', startBeat: 8 },
+          { id: createChordRegionId(), symbol: 'C', startBeat: 12 },
+        ],
         melody: [
           { id: createNoteId(), beat: 0, note: 72, duration: 1, velocity: 0.72 },
           { id: createNoteId(), beat: 1.5, note: 76, duration: 0.5, velocity: 0.76 },
@@ -452,9 +520,80 @@ export function buildSectionLoopDocument(document: SongDocument, sectionName: st
       {
         ...section,
         chords: [...section.chords],
+        chordRegions: section.chordRegions.map((region) => ({ ...region })),
         melody: section.melody.map((note) => ({ ...note })),
       },
     ],
+  };
+}
+
+export function sectionPhraseBeats(document: SongDocument, section: SongSection): number {
+  const beatsPerBar = section.beatsPerBar ?? document.song.beatsPerBar;
+  return Math.max(1, section.barsPerPhrase * beatsPerBar);
+}
+
+export function normalizeChordRegions(regions: ChordRegion[], phraseBeats: number): ChordRegion[] {
+  const maxStartBeat = Math.max(0, phraseBeats - 0.25);
+  const sanitized = regions
+    .map((region) => ({
+      id: region.id || createChordRegionId(),
+      symbol: region.symbol.trim(),
+      startBeat: Math.min(maxStartBeat, Math.max(0, region.startBeat)),
+    }))
+    .filter((region) => region.symbol)
+    .sort((left, right) => left.startBeat - right.startBeat || left.symbol.localeCompare(right.symbol));
+
+  if (sanitized.length === 0) {
+    return [];
+  }
+
+  return sanitized.map((region, index) => ({
+    ...region,
+    startBeat: index === 0 ? 0 : region.startBeat,
+  }));
+}
+
+function buildEvenChordRegions(chords: string[], phraseBeats: number): ChordRegion[] {
+  const sanitized = sanitizeChordList(chords);
+  if (sanitized.length === 0) {
+    return [];
+  }
+  const step = phraseBeats / sanitized.length;
+  return sanitized.map((symbol, index) => ({
+    id: createChordRegionId(),
+    symbol,
+    startBeat: Math.round(index * step * 1000) / 1000,
+  }));
+}
+
+export function sectionChordRegions(document: SongDocument, section: SongSection): ChordRegion[] {
+  const phraseBeats = sectionPhraseBeats(document, section);
+  if (section.chordRegions.length > 0) {
+    return normalizeChordRegions(section.chordRegions, phraseBeats);
+  }
+  return buildEvenChordRegions(section.chords, phraseBeats);
+}
+
+export function sectionChordRegionSpans(document: SongDocument, section: SongSection): ChordRegionSpan[] {
+  const phraseBeats = sectionPhraseBeats(document, section);
+  const regions = sectionChordRegions(document, section);
+  return regions.map((region, index) => {
+    const nextStartBeat = regions[index + 1]?.startBeat ?? phraseBeats;
+    const endBeat = Math.max(region.startBeat + 0.25, nextStartBeat);
+    return {
+      ...region,
+      endBeat,
+      durationBeats: Math.max(0.25, endBeat - region.startBeat),
+    };
+  });
+}
+
+export function syncSectionChordRegions(document: SongDocument, section: SongSection, regions: ChordRegion[]): SongSection {
+  const nextRegions = normalizeChordRegions(regions, sectionPhraseBeats(document, section));
+  return {
+    ...section,
+    chords: nextRegions.map((region) => region.symbol),
+    chordRegions: nextRegions,
   };
 }
 
@@ -475,6 +614,21 @@ export function parseSongText(contents: string): SongDocument {
   const tempoBpm = asFiniteNumber(song.tempo_bpm, 100);
   const beatsPerBar = Math.max(1, Math.round(asFiniteNumber(song.beats_per_bar, 4)));
   const beatUnit = Math.max(1, Math.round(asFiniteNumber(song.beat_unit, 4)));
+  const songPatches = emptyPatchAssignments();
+  const patchBlock =
+    song.patches && typeof song.patches === 'object' ? (song.patches as Record<string, unknown>) : null;
+  if (patchBlock) {
+    for (const role of PATCH_ROLE_OPTIONS) {
+      const raw = patchBlock[role];
+      if (typeof raw === 'string') {
+        songPatches[role] = raw.trim() || null;
+      } else if (raw && typeof raw === 'object') {
+        const patchObject = raw as Record<string, unknown>;
+        const patchValue = asText(patchObject.patch) || asText(patchObject.patch_file);
+        songPatches[role] = patchValue || null;
+      }
+    }
+  }
 
   const sectionsObject = parsed.sections ?? {};
   const knownNames = Object.keys(sectionsObject);
@@ -484,16 +638,34 @@ export function parseSongText(contents: string): SongDocument {
 
   const sections = orderedNames.map((name) => {
     const section = sectionsObject[name] ?? {};
+    const barsPerPhrase = Math.max(1, Math.round(asFiniteNumber(section.bars_per_phrase, 4)));
+    const phraseCount = Math.max(1, Math.round(asFiniteNumber(section.phrase_count, 1)));
+    const sectionBeatsPerBar = asOptionalNumber(section.beats_per_bar);
+    const phraseBeats = Math.max(1, barsPerPhrase * (sectionBeatsPerBar ?? beatsPerBar));
+    const parsedChords = parseCsvText(section.chords);
+    const parsedRegions = parseChordRegions((section as Record<string, unknown>).chord_regions);
+    const chordRegions =
+      parsedRegions.length > 0
+        ? normalizeChordRegions(
+            parsedRegions.map((region) => ({
+              id: createChordRegionId(),
+              symbol: region.symbol,
+              startBeat: region.startBeat,
+            })),
+            phraseBeats,
+          )
+        : buildEvenChordRegions(parsedChords, phraseBeats);
     return {
       name: normalizeSectionName(name),
-      barsPerPhrase: Math.max(1, Math.round(asFiniteNumber(section.bars_per_phrase, 4))),
-      phraseCount: Math.max(1, Math.round(asFiniteNumber(section.phrase_count, 1))),
+      barsPerPhrase,
+      phraseCount,
       tempoBpm: asOptionalNumber(section.tempo_bpm),
-      beatsPerBar: asOptionalNumber(section.beats_per_bar),
+      beatsPerBar: sectionBeatsPerBar,
       beatUnit: asOptionalNumber(section.beat_unit),
       mood: asText(section.mood),
       feel: asText(section.feel),
-      chords: parseCsvText(section.chords),
+      chords: chordRegions.map((region) => region.symbol),
+      chordRegions,
       melody: parseMelody(section.melody),
     } satisfies SongSection;
   });
@@ -503,7 +675,7 @@ export function parseSongText(contents: string): SongDocument {
   }
 
   return {
-    song: { genre, mood, tempoBpm, beatsPerBar, beatUnit },
+    song: { genre, mood, tempoBpm, beatsPerBar, beatUnit, patches: songPatches },
     sections,
   };
 }
@@ -522,6 +694,16 @@ export function serializeSong(document: SongDocument): string {
       beats_per_bar: document.song.beatsPerBar,
       beat_unit: document.song.beatUnit,
       form: normalizedSections.map((section) => section.name).join(','),
+      ...(Object.values(document.song.patches).some((path) => typeof path === 'string' && path.trim() !== '')
+        ? {
+            patches: Object.fromEntries(
+              PATCH_ROLE_OPTIONS.flatMap((role) => {
+                const path = document.song.patches[role];
+                return path && path.trim() !== '' ? [[role, path]] : [];
+              }),
+            ),
+          }
+        : {}),
     },
     sections: normalizedSections.reduce<Record<string, Record<string, unknown>>>((acc, section) => {
       const payload: Record<string, unknown> = {
@@ -533,7 +715,27 @@ export function serializeSong(document: SongDocument): string {
       if (section.beatUnit !== null) payload.beat_unit = section.beatUnit;
       if (section.mood) payload.mood = section.mood;
       if (section.feel) payload.feel = section.feel;
-      if (section.chords.length > 0) payload.chords = section.chords.join(',');
+      const phraseBeats = sectionPhraseBeats(document, section);
+      const chordRegions = normalizeChordRegions(section.chordRegions, phraseBeats);
+      const evenSpacing =
+        chordRegions.length > 0
+          && chordRegions.every((region, index) => {
+            const expectedStart = Math.round((index * phraseBeats) / chordRegions.length * 1000) / 1000;
+            return Math.abs(region.startBeat - expectedStart) < 0.001;
+          });
+      if (chordRegions.length > 0 && !evenSpacing) {
+        payload.chord_regions = Object.fromEntries(
+          chordRegions.map((region, index) => [
+            `change_${index + 1}`,
+            {
+              start_beat: Number(trimFloat(region.startBeat)),
+              symbol: region.symbol,
+            },
+          ]),
+        );
+      } else if (section.chords.length > 0) {
+        payload.chords = section.chords.join(',');
+      }
       const melody = formatMelody(section.melody);
       if (melody) payload.melody = melody;
       acc[section.name] = payload;
@@ -563,6 +765,12 @@ export function validateSong(document: SongDocument): string[] {
   if (!document.song.mood.trim()) {
     issues.push('Song mood is required.');
   }
+  for (const role of PATCH_ROLE_OPTIONS) {
+    const path = document.song.patches[role];
+    if (path !== null && path.trim() === '') {
+      issues.push(`Patch override for "${role}" must not be blank.`);
+    }
+  }
   if (document.sections.length === 0) {
     issues.push('Add at least one section.');
   }
@@ -574,10 +782,23 @@ export function validateSong(document: SongDocument): string[] {
     }
     names.add(normalizedName);
 
-    const sanitizedChords = sanitizeChordList(section.chords);
-    if (sanitizedChords.length === 0) {
+    const chordRegions = sectionChordRegions(document, section);
+    if (chordRegions.length === 0) {
       issues.push(`Section "${normalizedName}" should define at least one chord.`);
     }
+    const phraseBeats = sectionPhraseBeats(document, section);
+    chordRegions.forEach((region, index) => {
+      const nextRegion = chordRegions[index + 1] ?? null;
+      if (region.startBeat < 0) {
+        issues.push(`Section "${normalizedName}" has a chord change before beat 0.`);
+      }
+      if (region.startBeat >= phraseBeats) {
+        issues.push(`Section "${normalizedName}" has a chord change outside the phrase length.`);
+      }
+      if (nextRegion && nextRegion.startBeat <= region.startBeat) {
+        issues.push(`Section "${normalizedName}" has overlapping or out-of-order chord changes.`);
+      }
+    });
 
     const totalBeats = sectionTotalBeats(document, section);
     section.melody.forEach((note) => {

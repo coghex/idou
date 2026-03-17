@@ -22,7 +22,10 @@ import qualified Data.Vector.Unboxed as VU
 
 import Audio.Config (AudioBufferConfig(..), AudioConfig(..), AudioTelemetryConfig(..), parseAudioConfigText)
 import Audio.Envelope
+import Audio.Filter.Biquad (FilterType(..))
+import Audio.Filter.Types (FilterSpec(..), FilterSlope(..), KeyTrack(..))
 import Audio.Oscillator (Osc(..), oscInitSeeded, oscStep)
+import Audio.Patch.Loader (compilePatchText, loadInstrumentPatch)
 import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmDrumInstrument, gmProgramInstrument, gmPercussionChannel)
 import Audio.Thread.Render (renderChunkFrames)
 import Audio.Thread.InstrumentTable
@@ -77,6 +80,7 @@ import Player.Timeline
   , compileTimelineBars
   , generatedInstrumentSpecs
   , lookupGeneratedInstrument
+  , loadSongSpec
   , parseSongSpecText
   , setTimelineGenre
   , timelineBoundarySpanFromNextBar
@@ -135,9 +139,17 @@ testCases ∷ [TestCase]
 testCases =
   [ TestCase "audio-config-parses-yaml-shape" testAudioConfigParsesYamlShape
   , TestCase "audio-config-rejects-too-small-buffer" testAudioConfigRejectsTooSmallBuffer
+  , TestCase "patch-loader-compiles-voice-local-graph" testPatchLoaderCompilesVoiceLocalGraph
+  , TestCase "patch-loader-rejects-too-many-layers" testPatchLoaderRejectsTooManyLayers
+  , TestCase "patch-loader-rejects-mixed-dry-and-filtered-routing" testPatchLoaderRejectsMixedDryAndFilteredRouting
+  , TestCase "patch-loader-loads-sample-file" testPatchLoaderLoadsSampleFile
+  , TestCase "timeline-explicit-instrument-patch-path-parses" testTimelineExplicitInstrumentPatchPathParses
+  , TestCase "timeline-generated-patch-overrides-survive-genre-switch" testTimelineGeneratedPatchOverridesSurviveGenreSwitch
+  , TestCase "timeline-load-song-spec-resolves-patch-paths" testTimelineLoadSongSpecResolvesPatchPaths
   , TestCase "timeline-song-spec-parses-yaml" testTimelineSongSpecParsesYaml
   , TestCase "timeline-song-intent-schema-arranges-electronic-song" testTimelineSongIntentSchemaArrangesElectronicSong
   , TestCase "timeline-song-intent-schema-uses-top-level-defaults" testTimelineSongIntentSchemaUsesTopLevelDefaults
+  , TestCase "timeline-chord-regions-override-legacy-chords" testTimelineChordRegionsOverrideLegacyChords
   , TestCase "timeline-song-intent-schema-supports-ambient-genre" testTimelineSongIntentSchemaSupportsAmbientGenre
   , TestCase "timeline-song-intent-schema-supports-blackmetal-genre" testTimelineSongIntentSchemaSupportsBlackmetalGenre
   , TestCase "timeline-song-intent-schema-supports-cinematic-genre" testTimelineSongIntentSchemaSupportsCinematicGenre
@@ -256,6 +268,356 @@ testAudioConfigRejectsTooSmallBuffer = do
     Right cfg ->
       error ("expected config parse failure, got " <> show cfg)
 
+testPatchLoaderCompilesVoiceLocalGraph ∷ IO ()
+testPatchLoaderCompilesVoiceLocalGraph = do
+  let patchText =
+        unlines
+          [ "patch:"
+          , "  name: Motion Pad"
+          , "  nodes:"
+          , "    osc1:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "      level: 0.62"
+          , "      pitch:"
+          , "        cents: -7"
+          , "    osc2:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "      level: 0.58"
+          , "      pitch:"
+          , "        cents: 7"
+          , "    noise1:"
+          , "      type: noise"
+          , "      color: mix"
+          , "      mix: 0.35"
+          , "      level: 0.08"
+          , "    amp_env:"
+          , "      type: envelope"
+          , "      attack: 0.08"
+          , "      decay: 1.20"
+          , "      sustain: 0.72"
+          , "      release: 1.80"
+          , "    noise_env:"
+          , "      type: envelope"
+          , "      attack: 0.00"
+          , "      decay: 0.04"
+          , "      sustain: 0.00"
+          , "      release: 0.05"
+          , "    filter_env:"
+          , "      type: envelope"
+          , "      attack: 0.02"
+          , "      decay: 0.90"
+          , "      sustain: 0.14"
+          , "      release: 1.30"
+          , "    filter1:"
+          , "      type: filter"
+          , "      mode: lowpass"
+          , "      cutoff_hz: 1800"
+          , "      q: 0.74"
+          , "      slope: 24"
+          , "      key_track: 0.38"
+          , "      env_amount_oct: 1.45"
+          , "      q_env_amount: 0.08"
+          , "    out:"
+          , "      type: output"
+          , "      gain: 0.82"
+          , "      layer_spread: 0.18"
+          , "      play_mode: poly"
+          , "      poly_max: 12"
+          , "  connections:"
+          , "    osc1_to_filter:"
+          , "      from: osc1"
+          , "      to: filter1"
+          , "      kind: signal"
+          , "    osc2_to_filter:"
+          , "      from: osc2"
+          , "      to: filter1"
+          , "      kind: signal"
+          , "    noise_to_filter:"
+          , "      from: noise1"
+          , "      to: filter1"
+          , "      kind: signal"
+          , "    filter_to_out:"
+          , "      from: filter1"
+          , "      to: out"
+          , "      kind: signal"
+          , "    amp_to_out:"
+          , "      from: amp_env"
+          , "      to: out"
+          , "      kind: amp_envelope"
+          , "    noise_env_to_noise:"
+          , "      from: noise_env"
+          , "      to: noise1"
+          , "      kind: amp_envelope"
+          , "    filter_env_to_filter:"
+          , "      from: filter_env"
+          , "      to: filter1"
+          , "      kind: filter_envelope"
+          , "    osc1_syncs_osc2:"
+          , "      from: osc1"
+          , "      to: osc2"
+          , "      kind: hard_sync"
+          ]
+  case compilePatchText patchText of
+    Left err ->
+      error ("expected patch compile success, got " <> err)
+    Right instrument -> do
+      assertEqual "compiled patch should create three layers" 3 (length (iOscs instrument))
+      assertNear "output gain" 0.82 (iGain instrument)
+      assertNear "layer spread" 0.18 (iLayerSpread instrument)
+      assertEqual "patch should stay polyphonic" Poly (iPlayMode instrument)
+      assertEqual "patch should preserve poly max" 12 (iPolyMax instrument)
+      assertEqual "patch compiler should leave mod routes empty for now" [] (iModRoutes instrument)
+      assertEqual "output ADSR attack" 0.08 (aAttackSec (iAdsrDefault instrument))
+      case iFilter instrument of
+        Nothing ->
+          error "expected compiled patch to include a filter"
+        Just filterSpec -> do
+          assertEqual "filter mode" FLP (fType filterSpec)
+          assertEqual "filter slope" S24 (fSlope filterSpec)
+          assertEqual "filter key track" (KeyTrack 0.38) (fKeyTrack filterSpec)
+          assertNear "filter env amount" 1.45 (fEnvAmountOct filterSpec)
+          assertNear "filter q env amount" 0.08 (fQEnvAmount filterSpec)
+          assertEqual "filter env release" 1.30 (aReleaseSec (fEnvADSR filterSpec))
+      let syncedLayer =
+            find
+              (\layer ->
+                psCents (olPitch layer) > 6 &&
+                case olSync layer of
+                  HardSyncTo _ -> True
+                  _ -> False
+              )
+              (iOscs instrument)
+      case syncedLayer of
+        Nothing ->
+          error "expected one oscillator layer to use hard sync"
+        Just layer ->
+          assertNear "synced oscillator cents" 7 (psCents (olPitch layer))
+      let noiseLayer =
+            find
+              (\layer ->
+                case olWaveform layer of
+                  WaveNoiseMix _ -> True
+                  _ -> False
+              )
+              (iOscs instrument)
+      case noiseLayer of
+        Nothing ->
+          error "expected one noise layer"
+        Just layer -> do
+          assertNear "noise layer level" 0.08 (olLevel layer)
+          case olAmpEnv layer of
+            Nothing ->
+              error "expected noise layer to use its own amp envelope"
+            Just adsr ->
+              assertNear "noise env decay" 0.04 (aDecaySec adsr)
+
+testPatchLoaderRejectsTooManyLayers ∷ IO ()
+testPatchLoaderRejectsTooManyLayers = do
+  let patchText =
+        unlines
+          [ "patch:"
+          , "  nodes:"
+          , "    osc1:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "    osc2:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "    osc3:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "    osc4:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "    osc5:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "    amp_env:"
+          , "      type: envelope"
+          , "      attack: 0.01"
+          , "      decay: 0.10"
+          , "      sustain: 0.80"
+          , "      release: 0.30"
+          , "    out:"
+          , "      type: output"
+          , "  connections:"
+          , "    c1:"
+          , "      from: osc1"
+          , "      to: out"
+          , "      kind: signal"
+          , "    c2:"
+          , "      from: osc2"
+          , "      to: out"
+          , "      kind: signal"
+          , "    c3:"
+          , "      from: osc3"
+          , "      to: out"
+          , "      kind: signal"
+          , "    c4:"
+          , "      from: osc4"
+          , "      to: out"
+          , "      kind: signal"
+          , "    c5:"
+          , "      from: osc5"
+          , "      to: out"
+          , "      kind: signal"
+          , "    env:"
+          , "      from: amp_env"
+          , "      to: out"
+          , "      kind: amp_envelope"
+          ]
+  assertLeftContains "too many patch layers should be rejected" "at most 4" (compilePatchText patchText)
+
+testPatchLoaderRejectsMixedDryAndFilteredRouting ∷ IO ()
+testPatchLoaderRejectsMixedDryAndFilteredRouting = do
+  let patchText =
+        unlines
+          [ "patch:"
+          , "  nodes:"
+          , "    osc1:"
+          , "      type: oscillator"
+          , "      waveform: saw"
+          , "    osc2:"
+          , "      type: oscillator"
+          , "      waveform: square"
+          , "    amp_env:"
+          , "      type: envelope"
+          , "      attack: 0.01"
+          , "      decay: 0.10"
+          , "      sustain: 0.80"
+          , "      release: 0.30"
+          , "    filter1:"
+          , "      type: filter"
+          , "      mode: lowpass"
+          , "      cutoff_hz: 1200"
+          , "    out:"
+          , "      type: output"
+          , "  connections:"
+          , "    dry:"
+          , "      from: osc1"
+          , "      to: out"
+          , "      kind: signal"
+          , "    wet_in:"
+          , "      from: osc2"
+          , "      to: filter1"
+          , "      kind: signal"
+          , "    wet_out:"
+          , "      from: filter1"
+          , "      to: out"
+          , "      kind: signal"
+          , "    env:"
+          , "      from: amp_env"
+          , "      to: out"
+          , "      kind: amp_envelope"
+          ]
+  assertLeftContains
+    "mixed dry and filtered routing should be rejected"
+    "cannot mix direct output and filtered output"
+    (compilePatchText patchText)
+
+testPatchLoaderLoadsSampleFile ∷ IO ()
+testPatchLoaderLoadsSampleFile = do
+  instrument <- loadInstrumentPatch "config/patches/warm-pad.yaml"
+  assertEqual "sample patch should compile into three layers" 3 (length (iOscs instrument))
+  assertBool "sample patch should include a filter" (iFilter instrument /= Nothing)
+
+testTimelineExplicitInstrumentPatchPathParses ∷ IO ()
+testTimelineExplicitInstrumentPatchPathParses = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "sections:"
+          , "  verse:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pad:"
+          , "    instrument_id: 88"
+          , "    patch: config/patches/warm-pad.yaml"
+          , "    patterns:"
+          , "      verse: 0/C4/1.0/0.8"
+          ]
+  case parseSongSpecText yamlText of
+    Left err ->
+      error ("expected explicit patch path parse success, got " <> err)
+    Right spec ->
+      case find ((== "pad") . ipName) (sgInstruments spec) of
+        Nothing ->
+          error "expected explicit instrument spec"
+        Just inst ->
+          assertEqual "explicit instrument should keep its patch path" (Just "config/patches/warm-pad.yaml") (ipPatchPath inst)
+
+testTimelineGeneratedPatchOverridesSurviveGenreSwitch ∷ IO ()
+testTimelineGeneratedPatchOverridesSurviveGenreSwitch = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  genre: electronic"
+          , "  mood: dramatic"
+          , "  tempo_bpm: 100"
+          , "  beats_per_bar: 4"
+          , "  patches:"
+          , "    pad: config/patches/warm-pad.yaml"
+          , "sections:"
+          , "  intro:"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "    chords: Am"
+          ]
+  case parseSongSpecText yamlText of
+    Left err ->
+      error ("expected generated patch override parse success, got " <> err)
+    Right spec -> do
+      let expectPadPatch instruments label =
+            case find ((== "pad") . ipName) instruments of
+              Nothing -> error ("expected pad instrument in " <> label)
+              Just inst -> assertEqual (label <> " pad patch override") (Just "config/patches/warm-pad.yaml") (ipPatchPath inst)
+      expectPadPatch (sgInstruments spec) "initial generated palette"
+      case setTimelineGenre "ambient" (prepareTimelineRuntime 48000 0 spec) of
+        Left err ->
+          error ("expected genre switch success, got " <> err)
+        Right runtime ->
+          expectPadPatch (trInstruments runtime) "genre-switched generated palette"
+
+testTimelineLoadSongSpecResolvesPatchPaths ∷ IO ()
+testTimelineLoadSongSpecResolvesPatchPaths = do
+  (path, handle) <- openBinaryTempFile "." "idou-song-patch.yaml"
+  hClose handle
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  mode: cue"
+          , "sections:"
+          , "  verse:"
+          , "    tempo_bpm: 120"
+          , "    beats_per_bar: 4"
+          , "    bars_per_phrase: 1"
+          , "    phrase_count: 1"
+          , "instruments:"
+          , "  pad:"
+          , "    instrument_id: 88"
+          , "    patch: config/patches/warm-pad.yaml"
+          , "    patterns:"
+          , "      verse: 0/C4/1.0/0.8"
+          ]
+  Prelude.writeFile path yamlText
+  loaded <- loadSongSpec path
+  removeFile path
+  case loaded of
+    Left err ->
+      error ("expected loadSongSpec success, got " <> err)
+    Right spec ->
+      case find ((== "pad") . ipName) (sgInstruments spec) of
+        Nothing ->
+          error "expected explicit instrument spec after loading song"
+        Just inst ->
+          assertEqual "loadSongSpec should resolve relative patch paths" (Just "config/patches/warm-pad.yaml") (ipPatchPath inst)
+
 testTimelineSongSpecParsesYaml ∷ IO ()
 testTimelineSongSpecParsesYaml = do
   let yamlText =
@@ -360,6 +722,42 @@ testTimelineSongIntentSchemaUsesTopLevelDefaults = do
       assertBool "generated arrangement should still create notes" (not (null (tbNotes bar0)))
     [] ->
       error "expected at least one compiled bar"
+
+testTimelineChordRegionsOverrideLegacyChords ∷ IO ()
+testTimelineChordRegionsOverrideLegacyChords = do
+  let yamlText =
+        unlines
+          [ "song:"
+          , "  genre: electronic"
+          , "  mood: dramatic"
+          , "  tempo_bpm: 100"
+          , "  beats_per_bar: 4"
+          , "sections:"
+          , "  ending:"
+          , "    bars_per_phrase: 2"
+          , "    phrase_count: 1"
+          , "    chords: Am,F"
+          , "    chord_regions:"
+          , "      change_1:"
+          , "        start_beat: 0"
+          , "        symbol: Dm"
+          , "      change_2:"
+          , "        start_beat: 4"
+          , "        symbol: G"
+          ]
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText yamlText)
+  let bars = compileTimelineBars testSampleRate spec
+      bassKeys bar =
+        [ key
+        | note <- tbNotes bar
+        , tnInstrumentId note == InstrumentId 38
+        , let NoteKey key = tnKey note
+        ]
+  case bars of
+    _bar0 : bar1 : _ ->
+      assertBool "second bar should follow chord_regions instead of legacy chords" (any (`elem` [43, 47, 50, 55]) (bassKeys bar1))
+    _ ->
+      error "expected arranged bars for chord region override test"
 
 testTimelineSongIntentSchemaSupportsAmbientGenre ∷ IO ()
 testTimelineSongIntentSchemaSupportsAmbientGenre = do
@@ -2626,6 +3024,15 @@ assertEqual ∷ (Eq a, Show a) => String → a → a → IO ()
 assertEqual label expected actual =
   unless (expected == actual) $
     error (label <> ": expected " <> show expected <> ", got " <> show actual)
+
+assertLeftContains ∷ Show a => String → String → Either String a → IO ()
+assertLeftContains label needle result =
+  case result of
+    Left err ->
+      unless (needle `isInfixOf` err) $
+        error (label <> ": expected error containing " <> show needle <> ", got " <> show err)
+    Right value ->
+      error (label <> ": expected failure, got " <> show value)
 
 assertNear ∷ String → Float → Float → IO ()
 assertNear label expected actual =

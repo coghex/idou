@@ -14,7 +14,7 @@ module Player.Thread
 
 import Control.Concurrent (forkIO, threadDelay)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (finally)
+import Control.Exception (SomeException, displayException, finally, try)
 import Control.Monad (foldM)
 import Data.Char (isSpace, toLower)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
@@ -56,8 +56,10 @@ import Player.Automation
   , stepEnergyLane
   , stepMoodLane
   )
+import Player.Instrument (loadResolvedInstrument, lookupInstrumentSpec, usesBuiltInDrumPatch)
 import Player.Timeline
-  ( SongSpec
+  ( InstrumentPatternSpec(..)
+  , SongSpec
   , TimelineBar(..)
   , TimelineNote(..)
   , TimelineTransitionTelemetry
@@ -70,6 +72,7 @@ import Player.Timeline
     , setTimelineGenre
     , setTimelineTargets
     , sgGenre
+    , sgInstruments
     , timelineBoundarySpanFromNextBar
     , timelineNextBarBoundaryFrame
     , timelineRuntimeDone
@@ -288,16 +291,28 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
             Left err ->
               Q.writeQueue evQ (PlayerEventGenreChangeRejected genreRaw err)
             Right currentGenre -> do
-              writeIORef playerStateRef (applyLiveTimelineSettings (ps { pstGenreTarget = genre' }))
-              Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
+              let ps' = applyLiveTimelineSettings (ps { pstGenreTarget = genre' })
+              preloadResult <- try (preloadActiveTimelineInstruments audioSys ps') ∷ IO (Either SomeException ())
+              case preloadResult of
+                Left ex ->
+                  Q.writeQueue evQ (PlayerEventGenreChangeRejected genreRaw (displayException ex))
+                Right () -> do
+                  writeIORef playerStateRef ps'
+                  Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
         PlayerClearGenreTarget -> do
           ps <- readIORef playerStateRef
           case validateGenreTarget ps Nothing of
             Left err ->
               Q.writeQueue evQ (PlayerEventGenreChangeRejected "<default>" err)
             Right currentGenre -> do
-              writeIORef playerStateRef (applyLiveTimelineSettings (ps { pstGenreTarget = Nothing }))
-              Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
+              let ps' = applyLiveTimelineSettings (ps { pstGenreTarget = Nothing })
+              preloadResult <- try (preloadActiveTimelineInstruments audioSys ps') ∷ IO (Either SomeException ())
+              case preloadResult of
+                Left ex ->
+                  Q.writeQueue evQ (PlayerEventGenreChangeRejected "<default>" (displayException ex))
+                Right () -> do
+                  writeIORef playerStateRef ps'
+                  Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
         PlayerSetMoodTarget moodRaw -> do
           let mood' = normalizeMoodTarget moodRaw
           modifyIORef'
@@ -341,23 +356,28 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
             Left err ->
               Q.writeQueue evQ (PlayerEventTimelineLoadFailed path err)
             Right spec -> do
-              let bars = compileTimelineBars (sampleRate (asHandle audioSys)) spec
-              case bars of
-                [] -> pure ()
-                firstBar : _ -> do
+              preloadResult <- try (preloadInstrumentSpecs audioSys (sgInstruments spec)) ∷ IO (Either SomeException ())
+              case preloadResult of
+                Left ex ->
+                  Q.writeQueue evQ (PlayerEventTimelineLoadFailed path (displayException ex))
+                Right () -> do
+                  let bars = compileTimelineBars (sampleRate (asHandle audioSys)) spec
+                  case bars of
+                    [] -> pure ()
+                    firstBar : _ -> do
+                      modifyIORef'
+                        playerStateRef
+                        ( \s ->
+                            s
+                              { pstBeatsPerBar = tbBeatsPerBar firstBar
+                              , pstTempoBpm = tbTempoBpm firstBar
+                              }
+                        )
+                      sendAudio audioSys (AudioSetTransportBpm (tbTempoBpm firstBar))
                   modifyIORef'
                     playerStateRef
-                    ( \s ->
-                        s
-                          { pstBeatsPerBar = tbBeatsPerBar firstBar
-                          , pstTempoBpm = tbTempoBpm firstBar
-                          }
-                    )
-                  sendAudio audioSys (AudioSetTransportBpm (tbTempoBpm firstBar))
-              modifyIORef'
-                playerStateRef
-                (\s -> s { pstSongSpec = Just spec, pstGenreTarget = Nothing, pstTimeline = Nothing })
-              Q.writeQueue evQ (PlayerEventTimelineLoaded path)
+                    (\s -> s { pstSongSpec = Just spec, pstGenreTarget = Nothing, pstTimeline = Nothing })
+                  Q.writeQueue evQ (PlayerEventTimelineLoaded path)
         PlayerStartSongTimeline -> do
           ps <- readIORef playerStateRef
           case pstSongSpec ps of
@@ -382,8 +402,13 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
                           spec
                       )
                   estimatedBars = max 1 (length (compileTimelineBars (sampleRate (asHandle audioSys)) spec))
-              modifyIORef' playerStateRef (\s -> s { pstTimeline = Just runtime })
-              Q.writeQueue evQ (PlayerEventTimelineStarted frame estimatedBars)
+              preloadResult <- try (preloadInstrumentSpecs audioSys (trInstruments runtime)) ∷ IO (Either SomeException ())
+              case preloadResult of
+                Left ex ->
+                  Q.writeQueue evQ (PlayerEventTimelineLoadFailed "<runtime>" (displayException ex))
+                Right () -> do
+                  modifyIORef' playerStateRef (\s -> s { pstTimeline = Just runtime })
+                  Q.writeQueue evQ (PlayerEventTimelineStarted frame estimatedBars)
         PlayerStopSongTimeline -> do
           modifyIORef' playerStateRef (\s -> s { pstTimeline = Nothing })
           sendAudio audioSys AudioStopAll
@@ -468,8 +493,25 @@ applyLiveTimelineRuntime ps timeline =
        Nothing -> timeline'
        Just genre ->
          case setTimelineGenre genre timeline' of
-           Left _ -> timeline'
-           Right timeline'' -> timeline''
+            Left _ -> timeline'
+            Right timeline'' -> timeline''
+
+preloadActiveTimelineInstruments ∷ AudioSystem → PlayerState → IO ()
+preloadActiveTimelineInstruments audioSys ps =
+  case pstTimeline ps of
+    Nothing -> pure ()
+    Just timeline -> preloadInstrumentSpecs audioSys (trInstruments timeline)
+
+preloadInstrumentSpecs ∷ AudioSystem → [InstrumentPatternSpec] → IO ()
+preloadInstrumentSpecs audioSys =
+  mapM_ preloadInstrument
+  where
+    preloadInstrument spec =
+      if usesBuiltInDrumPatch spec
+        then pure ()
+        else do
+          inst <- loadResolvedInstrument spec
+          sendAudio audioSys (AudioLoadInstrument (ipInstrumentId spec) inst)
 
 normalizeMoodTarget ∷ String → Maybe String
 normalizeMoodTarget raw =
@@ -704,7 +746,7 @@ scheduleTimelineBar audioSys evQ runtime ps bar = do
   let barStart = trStartFrame runtime + tbStartOffsetFrames bar
   (nextInst, _) <-
     foldM
-      (scheduleNotePair audioSys evQ barStart)
+      (scheduleNotePair audioSys evQ runtime barStart)
       (pstNextNoteInst ps, 0 ∷ Int)
       (tbNotes bar)
   let ps' =
@@ -716,12 +758,14 @@ scheduleTimelineBar audioSys evQ runtime ps bar = do
 scheduleNotePair
   ∷ AudioSystem
   → Queue PlayerEvent
+  → TimelineRuntime
   → Word64
   → (Word64, Int)
   → TimelineNote
   → IO (Word64, Int)
-scheduleNotePair audioSys evQ barStart (nextInst, ix) note = do
-  let (schedIid, schedKey, drumKey) = remapScheduledDrumNote (tnInstrumentId note) (tnKey note)
+scheduleNotePair audioSys evQ runtime barStart (nextInst, ix) note = do
+  let spec = lookupInstrumentSpec (tnInstrumentId note) (trInstruments runtime)
+      (schedIid, schedKey, drumKey) = remapScheduledDrumNote spec (tnInstrumentId note) (tnKey note)
   case drumKey of
     Nothing -> pure ()
     Just key ->
@@ -750,13 +794,22 @@ scheduleNotePair audioSys evQ barStart (nextInst, ix) note = do
   Q.writeQueue evQ (PlayerEventScheduled noteOffFrame offAction)
   pure (nextInst + 1, ix + 1)
 
-remapScheduledDrumNote ∷ InstrumentId → NoteKey → (InstrumentId, NoteKey, Maybe Int)
-remapScheduledDrumNote iid key =
-  case (iid, key) of
-    (InstrumentId 9, NoteKey drumKey) ->
+remapScheduledDrumNote ∷ Maybe InstrumentPatternSpec → InstrumentId → NoteKey → (InstrumentId, NoteKey, Maybe Int)
+remapScheduledDrumNote spec iid key =
+  case (shouldUseBuiltInDrums spec iid, key) of
+    (True, NoteKey drumKey) ->
       (timelineDrumInstrumentId drumKey, NoteKey 60, Just drumKey)
     _ ->
       (iid, key, Nothing)
+
+shouldUseBuiltInDrums ∷ Maybe InstrumentPatternSpec → InstrumentId → Bool
+shouldUseBuiltInDrums spec iid =
+  case spec of
+    Just instrumentSpec -> usesBuiltInDrumPatch instrumentSpec
+    Nothing ->
+      case iid of
+        InstrumentId 9 -> True
+        _ -> False
 
 timelineDrumInstrumentId ∷ Int → InstrumentId
 timelineDrumInstrumentId key =
