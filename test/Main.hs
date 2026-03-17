@@ -6,12 +6,14 @@ import Control.Exception (SomeException, bracket, evaluate, try)
 import Control.Monad (forM, unless, when)
 import qualified Data.ByteString.Lazy as BL
 import Data.ByteString.Builder
+import Data.Foldable (toList)
 import Data.List (find, intercalate, isInfixOf, nub)
 import qualified Data.Map.Strict as M
 import Data.Word (Word32, Word64)
 import Foreign.ForeignPtr (mallocForeignPtrArray)
 import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.C (CFloat)
+import Foreign.Ptr (Ptr)
 import System.Directory (getTemporaryDirectory, removeFile)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
@@ -48,6 +50,7 @@ import Audio.Thread.Voice
   , releaseInstrumentAllVoices
   , releaseInstrumentNote
   , setInstrumentNoteAftertouch
+  , stopVoicesByBus
   )
 import Audio.Types
 import Midi.Control (controllerPanValue, controllerValue01, midiPitchBendSemitones, sustainPedalDown)
@@ -73,18 +76,22 @@ import Player.Timeline
   ( SongMode(..)
   , InstrumentPatternSpec(..)
   , SongSpec
-  , TimelineBar(..)
-  , TimelineNote(..)
-  , TimelineTransitionTelemetry(..)
-  , TimelineRuntime(..)
-  , compileTimelineBars
-  , generatedInstrumentSpecs
-  , lookupGeneratedInstrument
-  , loadSongSpec
-  , parseSongSpecText
-  , setTimelineGenre
-  , timelineBoundarySpanFromNextBar
-  , timelineRuntimeEndFrame
+   , TimelineBar(..)
+   , TimelineLookaheadTelemetry(..)
+   , TimelineNote(..)
+   , TimelineRetargetTelemetry(..)
+   , TimelineTransitionTelemetry(..)
+   , TimelineRuntime(..)
+   , compileTimelineBars
+   , generatedInstrumentSpecs
+   , lookupGeneratedInstrument
+   , loadSongSpec
+   , parseSongSpecText
+   , popLookaheadTelemetry
+   , popRetargetTelemetry
+   , setTimelineGenre
+   , timelineBoundarySpanFromNextBar
+   , timelineRuntimeEndFrame
   , popTransitionTelemetry
   , popReadyBars
   , prepareTimelineRuntime
@@ -97,7 +104,7 @@ import Player.Timeline
   , timelineRuntimeDone
   )
 import Sound.Miniaudio.Decode (DecodedAudio(..), decodeAudioFileStereoF32)
-import Sound.Miniaudio.RingBuffer (rbCreateF32, rbDestroy, rbReadF32)
+import Sound.Miniaudio.RingBuffer (MaRB, rbCreateF32, rbDestroy, rbReadF32)
 
 data TestCase = TestCase
   { tcName   ∷ String
@@ -177,7 +184,10 @@ testCases =
   , TestCase "timeline-mood-target-steers-transposition" testTimelineMoodTargetSteersTransposition
   , TestCase "timeline-section-metadata-steers-conductor" testTimelineSectionMetadataSteersConductor
   , TestCase "timeline-section-feel-steers-variation" testTimelineSectionFeelSteersVariation
+  , TestCase "timeline-retarget-telemetry-reports-future-generation-policy" testTimelineRetargetTelemetryReportsFutureGenerationPolicy
+  , TestCase "timeline-retarget-does-not-rewrite-buffered-bars" testTimelineRetargetDoesNotRewriteBufferedBars
   , TestCase "timeline-transition-telemetry-emits-reason-and-weights" testTimelineTransitionTelemetryEmitsReasonAndWeights
+  , TestCase "timeline-lookahead-telemetry-reports-boundary-queries" testTimelineLookaheadTelemetryReportsBoundaryQueries
   , TestCase "timeline-runtime-end-frame-includes-last-bar-length" testTimelineRuntimeEndFrameIncludesLastBarLength
   , TestCase "timeline-next-bar-span-follows-tempo-and-meter-changes" testTimelineNextBarSpanFollowsTempoAndMeterChanges
   , TestCase "timeline-drum-timing-humanization-is-deterministic" testTimelineDrumTimingHumanizationIsDeterministic
@@ -213,9 +223,14 @@ testCases =
   , TestCase "instrument-load-keeps-active-voice-until-live-apply" testInstrumentLoadKeepsActiveVoiceUntilLiveApply
   , TestCase "clip-one-shot-auto-releases-source" testClipOneShotAutoReleasesSource
   , TestCase "clip-music-bus-gain-zero-mutes-output" testClipMusicBusGainZeroMutesOutput
+  , TestCase "note-sfx-bus-gain-zero-mutes-output" testNoteSfxBusGainZeroMutesOutput
   , TestCase "clip-finished-emits-audio-event" testClipFinishedEmitsAudioEvent
   , TestCase "note-finished-emits-audio-event" testNoteFinishedEmitsAudioEvent
+  , TestCase "mixed-song-and-wav-clip-coexist-on-music-bus" testMixedSongAndWavClipCoexistOnMusicBus
+  , TestCase "mixed-song-and-sfx-note-respect-separate-buses" testMixedSongAndSfxNoteRespectSeparateBuses
+  , TestCase "mixed-song-and-midi-note-share-music-bus" testMixedSongAndMidiNoteShareMusicBus
   , TestCase "scheduled-bus-gain-switches-at-frame" testScheduledBusGainSwitchesAtFrame
+  , TestCase "scheduled-stop-bus-clears-note-and-clip-sources" testScheduledStopBusClearsNoteAndClipSources
   , TestCase "scheduled-note-on-off-trigger-at-frames" testScheduledNoteOnOffTriggerAtFrames
   , TestCase "wav-decoder-loads-stereo-f32" testWavDecoderLoadsStereoF32
   ]
@@ -1247,6 +1262,57 @@ testTimelineTransitionTelemetryEmitsReasonAndWeights = do
                     telemetryAcc'
                     rt2
 
+testTimelineRetargetTelemetryReportsFutureGenerationPolicy ∷ IO ()
+testTimelineRetargetTelemetryReportsFutureGenerationPolicy = do
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText timelineAdaptivePolicyYaml)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (_batch, runtime1) = popReadyBars 0 runtime0
+      runtime2 = setTimelineTargets (Just "combat") 0.9 runtime1
+      (events, _runtime3) = popRetargetTelemetry runtime2
+      buffered = bufferedFutureBars runtime1
+  assertEqual "retarget should emit one policy event" 1 (length events)
+  case events of
+    [] -> error "expected retarget telemetry event"
+    ev : _ -> do
+      assertEqual "retarget reason" "live-retarget" (trtReason ev)
+      assertEqual "retarget policy" "future-generated-bars-only" (trtPolicy ev)
+      assertEqual "buffered bars should be reported" (length buffered) (trtBufferedFutureBars ev)
+      assertEqual "next generated bar index should be the current frontier" (trGeneratedBarCount runtime1) (trtNextGeneratedBarIx ev)
+      assertEqual "next generated frame should follow the buffered frontier" (trStartFrame runtime1 + trNextBarOffset runtime1) (trtNextGeneratedFrame ev)
+      assertEqual "mood target should be captured" (Just "combat") (trtMoodTarget ev)
+      assertBool "energy target should be captured" (abs (trtEnergyTarget ev - 0.9) < 0.0001)
+
+testTimelineRetargetDoesNotRewriteBufferedBars ∷ IO ()
+testTimelineRetargetDoesNotRewriteBufferedBars = do
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText timelineAdaptivePolicyYaml)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (_mSpan, runtime1) = timelineBoundarySpanFromNextBar 1 1 runtime0
+      bufferedBefore = bufferedFutureBars runtime1
+      runtime2 = setTimelineTargets (Just "combat") 0.9 runtime1
+      bufferedAfter = bufferedFutureBars runtime2
+  assertBool "lookahead should contain buffered bars before retargeting" (not (null bufferedBefore))
+  assertEqual "retargeting should preserve already-buffered future bars" bufferedBefore bufferedAfter
+
+testTimelineLookaheadTelemetryReportsBoundaryQueries ∷ IO ()
+testTimelineLookaheadTelemetryReportsBoundaryQueries = do
+  spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText timelineAdaptivePolicyYaml)
+  let runtime0 = prepareTimelineRuntime testSampleRate 0 spec
+      (_mFrame, runtime1) = timelineBoundarySpanFromNextBar 1 1 runtime0
+      (events, _runtime2) = popLookaheadTelemetry runtime1
+  assertEqual "boundary query should emit one lookahead event" 1 (length events)
+  case events of
+    [] -> error "expected lookahead telemetry event"
+    ev : _ -> do
+      assertEqual "lookahead reason" "next-boundary-span-query" (tltReason ev)
+      assertBool "query should generate bars" (tltGeneratedBarCount ev > 0)
+      assertEqual "generation should start from bar zero" 0 (tltFirstGeneratedBarIx ev)
+      assertEqual "generated count should match inclusive index range" (tltGeneratedBarCount ev - 1) (tltLastGeneratedBarIx ev)
+      assertBool "generated frame range should be increasing" (tltEndFrame ev > tltStartFrame ev)
+      assertEqual "lookahead should capture the base mood" (Just "calm") (tltMoodTarget ev)
+      assertBool "default energy target should be captured" (abs (tltEnergyTarget ev - 0.5) < 0.0001)
+      assertEqual "lookahead should capture the active genre" "electronic" (tltGenre ev)
+      assertBool "seed should advance during lookahead generation" (tltSeedEnd ev /= tltSeedStart ev)
+
 testTimelineRuntimeEndFrameIncludesLastBarLength ∷ IO ()
 testTimelineRuntimeEndFrameIncludesLastBarLength = do
   spec <- either (\err -> error ("parse failed: " <> err)) pure (parseSongSpecText timelineTempoChangeYaml)
@@ -1272,6 +1338,32 @@ testTimelineNextBarSpanFollowsTempoAndMeterChanges = do
     "next-bar span should follow the upcoming ending tempo and meter"
     (Just (96000, 240000))
     mSpan
+
+timelineAdaptivePolicyYaml ∷ String
+timelineAdaptivePolicyYaml =
+  unlines
+    [ "song:"
+    , "  genre: electronic"
+    , "  mood: calm"
+    , "  lookahead_bars: 2"
+    , "sections:"
+    , "  ending:"
+    , "    tempo_bpm: 120"
+    , "    beats_per_bar: 4"
+    , "    bars_per_phrase: 6"
+    , "    phrase_count: 1"
+    , "instruments:"
+    , "  pulse:"
+    , "    instrument_id: 0"
+    , "    amp: 1"
+    , "    pan: 0"
+    , "    pattern_ending: 0/60/0.5/0.9,0.5/62/0.5/0.9,1/64/0.5/0.9,1.5/65/0.5/0.9,2/67/0.5/0.9,2.5/69/0.5/0.9,3/71/0.5/0.9,3.5/72/0.5/0.9"
+    ]
+
+bufferedFutureBars ∷ TimelineRuntime → [TimelineBar]
+bufferedFutureBars rt =
+  let seqIx = max 0 (trNextBarIx rt - trBarOffset rt)
+  in drop seqIx (toList (trBars rt))
 
 timelineTempoChangeYaml ∷ String
 timelineTempoChangeYaml =
@@ -2138,7 +2230,7 @@ testMonoAdsrOverrideOnNewVoice = do
       override = ADSR 0.005 0.01 1.5 0.02
       expected = override { aSustain = 1 }
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) (NoteInstanceId 1) 0.8 (Just override)
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) (NoteInstanceId 1) 0.8 (Just override)
   assertEqual "active voice count" 1 (stActiveCount st2)
   voice <- MV.read (stVoices st2) 0
   assertEqual "voice ADSR" expected (vADSR voice)
@@ -2154,8 +2246,8 @@ testMonoLegatoReusesVoiceAndUpdatesOverride = do
       override2 = ADSR 0.02 0.04 (-0.5) 0.05
       expected2 = override2 { aSustain = 0 }
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) (NoteInstanceId 1) 0.7 (Just override1)
-  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 67) (NoteInstanceId 2) 0.7 (Just override2)
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) (NoteInstanceId 1) 0.7 (Just override1)
+  st3 <- addInstrumentNote handle st2 iid AudioBusMusic 1 0 (NoteKey 67) (NoteInstanceId 2) 0.7 (Just override2)
   assertEqual "active voice count after legato reuse" 1 (stActiveCount st3)
   assertEqual "monotonic voice timestamp" 2 (stNow st3)
   voice <- MV.read (stVoices st3) 0
@@ -2172,8 +2264,8 @@ testMonoLegatoSustainStyleStaleReleaseIsIgnored = do
       firstId = NoteInstanceId 1
       secondId = NoteInstanceId 2
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
-  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 67) secondId 0.8 Nothing
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid AudioBusMusic 1 0 (NoteKey 67) secondId 0.8 Nothing
   st4 <- releaseInstrumentNote iid firstId st3
   assertEqual "active voice count after stale release" 1 (stActiveCount st4)
   voice <- MV.read (stVoices st4) 0
@@ -2190,8 +2282,8 @@ testMonoLegatoSustainStyleCurrentReleaseStillWorks = do
       firstId = NoteInstanceId 1
       secondId = NoteInstanceId 2
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
-  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 67) secondId 0.8 Nothing
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid AudioBusMusic 1 0 (NoteKey 67) secondId 0.8 Nothing
   st4 <- releaseInstrumentNote iid firstId st3
   st5 <- releaseInstrumentNote iid secondId st4
   voice <- MV.read (stVoices st5) 0
@@ -2206,8 +2298,8 @@ testReleaseTargetsMatchingNoteInstance = do
       firstId = NoteInstanceId 1
       secondId = NoteInstanceId 2
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
-  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 64) secondId 0.8 Nothing
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid AudioBusMusic 1 0 (NoteKey 64) secondId 0.8 Nothing
   st4 <- releaseInstrumentNote iid firstId st3
   voices <- readActiveVoices st4
   released <- findVoice firstId voices
@@ -2225,10 +2317,10 @@ testPolyVoiceStealReusesReleasedSlot = do
       secondId = NoteInstanceId 2
       thirdId = NoteInstanceId 3
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
-  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 64) secondId 0.8 Nothing
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid AudioBusMusic 1 0 (NoteKey 64) secondId 0.8 Nothing
   st4 <- releaseInstrumentNote iid firstId st3
-  st5 <- addInstrumentNote handle st4 iid 1 0 (NoteKey 67) thirdId 0.8 Nothing
+  st5 <- addInstrumentNote handle st4 iid AudioBusMusic 1 0 (NoteKey 67) thirdId 0.8 Nothing
   voices <- readActiveVoices st5
   assertEqual "active voice count after steal" 2 (stActiveCount st5)
   assertBool "released voice should be replaced" (all ((/= Just firstId) . vNoteInstanceId) voices)
@@ -2247,9 +2339,9 @@ testReleaseAllVoicesKeepsOtherInstrumentsActive = do
       thirdId = NoteInstanceId 3
   st1 <- setInstrument iid0 inst st0
   st2 <- setInstrument iid1 inst st1
-  st3 <- addInstrumentNote handle st2 iid0 1 0 (NoteKey 60) firstId 0.8 Nothing
-  st4 <- addInstrumentNote handle st3 iid0 1 0 (NoteKey 64) secondId 0.8 Nothing
-  st5 <- addInstrumentNote handle st4 iid1 1 0 (NoteKey 67) thirdId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid0 AudioBusMusic 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st4 <- addInstrumentNote handle st3 iid0 AudioBusMusic 1 0 (NoteKey 64) secondId 0.8 Nothing
+  st5 <- addInstrumentNote handle st4 iid1 AudioBusMusic 1 0 (NoteKey 67) thirdId 0.8 Nothing
   st6 <- releaseInstrumentAllVoices iid0 st5
   voices <- readActiveVoices st6
   firstVoice <- findVoice firstId voices
@@ -2368,8 +2460,8 @@ testPolyAftertouchTargetsMatchingNoteInstance = do
       firstId = NoteInstanceId 1
       secondId = NoteInstanceId 2
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) firstId 0.8 Nothing
-  st3 <- addInstrumentNote handle st2 iid 1 0 (NoteKey 64) secondId 0.8 Nothing
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) firstId 0.8 Nothing
+  st3 <- addInstrumentNote handle st2 iid AudioBusMusic 1 0 (NoteKey 64) secondId 0.8 Nothing
   st4 <- setInstrumentNoteAftertouch iid secondId 1.5 st3
   voices <- readActiveVoices st4
   firstVoice <- findVoice firstId voices
@@ -2544,7 +2636,7 @@ testInstrumentLoadKeepsActiveVoiceUntilLiveApply = do
           , iModRoutes = routesB
           }
   st1 <- setInstrument iid instA st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) (NoteInstanceId 1) 0.8 Nothing
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) (NoteInstanceId 1) 0.8 Nothing
   st3 <- setInstrument iid instB st2
   voiceLoaded <- MV.read (stVoices st3) 0
   oscLoaded <- MV.read (vOscs voiceLoaded) 0
@@ -2610,6 +2702,24 @@ testClipMusicBusGainZeroMutesOutput = do
       assertNear "left output should be muted by bus gain" 0 (realToFrac (l ∷ CFloat))
       assertNear "right output should be muted by bus gain" 0 (realToFrac (r ∷ CFloat))
 
+testNoteSfxBusGainZeroMutesOutput ∷ IO ()
+testNoteSfxBusGainZeroMutesOutput = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      inst =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSquare rootPitch 1 NoSync Nothing]
+          , iAdsrDefault = ADSR 0 0 1 0.5
+          }
+  st1 <- setInstrument iid inst st0
+  st2 <- addInstrumentNote handle st1 iid AudioBusSfx 1 0 (NoteKey 60) (NoteInstanceId 1) 0.8 Nothing
+  let st3 = st2 { stBusSfxGain = 0 }
+  bracket (rbCreateF32 32 2) rbDestroy $ \rb -> do
+    (_st4, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 4 st3
+    vals <- readRenderedSamples rb 4
+    assertBool "all note samples should be muted by SFX bus gain" (all (\x -> abs x < 1e-6) vals)
+
 testClipFinishedEmitsAudioEvent ∷ IO ()
 testClipFinishedEmitsAudioEvent = do
   st0 <- mkTestState
@@ -2642,7 +2752,7 @@ testNoteFinishedEmitsAudioEvent = do
       noteInst = NoteInstanceId 99
       inst = (mkInstrument Poly) { iAdsrDefault = ADSR 0 0 0 0.001 }
   st1 <- setInstrument iid inst st0
-  st2 <- addInstrumentNote handle st1 iid 1 0 (NoteKey 60) noteInst 0.8 Nothing
+  st2 <- addInstrumentNote handle st1 iid AudioBusMusic 1 0 (NoteKey 60) noteInst 0.8 Nothing
   st3 <- releaseInstrumentNote iid noteInst st2
   bracket (rbCreateF32 512 2) rbDestroy $ \rb -> do
     (_st4, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 512 st3
@@ -2650,6 +2760,148 @@ testNoteFinishedEmitsAudioEvent = do
     assertBool
       "note finished event should be emitted"
       (AudioEventNoteFinished iid noteInst `elem` events)
+
+testMixedSongAndWavClipCoexistOnMusicBus ∷ IO ()
+testMixedSongAndWavClipCoexistOnMusicBus = do
+  handle <- mkTestHandle
+  let iid = InstrumentId 0
+      noteInst = NoteInstanceId 70
+      clipId' = ClipId 7
+      inst =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSquare rootPitch 1 NoSync Nothing]
+          , iAdsrDefault = ADSR 0 0 1 0.5
+          }
+      noteOnAction =
+        ScheduledNoteOn
+          { saInstrumentId = iid
+          , saNoteBus = AudioBusMusic
+          , saAmp = 0.4
+          , saPan = 0
+          , saNoteKey = NoteKey 60
+          , saNoteInstanceId = noteInst
+          , saVelocity = 0.8
+          , saAdsrOverride = Nothing
+          }
+      clip =
+        ClipAsset 1 4 (VU.fromList [0.25, 0.25, 0.25, 0.25])
+      clipSrc =
+        ClipSource
+          { csClipId = clipId'
+          , csBus = AudioBusMusic
+          , csGainL = 1
+          , csGainR = 1
+          , csFramePos = 0
+          , csLoop = False
+          }
+      renderScenario includeSong includeClip = do
+        st0 <- mkTestState
+        st1 <- setInstrument iid inst st0
+        let st2 =
+              st1
+                { stScheduled = if includeSong then [ScheduledItem 0 1 noteOnAction] else []
+                }
+        if includeClip
+          then do
+            MV.write (stClipAssets st2) 7 (Just clip)
+            MV.write (stClipSources st2) 0 clipSrc
+            let st3 = st2 { stClipActiveCount = 1 }
+            bracket (rbCreateF32 32 2) rbDestroy $ \rb -> do
+              (_st4, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 4 st3
+              takeEveryOther <$> readRenderedSamples rb 4
+          else
+            bracket (rbCreateF32 32 2) rbDestroy $ \rb -> do
+              (_st3, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 4 st2
+              takeEveryOther <$> readRenderedSamples rb 4
+  songOnly <- renderScenario True False
+  clipOnly <- renderScenario False True
+  mixed <- renderScenario True True
+  assertBool
+    "music note and clip should both contribute on the shared music bus"
+    (meanAbs mixed > meanAbs songOnly && meanAbs mixed > meanAbs clipOnly)
+
+testMixedSongAndSfxNoteRespectSeparateBuses ∷ IO ()
+testMixedSongAndSfxNoteRespectSeparateBuses = do
+  handle <- mkTestHandle
+  let songIid = InstrumentId 0
+      sfxIid = InstrumentId 1
+      songInst =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSquare rootPitch 1 NoSync Nothing]
+          , iAdsrDefault = ADSR 0 0 1 0.5
+          }
+      sfxInst =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSquare rootPitch 1 NoSync Nothing]
+          , iAdsrDefault = ADSR 0 0 1 0.5
+          }
+      songAction =
+        ScheduledNoteOn
+          { saInstrumentId = songIid
+          , saNoteBus = AudioBusMusic
+          , saAmp = 0.5
+          , saPan = 0
+          , saNoteKey = NoteKey 60
+          , saNoteInstanceId = NoteInstanceId 71
+          , saVelocity = 0.8
+          , saAdsrOverride = Nothing
+          }
+      renderScenario includeSfx = do
+        st0 <- mkTestState
+        st1 <- setInstrument songIid songInst st0
+        st2 <- setInstrument sfxIid sfxInst st1
+        st3 <-
+          if includeSfx
+            then addInstrumentNote handle st2 sfxIid AudioBusSfx 0.5 0 (NoteKey 67) (NoteInstanceId 72) 0.8 Nothing
+            else pure st2
+        let st4 =
+              st3
+                { stScheduled = [ScheduledItem 0 1 songAction]
+                , stBusSfxGain = 0
+                }
+        bracket (rbCreateF32 32 2) rbDestroy $ \rb -> do
+          (_st5, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 4 st4
+          takeEveryOther <$> readRenderedSamples rb 4
+  songOnly <- renderScenario False
+  songWithMutedSfx <- renderScenario True
+  assertBool
+    "muting SFX bus should leave the scheduled song note unchanged"
+    (and (zipWith (\a b -> abs (a - b) < 1e-5) songOnly songWithMutedSfx))
+
+testMixedSongAndMidiNoteShareMusicBus ∷ IO ()
+testMixedSongAndMidiNoteShareMusicBus = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let songIid = InstrumentId 0
+      midiIid = InstrumentId 1
+      inst =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSquare rootPitch 1 NoSync Nothing]
+          , iAdsrDefault = ADSR 0 0 1 0.5
+          }
+      songAction =
+        ScheduledNoteOn
+          { saInstrumentId = songIid
+          , saNoteBus = AudioBusMusic
+          , saAmp = 0.35
+          , saPan = 0
+          , saNoteKey = NoteKey 60
+          , saNoteInstanceId = NoteInstanceId 73
+          , saVelocity = 0.8
+          , saAdsrOverride = Nothing
+          }
+  st1 <- setInstrument songIid inst st0
+  st2 <- setInstrument midiIid inst st1
+  st3 <- addInstrumentNote handle st2 midiIid AudioBusMusic 0.35 0 (NoteKey 64) (NoteInstanceId 74) 0.8 Nothing
+  let st4 =
+        st3
+          { stScheduled = [ScheduledItem 0 1 songAction]
+          , stBusMusicGain = 0
+          }
+  bracket (rbCreateF32 32 2) rbDestroy $ \rb -> do
+    (_st5, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 4 st4
+    vals <- readRenderedSamples rb 4
+    assertBool "muting music bus should silence both scheduled song and MIDI-style note" (all (\x -> abs x < 1e-6) vals)
 
 testScheduledBusGainSwitchesAtFrame ∷ IO ()
 testScheduledBusGainSwitchesAtFrame = do
@@ -2703,6 +2955,7 @@ testScheduledNoteOnOffTriggerAtFrames = do
       noteOnAction =
         ScheduledNoteOn
           { saInstrumentId = iid
+          , saNoteBus = AudioBusMusic
           , saAmp = 1
           , saPan = 0
           , saNoteKey = noteKey
@@ -2737,6 +2990,45 @@ testScheduledNoteOnOffTriggerAtFrames = do
     assertBool
       "note-off schedule trigger event should be emitted"
       (AudioEventScheduleTriggered 3 noteOffAction `elem` events)
+
+testScheduledStopBusClearsNoteAndClipSources ∷ IO ()
+testScheduledStopBusClearsNoteAndClipSources = do
+  handle <- mkTestHandle
+  st0 <- mkTestState
+  let iid = InstrumentId 0
+      inst =
+        (mkInstrument Poly)
+          { iOscs = [OscLayer WaveSquare rootPitch 1 NoSync Nothing]
+          , iAdsrDefault = ADSR 0 0 1 0.5
+          }
+      clip =
+        ClipAsset 1 8 (VU.fromList (replicate 8 0.25))
+      clipSrc =
+        ClipSource
+          { csClipId = ClipId 3
+          , csBus = AudioBusSfx
+          , csGainL = 1
+          , csGainR = 1
+          , csFramePos = 0
+          , csLoop = False
+          }
+  st1 <- setInstrument iid inst st0
+  st2 <- addInstrumentNote handle st1 iid AudioBusSfx 0.5 0 (NoteKey 60) (NoteInstanceId 75) 0.8 Nothing
+  MV.write (stClipAssets st2) 3 (Just clip)
+  MV.write (stClipSources st2) 0 clipSrc
+  let st3 =
+        st2
+          { stClipActiveCount = 1
+          , stScheduled = [ScheduledItem 1 1 (ScheduledStopBus AudioBusSfx)]
+          }
+  bracket (rbCreateF32 32 2) rbDestroy $ \rb -> do
+    (st4, _wrote) <- renderChunkFrames (audioEventQueue handle) runScheduledForTest rb 4 st3
+    assertEqual "scheduled stop bus should remove SFX note voices" 0 (stActiveCount st4)
+    assertEqual "scheduled stop bus should remove SFX clips" 0 (stClipActiveCount st4)
+    events <- drainAudioEvents (audioEventQueue handle)
+    assertBool
+      "stop-bus trigger event should be emitted"
+      (AudioEventScheduleTriggered 1 (ScheduledStopBus AudioBusSfx) `elem` events)
 
 testWavDecoderLoadsStereoF32 ∷ IO ()
 testWavDecoderLoadsStereoF32 =
@@ -2800,9 +3092,9 @@ runScheduledForTest action st =
                   , csLoop = loop
                   }
               pure st { stClipActiveCount = active + 1 }
-    ScheduledNoteOn iid amp pan key noteInst vel adsrOverride -> do
+    ScheduledNoteOn iid bus amp pan key noteInst vel adsrOverride -> do
       handle <- mkTestHandle
-      addInstrumentNote handle st iid amp pan key noteInst vel adsrOverride
+      addInstrumentNote handle st iid bus amp pan key noteInst vel adsrOverride
     ScheduledNoteOff iid noteInst ->
       releaseInstrumentNote iid noteInst st
     ScheduledStopClip cid -> do
@@ -2832,7 +3124,7 @@ runScheduledForTest action st =
                       MV.read vec lastIx >>= MV.write vec i
                     go i st' { stClipActiveCount = lastIx }
                   else go (i + 1) st'
-      go 0 st
+      stopVoicesByBus bus st >>= go 0
     ScheduledSetBusGain bus gain ->
       case bus of
         AudioBusMusic -> pure st { stBusMusicGain = max 0 (min 1 gain) }
@@ -2945,6 +3237,18 @@ rootPitch = PitchSpec 0 0 0 0
 readActiveVoices ∷ AudioState → IO [Voice]
 readActiveVoices st =
   mapM (MV.read (stVoices st)) [0 .. stActiveCount st - 1]
+
+readRenderedSamples ∷ Ptr MaRB → Int → IO [Float]
+readRenderedSamples rb frames =
+  allocaArray (frames * 2) $ \buf -> do
+    got <- rbReadF32 rb buf (fromIntegral frames)
+    assertEqual "ring buffer should contain requested frames" frames (fromIntegral got ∷ Int)
+    map realToFrac <$> peekArray (frames * 2) buf
+
+takeEveryOther ∷ [a] → [a]
+takeEveryOther [] = []
+takeEveryOther (x:_:rest) = x : takeEveryOther rest
+takeEveryOther [x] = [x]
 
 findVoice ∷ NoteInstanceId → [Voice] → IO Voice
 findVoice instId voices =

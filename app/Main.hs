@@ -23,13 +23,16 @@ import Audio.Patch (defaultMidiProgram, gmChannelInstrument, gmDrumInstrument)
 import Audio.Thread
 import Audio.Types
 import Player.Instrument (loadResolvedInstrument, usesBuiltInDrumPatch)
-import Player.Thread
+import Player.Automation (AutomationCurve(..))
+import qualified Player.Runtime as Runtime
 import Player.Timeline
   ( InstrumentPatternSpec(..)
   , SectionSpec(..)
   , SongSpec(..)
   , TimelineBar(..)
+  , TimelineLookaheadTelemetry(..)
   , TimelineNote(..)
+  , TimelineRetargetTelemetry(..)
   , compileTimelineBars
   , cueSectionOrder
   , lookupGeneratedInstrument
@@ -53,7 +56,7 @@ main = do
         CliPlay healthVerbosity inputPath -> do
           audioCfg <- loadAudioConfig audioConfigPath
           bracket (startAudioSystem audioCfg healthVerbosity) stopAudioSystem $ \sys -> do
-            bracket (startPlayerThread sys) stopPlayerThread $ \player -> do
+            bracket (Runtime.startRuntime sys) Runtime.stopRuntime $ \player -> do
               -- Preload instruments 0..15 (MIDI channels) with the same patch for now.
               preloadChannels sys
               runInputMode sys player inputPath
@@ -62,7 +65,7 @@ main = do
         CliNotePreview healthVerbosity -> do
           audioCfg <- loadAudioConfig audioConfigPath
           bracket (startAudioSystem audioCfg healthVerbosity) stopAudioSystem $ \sys -> do
-            bracket (startPlayerThread sys) stopPlayerThread $ \player -> do
+            bracket (Runtime.startRuntime sys) Runtime.stopRuntime $ \player -> do
               preloadChannels sys
               runNotePreviewShell sys player
         CliCheckPatch patchPath ->
@@ -241,16 +244,16 @@ previewNoteValue instrumentNameMap barIx baseBeat framesToBeats note =
       , "durationBeats" Aeson..= framesToBeats durationFrames
       ]
 
-runInputMode ∷ AudioSystem → PlayerSystem → FilePath → IO ()
+runInputMode ∷ AudioSystem → Runtime.PlayerSystem → FilePath → IO ()
 runInputMode sys player inputPath
   | hasExt ".mid" inputPath || hasExt ".midi" inputPath = do
       playMidiInput sys inputPath
       putStrLn "Press q to quit."
-      withRawStdin (waitForQuit sys)
+      withRawStdin (waitForQuit player)
   | hasExt ".wav" inputPath = do
-      playWavInput sys inputPath
+      playWavInput player inputPath
       putStrLn "Press q to quit."
-      withRawStdin (waitForQuit sys)
+      withRawStdin (waitForQuit player)
   | hasExt ".yaml" inputPath || hasExt ".yml" inputPath =
       playSongTimelineInteractive sys player inputPath
   | otherwise =
@@ -261,11 +264,11 @@ playMidiInput sys inputPath = do
   _ <- forkIO (playMidiFile defaultChannelMap sys inputPath)
   putStrLn ("Playing MIDI file: " <> inputPath)
 
-playWavInput ∷ AudioSystem → FilePath → IO ()
-playWavInput sys inputPath = do
+playWavInput ∷ Runtime.PlayerSystem → FilePath → IO ()
+playWavInput player inputPath = do
   let clip = ClipId 0
-  loadClipFromFile sys clip inputPath
-  sendAudio sys (AudioPlayClip clip AudioBusMusic 1 0 False)
+  Runtime.loadClipFile player clip inputPath
+  Runtime.playMusicClipNow player clip 1 0 False
   putStrLn ("Playing WAV file: " <> inputPath)
 
 data PromptCmd
@@ -280,6 +283,7 @@ data PromptCmd
   | PromptCancelMood
   | PromptTempo !Float
   | PromptMeter !Int
+  | PromptStatus
   | PromptStart
   | PromptStop
   | PromptPanic
@@ -287,11 +291,11 @@ data PromptCmd
   | PromptPreviewPatch !FilePath !Int !Float !Int
   | PromptUnknown !String
 
-playSongTimelineInteractive ∷ AudioSystem → PlayerSystem → FilePath → IO ()
+playSongTimelineInteractive ∷ AudioSystem → Runtime.PlayerSystem → FilePath → IO ()
 playSongTimelineInteractive sys player path = do
   instCounterRef <- newIORef 1
-  sendPlayer player (PlayerLoadSongTimeline path)
-  sendPlayer player PlayerStartSongTimeline
+  Runtime.loadSong player path
+  Runtime.startSongNextBar player
   _ <- forkIO (playerEventPrinter player)
   putStrLn ("Playing song timeline: " <> path)
   printPromptHelp
@@ -308,7 +312,7 @@ playSongTimelineInteractive sys player path = do
           done <- runPromptCommand sys player instCounterRef (parsePromptCmd line)
           if done then pure () else commandLoop instCounterRef
 
-runNotePreviewShell ∷ AudioSystem → PlayerSystem → IO ()
+runNotePreviewShell ∷ AudioSystem → Runtime.PlayerSystem → IO ()
 runNotePreviewShell sys player = do
   instCounterRef <- newIORef 1
   _ <- forkIO (playerEventPrinter player)
@@ -329,47 +333,49 @@ quitInteractive = do
   putStrLn "Quit."
   exitSuccess
 
-runPromptCommand ∷ AudioSystem → PlayerSystem → IORef Word64 → PromptCmd → IO Bool
+runPromptCommand ∷ AudioSystem → Runtime.PlayerSystem → IORef Word64 → PromptCmd → IO Bool
 runPromptCommand sys player instCounterRef cmd =
   case cmd of
     PromptHelp -> printPromptHelp >> pure False
     PromptQuit -> do
-      sendPlayer player PlayerStopSongTimeline
-      sendAudio sys AudioStopAll
+      Runtime.stopSong player
+      Runtime.panic player
       quitInteractive
       pure True
     PromptGenre genre -> do
       case genre of
-        Nothing -> sendPlayer player PlayerClearGenreTarget
-        Just g -> sendPlayer player (PlayerSetGenreTarget g)
+        Nothing -> Runtime.clearGenreTarget player
+        Just g -> Runtime.setGenreTarget player g
       pure False
     PromptMood mood -> do
       case mood of
-        Nothing -> sendPlayer player PlayerClearMoodTarget
-        Just m -> sendPlayer player (PlayerSetMoodTarget m)
+        Nothing -> Runtime.clearMoodTarget player
+        Just m -> Runtime.setMoodTarget player m
       pure False
-    PromptEnergy x -> sendPlayer player (PlayerSetEnergyTarget x) >> pure False
+    PromptEnergy x -> Runtime.setEnergyTarget player x >> pure False
     PromptAutoEnergy target bars curve -> do
-      sendPlayer player (PlayerAutomateEnergyNextBar target bars curve)
+      Runtime.automateEnergyNextBar player target bars curve
       pure False
     PromptAutoMood mood bars -> do
       let target = maybe "" id mood
-      sendPlayer player (PlayerAutomateMoodNextBar target bars)
+      Runtime.automateMoodNextBar player target bars
       pure False
     PromptCancelEnergy ->
-      sendPlayer player PlayerCancelEnergyAutomation >> pure False
+      Runtime.cancelEnergyAutomation player >> pure False
     PromptCancelMood ->
-      sendPlayer player PlayerCancelMoodAutomation >> pure False
+      Runtime.cancelMoodAutomation player >> pure False
     PromptTempo bpm ->
-      sendPlayer player (PlayerSetTempoBpm bpm) >> pure False
+      Runtime.setTempoBpm player bpm >> pure False
     PromptMeter beats ->
-      sendPlayer player (PlayerSetMeter beats) >> pure False
+      Runtime.setMeter player beats >> pure False
+    PromptStatus ->
+      Runtime.requestStatus player >> pure False
     PromptStart ->
-      sendPlayer player PlayerStartSongTimeline >> pure False
+      Runtime.startSongNextBar player >> pure False
     PromptStop ->
-      sendPlayer player PlayerStopSongTimeline >> pure False
+      Runtime.stopSong player >> pure False
     PromptPanic ->
-      sendAudio sys AudioStopAll >> pure False
+      Runtime.panic player >> pure False
     PromptPreviewNote genre instrumentName key velocity durationMs -> do
       previewGeneratedNote sys instCounterRef genre instrumentName key velocity durationMs
       pure False
@@ -427,6 +433,7 @@ parsePromptCmd raw =
           ["quit"] -> PromptQuit
           ["exit"] -> PromptQuit
           ["panic"] -> PromptPanic
+          ["status"] -> PromptStatus
           ["start"] -> PromptStart
           ["stop"] -> PromptStop
           ["note", genre, instrumentName, keyS] ->
@@ -490,6 +497,7 @@ printPromptHelp =
       , "  start                    Start timeline playback"
       , "  stop                     Stop timeline playback"
       , "  panic                    Stop all audio voices/clips immediately"
+      , "  status                   Query current runtime status snapshot"
       , "  note <genre> <instrument> <midi-key> [velocity] [duration-ms]"
       , "                           Preview one generated instrument note"
       , "  patch <path> <midi-key> [velocity] [duration-ms]"
@@ -507,34 +515,81 @@ printPromptHelp =
       , "  meter <beats>            Set beats-per-bar for next-bar quantization"
       ]
 
-playerEventPrinter ∷ PlayerSystem → IO ()
+playerEventPrinter ∷ Runtime.PlayerSystem → IO ()
 playerEventPrinter player = loop
   where
     loop = do
-      m <- tryReadPlayerEvent player
+      m <- Runtime.tryReadEvent player
       case m of
         Nothing -> threadDelay 20000 >> loop
         Just ev -> do
           printPlayerEvent ev
           loop
 
-printPlayerEvent ∷ PlayerEvent → IO ()
+printPlayerEvent ∷ Runtime.PlayerEvent → IO ()
 printPlayerEvent ev =
   case ev of
-    PlayerEventTimelineLoaded path ->
+    Runtime.PlayerEventStatus status ->
+      putStrLn
+        ( "[player] status frame="
+            <> show (Runtime.prsTransportFrame status)
+            <> " loaded="
+            <> show (Runtime.prsSongLoaded status)
+            <> " playing="
+            <> show (Runtime.prsTimelinePlaying status)
+            <> " section="
+            <> show (Runtime.prsCurrentSection status)
+        )
+    Runtime.PlayerEventTimelineLoaded path ->
       putStrLn ("[player] loaded timeline: " <> path)
-    PlayerEventTimelineLoadFailed path err ->
+    Runtime.PlayerEventTimelineLoadFailed path err ->
       putStrLn ("[player] timeline load failed (" <> path <> "): " <> err)
-    PlayerEventTimelineStarted frame bars ->
+    Runtime.PlayerEventClipLoaded clipId path ->
+      putStrLn ("[player] loaded clip " <> show clipId <> ": " <> path)
+    Runtime.PlayerEventClipLoadFailed clipId path err ->
+      putStrLn ("[player] clip load failed (" <> show clipId <> ", " <> path <> "): " <> err)
+    Runtime.PlayerEventTimelineStarted frame bars ->
       putStrLn ("[player] timeline started at frame " <> show frame <> " (" <> show bars <> " bars)")
-    PlayerEventTimelineStopped ->
+    Runtime.PlayerEventTimelineStopped ->
       putStrLn "[player] timeline stopped"
-    PlayerEventTimelineFinished ->
+    Runtime.PlayerEventTimelineFinished ->
       putStrLn "[player] timeline finished"
-    PlayerEventTimelineTransition t ->
+    Runtime.PlayerEventTimelineRetargeted t ->
+      putStrLn
+        ( "[player] retarget policy="
+            <> trtPolicy t
+            <> " buffered-bars="
+            <> show (trtBufferedFutureBars t)
+            <> " next-bar="
+            <> show (trtNextGeneratedBarIx t)
+            <> " frame="
+            <> show (trtNextGeneratedFrame t)
+            <> " mood="
+            <> show (trtMoodTarget t)
+            <> " energy="
+            <> show (trtEnergyTarget t)
+            <> " genre="
+            <> trtGenre t
+        )
+    Runtime.PlayerEventTimelineLookahead t ->
+      putStrLn
+        ( "[player] lookahead reason="
+            <> tltReason t
+            <> " bars="
+            <> show (tltGeneratedBarCount t)
+            <> " range="
+            <> show (tltFirstGeneratedBarIx t)
+            <> "-"
+            <> show (tltLastGeneratedBarIx t)
+            <> " frames="
+            <> show (tltStartFrame t)
+            <> "->"
+            <> show (tltEndFrame t)
+        )
+    Runtime.PlayerEventTimelineTransition t ->
       putStrLn
         ("[player] transition " <> show t)
-    PlayerEventEnergyAutomationStarted startF endF fromE toE curve ->
+    Runtime.PlayerEventEnergyAutomationStarted startF endF fromE toE curve ->
       putStrLn
         ( "[player] energy lane started frame="
             <> show startF
@@ -547,9 +602,9 @@ printPlayerEvent ev =
             <> " curve="
             <> show curve
         )
-    PlayerEventEnergyAutomationCompleted endF finalE ->
+    Runtime.PlayerEventEnergyAutomationCompleted endF finalE ->
       putStrLn ("[player] energy lane completed frame=" <> show endF <> " value=" <> show finalE)
-    PlayerEventMoodAutomationStarted startF endF fromM toM ->
+    Runtime.PlayerEventMoodAutomationStarted startF endF fromM toM ->
       putStrLn
         ( "[player] mood lane started frame="
             <> show startF
@@ -560,19 +615,19 @@ printPlayerEvent ev =
             <> "->"
             <> show toM
         )
-    PlayerEventMoodAutomationCompleted endF finalM ->
+    Runtime.PlayerEventMoodAutomationCompleted endF finalM ->
       putStrLn ("[player] mood lane completed frame=" <> show endF <> " value=" <> show finalM)
-    PlayerEventEnergyAutomationCanceled ->
+    Runtime.PlayerEventEnergyAutomationCanceled ->
       putStrLn "[player] energy lane canceled"
-    PlayerEventMoodAutomationCanceled ->
+    Runtime.PlayerEventMoodAutomationCanceled ->
       putStrLn "[player] mood lane canceled"
-    PlayerEventGenreChanged genre ->
+    Runtime.PlayerEventGenreChanged genre ->
       putStrLn ("[player] genre set to " <> genre)
-    PlayerEventGenreChangeRejected requested err ->
+    Runtime.PlayerEventGenreChangeRejected requested err ->
       putStrLn ("[player] genre change rejected (" <> requested <> "): " <> err)
-    PlayerEventScheduled _ _ ->
+    Runtime.PlayerEventScheduled _ _ ->
       pure ()
-    PlayerEventAudio _ ->
+    Runtime.PlayerEventAudio _ ->
       pure ()
 
 hasExt ∷ String → FilePath → Bool
@@ -624,6 +679,7 @@ previewGeneratedNote sys instCounterRef genre instrumentName key velocity durati
             sys
             (AudioNoteOn
               { instrumentId = previewIid
+              , noteBus = AudioBusSfx
               , amp = ipAmp instrumentSpec
               , pan = ipPan instrumentSpec
               , noteKey = previewKey
@@ -681,6 +737,7 @@ previewPatchNote sys instCounterRef patchPath key velocity durationMs = do
         sys
         (AudioNoteOn
           { instrumentId = previewIid
+          , noteBus = AudioBusSfx
           , amp = 1
           , pan = 0
           , noteKey = previewKey
@@ -702,13 +759,13 @@ previewPatchNote sys instCounterRef patchPath key velocity durationMs = do
             <> show (max 1 durationMs)
         )
 
-waitForQuit ∷ AudioSystem → IO ()
-waitForQuit sys = do
+waitForQuit ∷ Runtime.PlayerSystem → IO ()
+waitForQuit player = do
   let loop = do
         c <- hGetChar stdin
         case c of
           'q' -> do
-            sendAudio sys AudioStopAll
+            Runtime.panic player
             putStrLn "\nQuit."
             exitSuccess
           _ -> loop

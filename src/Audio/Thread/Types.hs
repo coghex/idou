@@ -72,6 +72,7 @@ data Voice = Voice
   , vNoteAftertouch ∷ !Float
 
   , vInstrId    ∷ !(Maybe InstrumentId)
+  , vBus        ∷ !AudioBus
 
   , vStartedAt  ∷ !Word64
   , vVibPhase   ∷ !Float

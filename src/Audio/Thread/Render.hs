@@ -336,7 +336,8 @@ mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouc
       baseAmp = stereoAmp (vBaseAmpL v0) (vBaseAmpR v0)
       basePan = stereoPan (vBaseAmpL v0) (vBaseAmpR v0)
       finalPan = clampPan (basePan + channelPan)
-      (voiceAmpL0, voiceAmpR0) = panGains (baseAmp * vInstrGain v0 * channelGain) finalPan
+      busGain = busGainFor st (vBus v0)
+      (voiceAmpL0, voiceAmpR0) = panGains (baseAmp * vInstrGain v0 * channelGain * busGain) finalPan
       lfoRateHz
         | vibRateHz > 0 = vibRateHz
         | modWheel > 0 = defaultModWheelLfoRateHz

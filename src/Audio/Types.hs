@@ -251,6 +251,7 @@ data AudioMsg
 
   | AudioNoteOn
       { instrumentId   ∷ !InstrumentId
+      , noteBus        ∷ !AudioBus
       , amp            ∷ !Float
       , pan            ∷ !Float
       , noteKey        ∷ !NoteKey
@@ -308,6 +309,7 @@ data ScheduledAudioAction
       }
   | ScheduledNoteOn
       { saInstrumentId ∷ !InstrumentId
+      , saNoteBus ∷ !AudioBus
       , saAmp ∷ !Float
       , saPan ∷ !Float
       , saNoteKey ∷ !NoteKey

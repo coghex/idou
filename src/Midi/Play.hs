@@ -18,7 +18,8 @@ import qualified Data.Map.Strict as M
 import Audio.Patch (gmChannelInstrument, gmDrumInstrument, gmPercussionChannel)
 import Audio.Thread (AudioSystem, sendAudio)
 import Audio.Types
-  ( AudioMsg(..)
+  ( AudioBus(..)
+  , AudioMsg(..)
   , InstrumentId(..)
   , NoteKey(..)
   , NoteInstanceId(..)
@@ -137,6 +138,7 @@ playMidiFile chanMap sys fp = do
               sendAudio sys $
                 AudioNoteOn
                   { instrumentId = iid
+                  , noteBus = AudioBusMusic
                   , amp = 1.0
                   , pan = 0.0
                   , noteKey = NoteKey key

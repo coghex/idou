@@ -385,6 +385,8 @@ function App() {
   const [showSectionDetails, setShowSectionDetails] = useState(false);
   const [showProgressionEditor, setShowProgressionEditor] = useState(false);
   const [showAccompaniment, setShowAccompaniment] = useState(true);
+  const [showProjectSidebar, setShowProjectSidebar] = useState(false);
+  const [showSoundSidebar, setShowSoundSidebar] = useState(false);
   const [auditionInstrument, setAuditionInstrument] = useState<string>('lead');
   const [selectedChordRegionId, setSelectedChordRegionId] = useState<string | null>(null);
   const [patchDocument, setPatchDocument] = useState<PatchDocument>(createDefaultPatch());
@@ -1738,6 +1740,87 @@ function App() {
     </CollapsibleSection>
   );
 
+  const soundAssignmentsSection = (
+    <CollapsibleSection
+      title="Instruments"
+      summary={instrumentsSummary}
+      expanded={expandedPanels.sound}
+      onToggle={() => togglePanel('sound')}
+    >
+      <div className="instrument-role-list">
+        {PATCH_ROLE_OPTIONS.map((role) => {
+          const roleMeta = PATCH_ROLE_META[role];
+          const assignedPath = document.song.patches[role];
+          return (
+            <div key={role} className="instrument-row" title={roleMeta.description}>
+              <div className="instrument-row-summary">
+                <strong>{roleMeta.label}</strong>
+                <span className="instrument-row-tag">{assignedPath ? 'custom' : 'built-in'}</span>
+              </div>
+              <label className="instrument-row-select">
+                <span className="sr-only">Sound choice for {roleMeta.label}</span>
+                <select value={assignedPath ?? ''} onChange={(event) => setSongPatch(role, event.target.value || null)}>
+                  <option value="">Built-in sound</option>
+                  {patchSelectOptions.map((entry) => (
+                    <option key={`${role}-${entry.path}`} value={entry.assignPath}>
+                      {entry.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <button
+                className="instrument-row-edit"
+                onClick={() => void openPatchEditorForRole(role)}
+                title={`Open the full sound editor for ${roleMeta.label}.`}
+              >
+                Edit
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <div className="hint">Each choice is saved with the song. Open a sound to fine-tune it in the full sound editor.</div>
+    </CollapsibleSection>
+  );
+
+  const songFlowSection = (
+    <CollapsibleSection
+      title="Song flow"
+      summary={document.sections.length === 0 ? 'No arrangement yet' : countLabel(document.sections.length, 'step')}
+      expanded={expandedPanels.form}
+      onToggle={() => togglePanel('form')}
+    >
+      <ol className="form-list">
+        {document.sections.map((section) => (
+          <li
+            key={section.name}
+            data-section-drop-target={section.name}
+            data-section-drop-axis="vertical"
+            className={[
+              draggedSectionName === section.name ? 'dragging' : '',
+              sectionDropHint?.sectionName === section.name ? `drop-${sectionDropHint.position}` : '',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+          >
+            <span
+              className="section-drag-handle flow-drag-handle"
+              onPointerDown={(event) => beginSectionPointerDrag(event, section.name)}
+              title={`Drag to move ${section.name} in the song flow.`}
+            >
+              ⋮⋮
+            </span>
+            <span>{section.name}</span>
+            <div className="inline-actions">
+              <button onClick={() => moveSection(section.name, -1)}>↑</button>
+              <button onClick={() => moveSection(section.name, 1)}>↓</button>
+            </div>
+          </li>
+        ))}
+      </ol>
+    </CollapsibleSection>
+  );
+
   const soundSetupSection = (
     <CollapsibleSection
       title="Sound setup"
@@ -2836,6 +2919,22 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="toolbar-group topbar-file-group">
+          {editorMode === 'arrangement' ? (
+            <button
+              className={showProjectSidebar ? 'topbar-sidebar-toggle active' : 'topbar-sidebar-toggle'}
+              onClick={() => setShowProjectSidebar((value) => !value)}
+              title={showProjectSidebar ? 'Hide project and tools.' : 'Show project and tools.'}
+              aria-expanded={showProjectSidebar}
+            >
+              <span className="topbar-sidebar-toggle-icon" aria-hidden="true">
+                ☰
+              </span>
+              <span className="topbar-sidebar-toggle-chevron" aria-hidden="true">
+                {showProjectSidebar ? '‹' : '›'}
+              </span>
+              <span className="sr-only">{showProjectSidebar ? 'Hide project and tools' : 'Show project and tools'}</span>
+            </button>
+          ) : null}
           <div
             className="file-pill project-pill"
             title={currentPath ? `${fileStatusLabel}: ${currentPath}` : 'Grey means this is a new untitled project.'}
@@ -2870,56 +2969,74 @@ function App() {
         </div>
 
         <div className="toolbar-group topbar-song-meta">
-          <label className="topbar-field" title="Choose the style used for generated parts and melody previews.">
-            <span>Genre</span>
-            <select value={document.song.genre} onChange={(event) => setSongField('genre', event.target.value)}>
-              {songGenreOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="topbar-field" title="Set the overall feeling for the song.">
-            <span>Mood</span>
-            <select value={document.song.mood} onChange={(event) => setSongField('mood', event.target.value)}>
-              {songMoodOptions.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="topbar-field topbar-field-small" title="Set the default tempo in beats per minute.">
-            <span>Tempo</span>
-            <input
-              type="number"
-              min={20}
-              max={280}
-              value={document.song.tempoBpm}
-              onChange={(event) => setSongField('tempoBpm', Number(event.target.value) || 100)}
-            />
-          </label>
-          <label className="topbar-field topbar-field-small" title="Set the default number of beats in each bar.">
-            <span>Beats/Bar</span>
-            <input
-              type="number"
-              min={1}
-              max={16}
-              value={document.song.beatsPerBar}
-              onChange={(event) => setSongField('beatsPerBar', Number(event.target.value) || 4)}
-            />
-          </label>
-          <label className="topbar-field topbar-field-small" title="Choose which note value counts as one beat.">
-            <span>Beat Unit</span>
-            <select value={document.song.beatUnit} onChange={(event) => setSongField('beatUnit', Number(event.target.value) || 4)}>
-              {BEAT_UNIT_OPTIONS.map((option) => (
-                <option key={option} value={option}>
-                  {option}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="topbar-song-fields">
+            <label className="topbar-field" title="Choose the style used for generated parts and melody previews.">
+              <span>Genre</span>
+              <select value={document.song.genre} onChange={(event) => setSongField('genre', event.target.value)}>
+                {songGenreOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="topbar-field" title="Set the overall feeling for the song.">
+              <span>Mood</span>
+              <select value={document.song.mood} onChange={(event) => setSongField('mood', event.target.value)}>
+                {songMoodOptions.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="topbar-field topbar-field-small" title="Set the default tempo in beats per minute.">
+              <span>Tempo</span>
+              <input
+                type="number"
+                min={20}
+                max={280}
+                value={document.song.tempoBpm}
+                onChange={(event) => setSongField('tempoBpm', Number(event.target.value) || 100)}
+              />
+            </label>
+            <label className="topbar-field topbar-field-small" title="Set the default number of beats in each bar.">
+              <span>Beats/Bar</span>
+              <input
+                type="number"
+                min={1}
+                max={16}
+                value={document.song.beatsPerBar}
+                onChange={(event) => setSongField('beatsPerBar', Number(event.target.value) || 4)}
+              />
+            </label>
+            <label className="topbar-field topbar-field-small" title="Choose which note value counts as one beat.">
+              <span>Beat Unit</span>
+              <select value={document.song.beatUnit} onChange={(event) => setSongField('beatUnit', Number(event.target.value) || 4)}>
+                {BEAT_UNIT_OPTIONS.map((option) => (
+                  <option key={option} value={option}>
+                    {option}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {editorMode === 'arrangement' ? (
+            <button
+              className={showSoundSidebar ? 'topbar-sidebar-toggle active' : 'topbar-sidebar-toggle'}
+              onClick={() => setShowSoundSidebar((value) => !value)}
+              title={showSoundSidebar ? 'Hide sounds.' : 'Show sounds.'}
+              aria-expanded={showSoundSidebar}
+            >
+              <span className="topbar-sidebar-toggle-icon" aria-hidden="true">
+                ♪
+              </span>
+              <span className="topbar-sidebar-toggle-chevron" aria-hidden="true">
+                {showSoundSidebar ? '›' : '‹'}
+              </span>
+              <span className="sr-only">{showSoundSidebar ? 'Hide sounds' : 'Show sounds'}</span>
+            </button>
+          ) : null}
         </div>
       </header>
 
@@ -2935,6 +3052,24 @@ function App() {
 
       {editorMode === 'arrangement' ? (
         <main className="arrangement-workspace">
+          {(showProjectSidebar || showSoundSidebar) ? (
+            <button
+              className="arrangement-sidebar-backdrop"
+              aria-label="Close sidebars"
+              onClick={() => {
+                setShowProjectSidebar(false);
+                setShowSoundSidebar(false);
+              }}
+            />
+          ) : null}
+
+          <aside className={`arrangement-side-panel left ${showProjectSidebar ? 'open' : 'closed'}`}>
+            <aside className="sidebar panel arrangement-sidebar-panel arrangement-side-content">
+              {songFlowSection}
+              {projectToolsSection}
+            </aside>
+          </aside>
+
           <section className="arrangement-main-column">
             {melodyWorkspace}
 
@@ -2944,82 +3079,10 @@ function App() {
             </div>
           </section>
 
-          <aside className="arrangement-sidebar-column">
-            <aside className="sidebar panel arrangement-sidebar-panel">
-              <CollapsibleSection
-                title="Instruments"
-                summary={instrumentsSummary}
-                expanded={expandedPanels.sound}
-                onToggle={() => togglePanel('sound')}
-              >
-                <div className="instrument-role-list">
-                  {PATCH_ROLE_OPTIONS.map((role) => {
-                    const roleMeta = PATCH_ROLE_META[role];
-                    const assignedPath = document.song.patches[role];
-                    return (
-                      <div key={role} className="instrument-row" title={roleMeta.description}>
-                        <div className="instrument-row-summary">
-                          <strong>{roleMeta.label}</strong>
-                          <span className="instrument-row-tag">{assignedPath ? 'custom' : 'built-in'}</span>
-                        </div>
-                        <label className="instrument-row-select">
-                          <span className="sr-only">Sound choice for {roleMeta.label}</span>
-                          <select value={assignedPath ?? ''} onChange={(event) => setSongPatch(role, event.target.value || null)}>
-                            <option value="">Built-in sound</option>
-                            {patchSelectOptions.map((entry) => (
-                              <option key={`${role}-${entry.path}`} value={entry.assignPath}>
-                                {entry.label}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <button className="instrument-row-edit" onClick={() => void openPatchEditorForRole(role)} title={`Open the full sound editor for ${roleMeta.label}.`}>
-                          Edit
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-                <div className="hint">Each choice is saved with the song. Open a sound to fine-tune it in the full sound editor.</div>
-              </CollapsibleSection>
-
-              <CollapsibleSection
-                title="Song flow"
-                summary={document.sections.length === 0 ? 'No arrangement yet' : countLabel(document.sections.length, 'step')}
-                expanded={expandedPanels.form}
-                onToggle={() => togglePanel('form')}
-              >
-                <ol className="form-list">
-                  {document.sections.map((section) => (
-                    <li
-                      key={section.name}
-                      data-section-drop-target={section.name}
-                      data-section-drop-axis="vertical"
-                      className={[
-                        draggedSectionName === section.name ? 'dragging' : '',
-                        sectionDropHint?.sectionName === section.name ? `drop-${sectionDropHint.position}` : '',
-                      ]
-                        .filter(Boolean)
-                        .join(' ')}
-                    >
-                      <span
-                        className="section-drag-handle flow-drag-handle"
-                        onPointerDown={(event) => beginSectionPointerDrag(event, section.name)}
-                        title={`Drag to move ${section.name} in the song flow.`}
-                      >
-                        ⋮⋮
-                      </span>
-                      <span>{section.name}</span>
-                      <div className="inline-actions">
-                        <button onClick={() => moveSection(section.name, -1)}>↑</button>
-                        <button onClick={() => moveSection(section.name, 1)}>↓</button>
-                      </div>
-                    </li>
-                  ))}
-                </ol>
-              </CollapsibleSection>
+          <aside className={`arrangement-side-panel right ${showSoundSidebar ? 'open' : 'closed'}`}>
+            <aside className="sidebar panel arrangement-tools-panel arrangement-side-content">
+              {soundAssignmentsSection}
             </aside>
-            <aside className="sidebar panel arrangement-tools-panel">{projectToolsSection}</aside>
           </aside>
         </main>
       ) : (

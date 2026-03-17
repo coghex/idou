@@ -417,7 +417,7 @@ processMsgs h rb st = do
           stopClipSourcesByClip cid st >>= processMsgs h rb
 
         AudioStopBus bus ->
-          stopClipSourcesByBus bus st >>= processMsgs h rb
+          stopSourcesByBus bus st >>= processMsgs h rb
 
         AudioSetBusGain bus gain ->
           setBusGain bus gain st >>= processMsgs h rb
@@ -448,8 +448,8 @@ processMsgs h rb st = do
                 }
 
         -- UPDATED: MIDI-native NoteOn/NoteOff
-        AudioNoteOn iid a p key instId vel eOverride ->
-          addInstrumentNote h st iid a p key instId vel eOverride >>= processMsgs h rb
+        AudioNoteOn iid bus a p key instId vel eOverride ->
+          addInstrumentNote h st iid bus a p key instId vel eOverride >>= processMsgs h rb
 
         AudioNoteOff iid instId ->
           releaseInstrumentNote iid instId st >>= processMsgs h rb
@@ -548,6 +548,10 @@ lookupClipAsset (ClipId clipIx) st = do
     then pure Nothing
     else MV.read assets clipIx
 
+stopSourcesByBus ∷ AudioBus → AudioState → IO AudioState
+stopSourcesByBus bus st =
+  stopVoicesByBus bus st >>= stopClipSourcesByBus bus
+
 setBusGain ∷ AudioBus → Float → AudioState → IO AudioState
 setBusGain bus gain st =
   case bus of
@@ -559,14 +563,14 @@ applyScheduledAction h action st =
   case action of
     ScheduledPlayClip cid bus gain pan loop ->
       addClipSource cid bus gain pan loop st
-    ScheduledNoteOn iid amp pan key noteInst vel adsrOverride ->
-      addInstrumentNote h st iid amp pan key noteInst vel adsrOverride
+    ScheduledNoteOn iid bus amp pan key noteInst vel adsrOverride ->
+      addInstrumentNote h st iid bus amp pan key noteInst vel adsrOverride
     ScheduledNoteOff iid noteInst ->
       releaseInstrumentNote iid noteInst st
     ScheduledStopClip cid ->
       stopClipSourcesByClip cid st
     ScheduledStopBus bus ->
-      stopClipSourcesByBus bus st
+      stopSourcesByBus bus st
     ScheduledSetBusGain bus gain ->
       setBusGain bus gain st
 

@@ -2,14 +2,42 @@
 
 module Player.Thread
   ( AutomationCurve(..)
-  , PlayerMsg(..)
   , PlayerEvent(..)
+  , PlayerRuntimeStatus(..)
   , PlayerSystem(..)
   , nextBarFrame
   , startPlayerThread
   , stopPlayerThread
-  , sendPlayer
   , tryReadPlayerEvent
+  , pausePlayer
+  , resumePlayer
+  , setPlayerMeter
+  , setPlayerTempoBpm
+  , setPlayerGenreTarget
+  , clearPlayerGenreTarget
+  , setPlayerMoodTarget
+  , clearPlayerMoodTarget
+  , setPlayerEnergyTarget
+  , automatePlayerEnergyNextBar
+  , automatePlayerMoodNextBar
+  , cancelPlayerEnergyAutomation
+  , cancelPlayerMoodAutomation
+  , loadPlayerSongTimeline
+  , startPlayerSongTimeline
+  , stopPlayerSongTimeline
+  , schedulePlayerClipNextBar
+  , schedulePlayerBusGainNextBar
+  , schedulePlayerNoteOnNextBar
+  , schedulePlayerNoteOffNextBar
+  , loadPlayerClip
+  , playPlayerClipNow
+  , stopPlayerClipNow
+  , setPlayerBusGainNow
+  , stopPlayerBusNow
+  , playerNoteOnNow
+  , playerNoteOffNow
+  , panicPlayer
+  , requestPlayerStatus
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
@@ -21,15 +49,18 @@ import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word64)
 
+import qualified Data.Sequence as Seq
+
 import Audio.Thread
   ( AudioSystem(..)
+  , loadClipFromFile
   , readTransportFrame
   , scheduleAudioActionAtFrame
   , sendAudio
   , tryReadAudioEvent
   )
 import Audio.Types
-  ( AudioBus
+  ( AudioBus(..)
   , AudioEvent
   , AudioMsg(..)
   , ClipId
@@ -61,11 +92,15 @@ import Player.Timeline
   ( InstrumentPatternSpec(..)
   , SongSpec
   , TimelineBar(..)
+  , TimelineLookaheadTelemetry
   , TimelineNote(..)
+  , TimelineRetargetTelemetry
   , TimelineTransitionTelemetry
   , TimelineRuntime(..)
   , compileTimelineBars
   , loadSongSpec
+  , popLookaheadTelemetry
+  , popRetargetTelemetry
   , popTransitionTelemetry
   , popReadyBars
     , prepareTimelineRuntime
@@ -84,6 +119,7 @@ data PlayerMsg
   = PlayerShutdown
   | PlayerPause
   | PlayerResume
+  | PlayerRequestStatus
   | PlayerSetMeter
       { pmBeatsPerBar ∷ !Int
       }
@@ -115,8 +151,44 @@ data PlayerMsg
   | PlayerLoadSongTimeline
       { pmSongPath ∷ !FilePath
       }
+  | PlayerLoadClip
+      { pmLoadClipId   ∷ !ClipId
+      , pmLoadClipPath ∷ !FilePath
+      }
   | PlayerStartSongTimeline
   | PlayerStopSongTimeline
+  | PlayerPlayClipNow
+      { pmPlayClipId   ∷ !ClipId
+      , pmPlayClipBus  ∷ !AudioBus
+      , pmPlayClipGain ∷ !Float
+      , pmPlayClipPan  ∷ !Float
+      , pmPlayClipLoop ∷ !Bool
+      }
+  | PlayerStopClipNow
+      { pmStopClipId ∷ !ClipId
+      }
+  | PlayerSetBusGainNow
+      { pmSetGainNowBus   ∷ !AudioBus
+      , pmSetGainNowValue ∷ !Float
+      }
+  | PlayerStopBusNow
+      { pmStopNowBus ∷ !AudioBus
+      }
+  | PlayerNoteOnNow
+      { pmNowBus            ∷ !AudioBus
+      , pmNowInstrumentId   ∷ !InstrumentId
+      , pmNowAmp            ∷ !Float
+      , pmNowPan            ∷ !Float
+      , pmNowKey            ∷ !NoteKey
+      , pmNowInstanceId     ∷ !NoteInstanceId
+      , pmNowVelocity       ∷ !Float
+      , pmNowAdsrOverride   ∷ !(Maybe ADSR)
+      }
+  | PlayerNoteOffNow
+      { pmNowOffInstrumentId ∷ !InstrumentId
+      , pmNowOffInstanceId   ∷ !NoteInstanceId
+      }
+  | PlayerPanic
   | PlayerScheduleClipNextBar
       { pmClipId ∷ !ClipId
       , pmClipBus ∷ !AudioBus
@@ -129,7 +201,8 @@ data PlayerMsg
       , pmGainValue ∷ !Float
       }
   | PlayerScheduleNoteOnNextBar
-      { pmNoteOnInstrumentId ∷ !InstrumentId
+      { pmNoteOnBus ∷ !AudioBus
+      , pmNoteOnInstrumentId ∷ !InstrumentId
       , pmNoteOnAmp ∷ !Float
       , pmNoteOnPan ∷ !Float
       , pmNoteOnKey ∷ !NoteKey
@@ -143,16 +216,37 @@ data PlayerMsg
       }
   deriving (Eq, Show)
 
+data PlayerRuntimeStatus = PlayerRuntimeStatus
+  { prsTransportFrame    ∷ !Word64
+  , prsSongLoaded        ∷ !Bool
+  , prsTimelinePlaying   ∷ !Bool
+  , prsCurrentSection    ∷ !(Maybe String)
+  , prsTimelineStartFrame ∷ !(Maybe Word64)
+  , prsTimelineEndFrame  ∷ !(Maybe Word64)
+  , prsBufferedFutureBars ∷ !Int
+  , prsTempoBpm          ∷ !Float
+  , prsBeatsPerBar       ∷ !Int
+  , prsMoodTarget        ∷ !(Maybe String)
+  , prsEnergyTarget      ∷ !Float
+  , prsGenre             ∷ !(Maybe String)
+  }
+  deriving (Eq, Show)
+
 data PlayerEvent
   = PlayerEventAudio !AudioEvent
+  | PlayerEventStatus !PlayerRuntimeStatus
   | PlayerEventTimelineLoaded !FilePath
   | PlayerEventTimelineLoadFailed !FilePath !String
+  | PlayerEventClipLoaded !ClipId !FilePath
+  | PlayerEventClipLoadFailed !ClipId !FilePath !String
   | PlayerEventTimelineStarted
       { peTimelineStartFrame ∷ !Word64
       , peTimelineBarCount   ∷ !Int
       }
   | PlayerEventTimelineStopped
   | PlayerEventTimelineFinished
+  | PlayerEventTimelineRetargeted !TimelineRetargetTelemetry
+  | PlayerEventTimelineLookahead !TimelineLookaheadTelemetry
   | PlayerEventTimelineTransition !TimelineTransitionTelemetry
   | PlayerEventEnergyAutomationStarted
       { peEnergyAutoStartFrame ∷ !Word64
@@ -236,6 +330,122 @@ sendPlayer ps msg = Q.writeQueue (psMsgQueue ps) msg
 tryReadPlayerEvent ∷ PlayerSystem → IO (Maybe PlayerEvent)
 tryReadPlayerEvent ps = Q.tryReadQueue (psEventQueue ps)
 
+pausePlayer ∷ PlayerSystem → IO ()
+pausePlayer ps = sendPlayer ps PlayerPause
+
+resumePlayer ∷ PlayerSystem → IO ()
+resumePlayer ps = sendPlayer ps PlayerResume
+
+setPlayerMeter ∷ PlayerSystem → Int → IO ()
+setPlayerMeter ps beats = sendPlayer ps (PlayerSetMeter beats)
+
+setPlayerTempoBpm ∷ PlayerSystem → Float → IO ()
+setPlayerTempoBpm ps bpm = sendPlayer ps (PlayerSetTempoBpm bpm)
+
+setPlayerGenreTarget ∷ PlayerSystem → String → IO ()
+setPlayerGenreTarget ps genre = sendPlayer ps (PlayerSetGenreTarget genre)
+
+clearPlayerGenreTarget ∷ PlayerSystem → IO ()
+clearPlayerGenreTarget ps = sendPlayer ps PlayerClearGenreTarget
+
+setPlayerMoodTarget ∷ PlayerSystem → String → IO ()
+setPlayerMoodTarget ps mood = sendPlayer ps (PlayerSetMoodTarget mood)
+
+clearPlayerMoodTarget ∷ PlayerSystem → IO ()
+clearPlayerMoodTarget ps = sendPlayer ps PlayerClearMoodTarget
+
+setPlayerEnergyTarget ∷ PlayerSystem → Float → IO ()
+setPlayerEnergyTarget ps energy = sendPlayer ps (PlayerSetEnergyTarget energy)
+
+automatePlayerEnergyNextBar ∷ PlayerSystem → Float → Int → AutomationCurve → IO ()
+automatePlayerEnergyNextBar ps target bars curve =
+  sendPlayer ps (PlayerAutomateEnergyNextBar target bars curve)
+
+automatePlayerMoodNextBar ∷ PlayerSystem → String → Int → IO ()
+automatePlayerMoodNextBar ps mood bars =
+  sendPlayer ps (PlayerAutomateMoodNextBar mood bars)
+
+cancelPlayerEnergyAutomation ∷ PlayerSystem → IO ()
+cancelPlayerEnergyAutomation ps = sendPlayer ps PlayerCancelEnergyAutomation
+
+cancelPlayerMoodAutomation ∷ PlayerSystem → IO ()
+cancelPlayerMoodAutomation ps = sendPlayer ps PlayerCancelMoodAutomation
+
+loadPlayerSongTimeline ∷ PlayerSystem → FilePath → IO ()
+loadPlayerSongTimeline ps path = sendPlayer ps (PlayerLoadSongTimeline path)
+
+loadPlayerClip ∷ PlayerSystem → ClipId → FilePath → IO ()
+loadPlayerClip ps clipId path = sendPlayer ps (PlayerLoadClip clipId path)
+
+startPlayerSongTimeline ∷ PlayerSystem → IO ()
+startPlayerSongTimeline ps = sendPlayer ps PlayerStartSongTimeline
+
+stopPlayerSongTimeline ∷ PlayerSystem → IO ()
+stopPlayerSongTimeline ps = sendPlayer ps PlayerStopSongTimeline
+
+playPlayerClipNow ∷ PlayerSystem → ClipId → AudioBus → Float → Float → Bool → IO ()
+playPlayerClipNow ps clipId bus gain pan loop =
+  sendPlayer ps (PlayerPlayClipNow clipId bus gain pan loop)
+
+stopPlayerClipNow ∷ PlayerSystem → ClipId → IO ()
+stopPlayerClipNow ps clipId = sendPlayer ps (PlayerStopClipNow clipId)
+
+setPlayerBusGainNow ∷ PlayerSystem → AudioBus → Float → IO ()
+setPlayerBusGainNow ps bus gain = sendPlayer ps (PlayerSetBusGainNow bus gain)
+
+stopPlayerBusNow ∷ PlayerSystem → AudioBus → IO ()
+stopPlayerBusNow ps bus = sendPlayer ps (PlayerStopBusNow bus)
+
+playerNoteOnNow
+  ∷ PlayerSystem
+  → AudioBus
+  → InstrumentId
+  → Float
+  → Float
+  → NoteKey
+  → NoteInstanceId
+  → Float
+  → Maybe ADSR
+  → IO ()
+playerNoteOnNow ps bus iid amp pan key noteInst velocity adsrOverride =
+  sendPlayer ps (PlayerNoteOnNow bus iid amp pan key noteInst velocity adsrOverride)
+
+playerNoteOffNow ∷ PlayerSystem → InstrumentId → NoteInstanceId → IO ()
+playerNoteOffNow ps iid noteInst =
+  sendPlayer ps (PlayerNoteOffNow iid noteInst)
+
+panicPlayer ∷ PlayerSystem → IO ()
+panicPlayer ps = sendPlayer ps PlayerPanic
+
+schedulePlayerClipNextBar ∷ PlayerSystem → ClipId → AudioBus → Float → Float → Bool → IO ()
+schedulePlayerClipNextBar ps clipId bus gain pan loop =
+  sendPlayer ps (PlayerScheduleClipNextBar clipId bus gain pan loop)
+
+schedulePlayerBusGainNextBar ∷ PlayerSystem → AudioBus → Float → IO ()
+schedulePlayerBusGainNextBar ps bus gain =
+  sendPlayer ps (PlayerScheduleBusGainNextBar bus gain)
+
+schedulePlayerNoteOnNextBar
+  ∷ PlayerSystem
+  → AudioBus
+  → InstrumentId
+  → Float
+  → Float
+  → NoteKey
+  → NoteInstanceId
+  → Float
+  → Maybe ADSR
+  → IO ()
+schedulePlayerNoteOnNextBar ps bus iid amp pan key noteInst velocity adsrOverride =
+  sendPlayer ps (PlayerScheduleNoteOnNextBar bus iid amp pan key noteInst velocity adsrOverride)
+
+schedulePlayerNoteOffNextBar ∷ PlayerSystem → InstrumentId → NoteInstanceId → IO ()
+schedulePlayerNoteOffNextBar ps iid noteInst =
+  sendPlayer ps (PlayerScheduleNoteOffNextBar iid noteInst)
+
+requestPlayerStatus ∷ PlayerSystem → IO ()
+requestPlayerStatus ps = sendPlayer ps PlayerRequestStatus
+
 runPlayerLoop
   ∷ AudioSystem
   → Queue PlayerMsg
@@ -250,14 +460,18 @@ runPlayerLoop audioSys msgQ evQ controlRef playerStateRef = loop
       case control of
         ThreadStopped -> do
           processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef
+          flushPendingTimelineTelemetry evQ playerStateRef
           drainAudioEvents audioSys evQ
         ThreadPaused -> do
           processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef
+          flushPendingTimelineTelemetry evQ playerStateRef
           threadDelay 10000
           loop
         ThreadRunning -> do
           processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef
+          flushPendingTimelineTelemetry evQ playerStateRef
           pumpTimeline audioSys evQ playerStateRef
+          flushPendingTimelineTelemetry evQ playerStateRef
           drainAudioEvents audioSys evQ
           threadDelay 1000
           loop
@@ -278,6 +492,10 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerShutdown -> writeIORef controlRef ThreadStopped
         PlayerPause -> writeIORef controlRef ThreadPaused
         PlayerResume -> writeIORef controlRef ThreadRunning
+        PlayerRequestStatus -> do
+          ps <- readIORef playerStateRef
+          now <- readTransportFrame audioSys
+          Q.writeQueue evQ (PlayerEventStatus (snapshotPlayerRuntimeStatus now ps))
         PlayerSetMeter beats ->
           modifyIORef' playerStateRef (\s -> s { pstBeatsPerBar = max 1 beats })
         PlayerSetTempoBpm bpm -> do
@@ -378,6 +596,13 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
                     playerStateRef
                     (\s -> s { pstSongSpec = Just spec, pstGenreTarget = Nothing, pstTimeline = Nothing })
                   Q.writeQueue evQ (PlayerEventTimelineLoaded path)
+        PlayerLoadClip clipId path -> do
+          loaded <- try (loadClipFromFile audioSys clipId path) ∷ IO (Either SomeException ())
+          case loaded of
+            Left ex ->
+              Q.writeQueue evQ (PlayerEventClipLoadFailed clipId path (displayException ex))
+            Right () ->
+              Q.writeQueue evQ (PlayerEventClipLoaded clipId path)
         PlayerStartSongTimeline -> do
           ps <- readIORef playerStateRef
           case pstSongSpec ps of
@@ -413,6 +638,44 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           modifyIORef' playerStateRef (\s -> s { pstTimeline = Nothing })
           sendAudio audioSys AudioStopAll
           Q.writeQueue evQ PlayerEventTimelineStopped
+        PlayerPlayClipNow clipId bus gain pan loop ->
+          sendAudio
+            audioSys
+            (AudioPlayClip
+              { clipId = clipId
+              , clipBus = bus
+              , clipGain = gain
+              , clipPan = pan
+              , clipLoop = loop
+              })
+        PlayerStopClipNow clipId ->
+          sendAudio audioSys (AudioStopClip clipId)
+        PlayerSetBusGainNow bus gain ->
+          sendAudio audioSys (AudioSetBusGain bus gain)
+        PlayerStopBusNow bus ->
+          sendAudio audioSys (AudioStopBus bus)
+        PlayerNoteOnNow bus iid amp pan key noteInst velocity adsrOverride ->
+          sendAudio
+            audioSys
+            (AudioNoteOn
+              { instrumentId = iid
+              , noteBus = bus
+              , amp = amp
+              , pan = pan
+              , noteKey = key
+              , noteInstanceId = noteInst
+              , velocity = velocity
+              , adsrOverride = adsrOverride
+              })
+        PlayerNoteOffNow iid noteInst ->
+          sendAudio
+            audioSys
+            (AudioNoteOff
+              { instrumentId = iid
+              , noteInstanceId = noteInst
+              })
+        PlayerPanic ->
+          sendAudio audioSys AudioStopAll
         PlayerScheduleClipNextBar cid bus gain pan loop -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
@@ -438,7 +701,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
               action = ScheduledSetBusGain bus gain
           scheduleAudioActionAtFrame audioSys frame action
           Q.writeQueue evQ (PlayerEventScheduled frame action)
-        PlayerScheduleNoteOnNextBar iid amp pan key noteInst vel adsrOverride -> do
+        PlayerScheduleNoteOnNextBar bus iid amp pan key noteInst vel adsrOverride -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
           let (frame, ps') = resolveNextBarBoundary audioSys now ps
@@ -447,6 +710,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
               action =
                 ScheduledNoteOn
                   { saInstrumentId = iid
+                  , saNoteBus = bus
                   , saAmp = amp
                   , saPan = pan
                   , saNoteKey = key
@@ -549,6 +813,44 @@ validateGenreTarget ps target =
        then Left "live genre switching requires a song using song.genre"
        else validateSongGenre resolved
 
+snapshotPlayerRuntimeStatus ∷ Word64 → PlayerState → PlayerRuntimeStatus
+snapshotPlayerRuntimeStatus now ps =
+  let timeline = pstTimeline ps
+      (playing, currentSection, startFrame, endFrame, bufferedBars) =
+        case timeline of
+          Nothing -> (False, Nothing, Nothing, Nothing, 0)
+          Just rt ->
+            ( True
+            , nonEmptyTextMaybe (trCurrentSectionName rt)
+            , Just (trStartFrame rt)
+            , timelineRuntimeEndFrame rt
+            , futureBufferedBars rt
+            )
+  in PlayerRuntimeStatus
+       { prsTransportFrame = now
+       , prsSongLoaded = maybe False (const True) (pstSongSpec ps)
+       , prsTimelinePlaying = playing
+       , prsCurrentSection = currentSection
+       , prsTimelineStartFrame = startFrame
+       , prsTimelineEndFrame = endFrame
+       , prsBufferedFutureBars = bufferedBars
+       , prsTempoBpm = pstTempoBpm ps
+       , prsBeatsPerBar = pstBeatsPerBar ps
+       , prsMoodTarget = pstMoodTarget ps
+       , prsEnergyTarget = pstEnergyTarget ps
+       , prsGenre = activeGenreTarget ps
+       }
+
+futureBufferedBars ∷ TimelineRuntime → Int
+futureBufferedBars rt = max 0 (Seq.length (Seq.drop seqIx (trBars rt)))
+  where
+    seqIx = max 0 (trNextBarIx rt - trBarOffset rt)
+
+nonEmptyTextMaybe ∷ String → Maybe String
+nonEmptyTextMaybe raw =
+  let txt = trim raw
+  in if null txt then Nothing else Just txt
+
 trim ∷ String → String
 trim = dropWhileEnd isSpace . dropWhile isSpace
 
@@ -574,21 +876,39 @@ pumpTimeline audioSys evQ playerStateRef = do
   case pstTimeline ps of
     Nothing -> pure ()
     Just runtime -> do
-      let (readyBars, runtime') = popReadyBars now runtime
-          (transitionTelemetry, runtime'') = popTransitionTelemetry runtime'
+      let (readyBars, runtime1) = popReadyBars now runtime
+          (retargetTelemetry, runtime2) = popRetargetTelemetry runtime1
+          (lookaheadTelemetry, runtime3) = popLookaheadTelemetry runtime2
+          (transitionTelemetry, runtime4) = popTransitionTelemetry runtime3
+      mapM_ (Q.writeQueue evQ . PlayerEventTimelineRetargeted) retargetTelemetry
+      mapM_ (Q.writeQueue evQ . PlayerEventTimelineLookahead) lookaheadTelemetry
       mapM_ (Q.writeQueue evQ . PlayerEventTimelineTransition) transitionTelemetry
-      ps' <- foldM (scheduleTimelineBar audioSys evQ runtime'') ps readyBars
-      if timelineRuntimeDone runtime''
+      ps' <- foldM (scheduleTimelineBar audioSys evQ runtime4) ps readyBars
+      if timelineRuntimeDone runtime4
         then
-          case timelineRuntimeEndFrame runtime'' of
+          case timelineRuntimeEndFrame runtime4 of
             Just endFrame
               | now < endFrame ->
-                  writeIORef playerStateRef ps' { pstTimeline = Just runtime'' }
+                  writeIORef playerStateRef ps' { pstTimeline = Just runtime4 }
             _ -> do
               writeIORef playerStateRef ps' { pstTimeline = Nothing }
               Q.writeQueue evQ PlayerEventTimelineFinished
         else
-          writeIORef playerStateRef ps' { pstTimeline = Just runtime'' }
+          writeIORef playerStateRef ps' { pstTimeline = Just runtime4 }
+
+flushPendingTimelineTelemetry ∷ Queue PlayerEvent → IORef PlayerState → IO ()
+flushPendingTimelineTelemetry evQ playerStateRef = do
+  ps <- readIORef playerStateRef
+  case pstTimeline ps of
+    Nothing -> pure ()
+    Just runtime -> do
+      let (retargetTelemetry, runtime1) = popRetargetTelemetry runtime
+          (lookaheadTelemetry, runtime2) = popLookaheadTelemetry runtime1
+          (transitionTelemetry, runtime3) = popTransitionTelemetry runtime2
+      writeIORef playerStateRef ps { pstTimeline = Just runtime3 }
+      mapM_ (Q.writeQueue evQ . PlayerEventTimelineRetargeted) retargetTelemetry
+      mapM_ (Q.writeQueue evQ . PlayerEventTimelineLookahead) lookaheadTelemetry
+      mapM_ (Q.writeQueue evQ . PlayerEventTimelineTransition) transitionTelemetry
 
 advanceAutomationLanes ∷ Word64 → Queue PlayerEvent → PlayerState → IO PlayerState
 advanceAutomationLanes now evQ ps0 = do
@@ -776,6 +1096,7 @@ scheduleNotePair audioSys evQ runtime barStart (nextInst, ix) note = do
       onAction =
         ScheduledNoteOn
           { saInstrumentId = schedIid
+          , saNoteBus = AudioBusMusic
           , saAmp = tnAmp note
           , saPan = tnPan note
           , saNoteKey = schedKey

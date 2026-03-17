@@ -44,11 +44,16 @@ executable idou
                     Audio.Thread.Types
                     Audio.Thread.Render
                     Audio.Thread.Voice
-                    Audio.Thread.InstrumentTable
-                    Player.Automation
-                    Player.Thread
-                    Player.Timeline
-                    Audio.Envelope
+                     Audio.Thread.InstrumentTable
+                     Player.Automation
+                     Player.Runtime
+                     Player.Thread
+                     Player.Timeline
+                     Player.Timeline.Arrangement
+                     Player.Timeline.Parse
+                     Player.Timeline.Runtime
+                     Player.Timeline.Types
+                     Audio.Envelope
                     Audio.Oscillator
                     Audio.Filter
                     Audio.Filter.Types
@@ -90,10 +95,14 @@ test-suite idou-tests
                     Audio.Thread.Types
                     Audio.Thread.Render
                     Audio.Thread.Voice
-                    Audio.Thread.InstrumentTable
-                    Player.Automation
-                    Player.Timeline
-                    Audio.Envelope
+                     Audio.Thread.InstrumentTable
+                     Player.Automation
+                     Player.Timeline
+                     Player.Timeline.Arrangement
+                     Player.Timeline.Parse
+                     Player.Timeline.Runtime
+                     Player.Timeline.Types
+                     Audio.Envelope
                     Audio.Oscillator
                     Audio.Filter
                     Audio.Filter.Types

@@ -5,6 +5,7 @@ module Audio.Thread.Voice
   ( noteIdToHz
   , addBeepVoice
   , addInstrumentNote
+  , stopVoicesByBus
   , releaseInstrumentNote
   , releaseInstrumentAllVoices
   , setInstrumentNoteAftertouch
@@ -13,6 +14,7 @@ module Audio.Thread.Voice
   , panGains
   ) where
 
+import Control.Monad (when)
 import Data.Bits (shiftL, shiftR, xor)
 import Data.Word (Word32, Word64)
 import qualified Data.Vector.Mutable as MV
@@ -348,12 +350,13 @@ addBeepVoice h st amp pan freqHz durSec adsrSpec = do
                  , vEnv = env0
                 , vNoteKey = Nothing
                 , vNoteInstanceId = Nothing
-                , vVelocity = 1
-                , vNoteAftertouch = 0
-                , vInstrId = Nothing
-                , vStartedAt = stNow st
-                , vVibPhase = 0
-                , vLfo1Phase = 0
+                 , vVelocity = 1
+                 , vNoteAftertouch = 0
+                 , vInstrId = Nothing
+                 , vBus = AudioBusSfx
+                 , vStartedAt = stNow st
+                 , vVibPhase = 0
+                 , vLfo1Phase = 0
                 }
 
       MV.write vec n v
@@ -449,6 +452,7 @@ addInstrumentNote
   ∷ AudioHandle
   → AudioState
   → InstrumentId
+  → AudioBus
   → Float
   → Float
   → NoteKey
@@ -456,22 +460,22 @@ addInstrumentNote
   → Float
   → Maybe ADSR
   → IO AudioState
-addInstrumentNote h st iid amp pan key instId vel adsrOverride = do
+addInstrumentNote h st iid bus amp pan key instId vel adsrOverride = do
   instM <- lookupInstrument iid st
   case instM of
     Nothing -> pure st
     Just inst ->
       case iPlayMode inst of
-        MonoLegato -> addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride
-        Poly       -> addInstrumentNotePoly       h st iid inst amp pan key instId vel adsrOverride
+        MonoLegato -> addInstrumentNoteMonoLegato h st iid bus inst amp pan key instId vel adsrOverride
+        Poly       -> addInstrumentNotePoly       h st iid bus inst amp pan key instId vel adsrOverride
 
 -- Mono-legato path ------------------------------------------------------------
 
 addInstrumentNoteMonoLegato
-  ∷ AudioHandle → AudioState → InstrumentId → Instrument
+  ∷ AudioHandle → AudioState → InstrumentId → AudioBus → Instrument
   → Float → Float → NoteKey → NoteInstanceId → Float → Maybe ADSR
   → IO AudioState
-addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = do
+addInstrumentNoteMonoLegato h st iid bus inst amp pan key instId vel adsrOverride = do
   let srF = fromIntegral (sampleRate h) ∷ Float
       baseHz = noteKeyToHz key
       holdFrames = maxBound `div` 4
@@ -572,10 +576,11 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
         , vFiltTick = 0
          , vNoteKey = Just key
          , vNoteInstanceId = Just instId
-         , vVelocity = vel'
-         , vNoteAftertouch = 0
-         , vStartedAt = now'
-         }
+          , vVelocity = vel'
+          , vNoteAftertouch = 0
+          , vBus = bus
+          , vStartedAt = now'
+          }
 
       pure st { stNow = now' }
 
@@ -641,9 +646,10 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
                  , vVelocity = vel'
                  , vNoteAftertouch = 0
                  , vInstrId = Just iid
+                 , vBus = bus
                  , vStartedAt = now'
                  , vVibPhase = 0
-                , vLfo1Phase = 0
+                 , vLfo1Phase = 0
                 }
 
           MV.write vec n vNew
@@ -652,10 +658,10 @@ addInstrumentNoteMonoLegato h st iid inst amp pan key instId vel adsrOverride = 
 -- Poly path -------------------------------------------------------------------
 
 addInstrumentNotePoly
-  ∷ AudioHandle → AudioState → InstrumentId → Instrument
+  ∷ AudioHandle → AudioState → InstrumentId → AudioBus → Instrument
   → Float → Float → NoteKey → NoteInstanceId → Float → Maybe ADSR
   → IO AudioState
-addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
+addInstrumentNotePoly h st iid bus inst amp pan key instId vel adsrOverride = do
   let srF = fromIntegral (sampleRate h) ∷ Float
       baseHz = noteKeyToHz key
       holdFrames = maxBound `div` 4
@@ -736,10 +742,11 @@ addInstrumentNotePoly h st iid inst amp pan key instId vel adsrOverride = do
            , vVelocity = vel'
            , vNoteAftertouch = 0
            , vInstrId = Just iid
+           , vBus = bus
            , vStartedAt = now'
            , vVibPhase = 0
-          , vLfo1Phase = 0
-          }
+           , vLfo1Phase = 0
+           }
 
   if activeForInst < polyMax && nActive < cap
     then do
@@ -777,6 +784,22 @@ releaseInstrumentNote iid instId st = do
               else pure ()
             go (i+1)
   go 0
+
+stopVoicesByBus ∷ AudioBus → AudioState → IO AudioState
+stopVoicesByBus bus st = do
+  let vec = stVoices st
+      go i st'
+        | i >= stActiveCount st' = pure st'
+        | otherwise = do
+            v <- MV.read vec i
+            if vBus v == bus
+              then do
+                let lastIx = stActiveCount st' - 1
+                when (i /= lastIx) $
+                  MV.read vec lastIx >>= MV.write vec i
+                go i st' { stActiveCount = lastIx }
+              else go (i + 1) st'
+  go 0 st
 
 releaseInstrumentAllVoices ∷ InstrumentId → AudioState → IO AudioState
 releaseInstrumentAllVoices iid st = do

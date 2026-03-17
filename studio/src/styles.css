@@ -149,8 +149,37 @@ label {
 
 .topbar-song-meta {
   justify-content: flex-end;
+  gap: 0.55rem;
+}
+
+.topbar-song-fields {
+  display: flex;
+  justify-content: flex-end;
   flex-wrap: wrap;
   gap: 0.45rem 0.55rem;
+  min-width: 0;
+}
+
+.topbar-sidebar-toggle {
+  min-width: 2.2rem;
+  height: 2.2rem;
+  padding: 0 0.45rem;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.22rem;
+  flex: 0 0 auto;
+}
+
+.topbar-sidebar-toggle-icon {
+  font-size: 0.95rem;
+  line-height: 1;
+}
+
+.topbar-sidebar-toggle-chevron {
+  font-size: 1rem;
+  line-height: 1;
 }
 
 .file-pill {
@@ -347,11 +376,12 @@ label {
 .arrangement-workspace {
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.6rem;
   min-height: 0;
   overflow: auto;
   padding-right: 0.1rem;
+  position: relative;
 }
 
 .arrangement-main-column {
@@ -363,13 +393,61 @@ label {
   overflow: visible;
 }
 
-.arrangement-sidebar-column {
+.arrangement-side-panel {
   display: flex;
-  flex-direction: column;
-  gap: 0.55rem;
+  position: absolute;
+  top: 0.8rem;
+  bottom: 0.8rem;
+  z-index: 30;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 180ms ease,
+    opacity 180ms ease;
+  --side-panel-width: min(360px, calc(100vw - 1.8rem));
+}
+
+.arrangement-side-panel.left {
+  left: 0;
+  width: var(--side-panel-width);
+  transform: translateX(calc(-100% - 0.65rem));
+}
+
+.arrangement-side-panel.right {
+  right: 0;
+  width: var(--side-panel-width);
+  transform: translateX(calc(100% + 0.65rem));
+}
+
+.arrangement-side-panel.open {
+  transform: translateX(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.arrangement-side-content {
+  width: var(--side-panel-width);
   min-width: 0;
   min-height: 0;
-  overflow: visible;
+  overflow: auto;
+}
+
+.arrangement-side-panel.left .arrangement-side-content {
+  margin-right: 0;
+}
+
+.arrangement-side-panel.right .arrangement-side-content {
+  margin-left: 0;
+}
+
+.arrangement-sidebar-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  border: 0;
+  border-radius: 0;
+  background: rgba(0, 0, 0, 0.18);
+  cursor: default;
 }
 
 .arrangement-secondary-layout {
@@ -2286,9 +2364,6 @@ label,
 }
 
 @media (max-width: 1400px) {
-  .arrangement-workspace {
-    grid-template-columns: minmax(0, 1fr) 320px;
-  }
 
   .arrangement-bottom-grid {
     grid-template-columns: minmax(0, 1fr);
@@ -2332,6 +2407,10 @@ label,
     justify-content: flex-start;
   }
 
+  .topbar-song-fields {
+    justify-content: flex-start;
+  }
+
   .app-shell {
     height: auto;
     min-height: 100vh;
@@ -2347,9 +2426,34 @@ label,
     overflow: visible;
   }
 
-  .arrangement-main-column,
-  .arrangement-sidebar-column {
+  .arrangement-main-column {
     overflow: visible;
+  }
+
+  .arrangement-side-panel {
+    position: fixed;
+    top: 4.2rem;
+    bottom: 3.25rem;
+  }
+
+  .arrangement-side-panel.left {
+    left: 0;
+  }
+
+  .arrangement-side-panel.right {
+    right: 0;
+  }
+
+  .arrangement-side-content {
+    overflow: auto;
+  }
+
+  .arrangement-sidebar-backdrop {
+    position: fixed;
+    top: 4.2rem;
+    right: 0;
+    bottom: 2.8rem;
+    left: 0;
   }
 
   .workspace,

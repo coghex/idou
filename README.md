@@ -1,6 +1,6 @@
 # Idou
 
-Haskell FFI to miniaudio for playback.
+Idou is an engine-first adaptive music runtime for a Haskell game, with a separate Studio app for authoring the song YAML and patch data that the runtime consumes.
 
 Runtime audio settings live in `config/audio.yaml` under the `audio:` key.
 Timeline song settings can live in `config/song.yaml` and be loaded by the `Player.Thread` timeline API (`PlayerLoadSongTimeline` + `PlayerStartSongTimeline`).
@@ -16,9 +16,88 @@ cabal run idou -- song1.yaml
 cabal run idou -- config/song.yaml
 ```
 
+## Game runtime contract
+
+The intended game-facing control surface now lives in `src/Player/Runtime.hs`.
+
+Use that module as the façade for gameplay integration. It wraps the lower-level `Player.Thread` and `Audio.Thread` messages into a smaller runtime API aimed at:
+
+- starting/stopping the runtime thread and reading runtime events
+- loading and starting adaptive song timelines
+- stopping, pausing, and resuming playback
+- loading clip assets for later playback
+- changing mood and energy targets while a song is running
+- querying runtime status snapshots (transport frame, current section, loaded/playing flags)
+- scheduling music/SFX clips on the shared transport
+- triggering immediate clip and note playback through the player thread, with explicit bus ownership when needed
+- issuing a full panic/stop-all command
+- optionally reading the shared transport frame directly from the audio system when needed
+
+### Runtime roles
+
+- `Audio.Thread` owns the mixer, transport frame, clip playback, buses, and direct note/voice control.
+- `Player.Thread` owns adaptive song state, lookahead generation, timeline scheduling, transport-aligned adaptive control, clip-load proxying, immediate one-shot dispatch, and status snapshot replies.
+- `Player.Runtime` is the preferred game-facing façade over those lower-level modules; `app/Main.hs` now uses it instead of raw `PlayerMsg` constructors for runtime control.
+- `app/Main.hs` and Studio are runtime clients; they should not be treated as the source of truth for playback behavior.
+
+### Supported mixed playback
+
+The runtime is expected to mix these source types together in one engine:
+
+- adaptive song timelines
+- WAV clips
+- MIDI file playback
+- direct note playback / one-shot musical events
+
+The current bus model is:
+
+- `AudioBusMusic`
+- `AudioBusSfx`
+
+And the current source routing contract is:
+
+- adaptive timeline notes route to `AudioBusMusic`
+- MIDI playback routes note events to `AudioBusMusic`
+- clips can be placed on either bus
+- direct runtime note playback can be targeted explicitly by bus; the convenience `Player.Runtime.noteOnNow` / `scheduleNoteOnNextBar` helpers default to `AudioBusSfx`
+- bus gain and bus stop now apply consistently to both clip sources and synthesized note voices
+
+This is intentionally still a minimal mixer model. There are no sub-buses, ducking rules, source priorities, or separate voice budgets per bus yet; those remain future design work if game integration proves they are needed.
+
+### Timing semantics
+
+The runtime contract currently uses three timing buckets:
+
+- `RuntimeImmediate`: applied as soon as the player or audio thread receives the message
+- `RuntimeNextBar`: aligned to the next transport bar boundary
+- `RuntimeFutureLookahead`: affects only future adaptive generation that has not already been scheduled
+
+In practical terms:
+
+- `loadSong`, `stopSong`, `pausePlayback`, `resumePlayback`, `setMoodTarget`, `clearMoodTarget`, `setEnergyTarget`, direct clip playback, direct note playback, and `panic` are immediate controls.
+- `startSongNextBar`, automation lanes, and `schedule*NextBar` helpers are bar-synchronized controls.
+- live genre switching remains a lower-level `Player.Thread` capability intended mainly for CLI/Studio/debug flows; it is not part of the primary game-facing runtime façade.
+
+### Runtime status and events
+
+- `Player.Runtime.requestStatus` asks the player thread for a `PlayerEventStatus` snapshot.
+- `PlayerEventStatus` reports the current transport frame, whether a song is loaded, whether a timeline is actively playing, the current section when applicable, tempo/meter, mood/energy targets, active genre, and the count of buffered future bars.
+- Clip asset load success/failure is reported via `PlayerEventClipLoaded` / `PlayerEventClipLoadFailed`.
+- Existing timeline, automation, scheduled-action, clip-finished, and note-finished events remain available through the same event stream.
+
+### Transport guarantees
+
+- The audio thread owns the transport frame counter (`Audio.Thread.readTransportFrame`).
+- Transport-aligned scheduling is done in absolute frame space.
+- `Player.Thread` starts timelines on the next bar boundary using `nextBarFrame`.
+- When a timeline is already active, next-bar scheduling consults the timeline runtime first so new work stays aligned with the adaptive song's current bar structure.
+- Mood, energy, and live genre changes update adaptive targets immediately, but the runtime treats already-buffered lookahead bars as stable. The new targets apply from the next bar that has not been generated yet.
+- That “future-generated-bars-only” policy is now surfaced through `TimelineRetargetTelemetry` / `PlayerEventTimelineRetargeted`, including how many future bars were already buffered and the frame where newly generated material will begin.
+- Lookahead extension is also observable through `TimelineLookaheadTelemetry` / `PlayerEventTimelineLookahead`, which reports why bars were generated (`lookahead-horizon`, next-bar query, or boundary-span query), how many bars were added, the generated frame range, and the seed range used for deterministic replay.
+
 ## Idou Studio
 
-The repository now also includes a companion desktop editor in `studio/` for authoring the high-level song-intent YAML format visually.
+The repository also includes a companion desktop editor in `studio/` for authoring the high-level song-intent YAML format visually.
 
 Current studio workflow:
 - song-level editing for `genre`, `mood`, `tempo_bpm`, `beats_per_bar`, and `beat_unit`
@@ -140,7 +219,9 @@ The runtime also applies deterministic per-bar variation (density gating, transp
 Variation is section-aware: choruses are biased to remain stable while bridges are biased to mutate more.
 Live control is available via player messages: `PlayerSetMoodTarget`, `PlayerClearMoodTarget`, and `PlayerSetEnergyTarget`; these steer both section selection and variation intensity while the timeline is running.
 Runtime automation lanes are available via `PlayerAutomateEnergyNextBar` (with `AutomationStep|AutomationLinear|AutomationEaseInOut`), `PlayerAutomateMoodNextBar`, and lane cancellation messages; energy ramps are evaluated each player tick and applied back into timeline targets.
+Deterministic replay is defined by authored song data + start frame/seed + the ordered stream of runtime control events. Given the same inputs, the arranger, conductor, and variation layer should emit the same generated bars and telemetry.
 Transition observability is exposed via `PlayerEventTimelineTransition`, which reports section boundary transitions with from/to sections, reason, candidate weights (base + final), boundary timing, active mood/energy targets, and weighted-pick ticket info.
+Retarget and lookahead observability are exposed via `PlayerEventTimelineRetargeted` and `PlayerEventTimelineLookahead`, so the game can explain why a musical reaction has or has not taken effect yet without guessing about the lookahead buffer.
 
 If a section has no explicit drum pattern, timeline generation now injects a fallback drum groove on instrument/channel 10 (`InstrumentId 9`) so tracks keep percussion by default.
 For drum instruments (channel/instrument 10, `InstrumentId 9`), fills are applied automatically on phrase-boundary bars when a section fill is defined.
