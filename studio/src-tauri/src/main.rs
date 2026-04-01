@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{async_runtime, State};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,6 +100,7 @@ struct PlaySongRequest {
 struct TimelineDumpRequest {
     contents: String,
     suggested_name: Option<String>,
+    preview_seed: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +137,7 @@ struct ValidatePatchResponse {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct TimelinePreview {
+    seed: Option<u64>,
     sections: Vec<TimelinePreviewSection>,
 }
 
@@ -179,11 +181,48 @@ struct SongMetadataOptions {
 }
 
 fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: impl Into<String>) {
-    let mut guard = logs.lock().expect("log mutex poisoned");
+    let mut guard = match logs.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     guard.push_back(line.into());
     while guard.len() > 400 {
         guard.pop_front();
     }
+}
+
+/// Reject strings that contain control characters (newlines, tabs, etc.)
+/// to prevent injection into the stdin command protocol.
+fn sanitize_stdin_field(field: &str, name: &str) -> Result<String, String> {
+    let trimmed = field.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{name} must not be empty."));
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return Err(format!("{name} contains invalid control characters."));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn validate_midi(value: i32) -> Result<i32, String> {
+    if !(0..=127).contains(&value) {
+        return Err(format!("MIDI note {value} is out of range (0–127)."));
+    }
+    Ok(value)
+}
+
+fn validate_velocity(value: f64) -> Result<f64, String> {
+    if !value.is_finite() || value < 0.0 || value > 1.0 {
+        return Err(format!("Velocity {value} is out of range (0.0–1.0)."));
+    }
+    Ok(value)
+}
+
+fn validate_duration_ms(value: i32) -> Result<i32, String> {
+    if value <= 0 || value > 30000 {
+        return Err(format!("Duration {value}ms is out of range (1–30000)."));
+    }
+    Ok(value)
 }
 
 fn repo_root() -> Result<PathBuf, String> {
@@ -381,6 +420,7 @@ fn spawn_log_reader<T: std::io::Read + Send + 'static>(
                 }
             }
         }
+        push_log(&logs, format!("[{label}] stream closed."));
     });
 }
 
@@ -399,6 +439,7 @@ fn spawn_plain_log_reader<T: std::io::Read + Send + 'static>(
                 }
             }
         }
+        push_log(&logs, format!("[{label}] stream closed."));
     });
 }
 
@@ -435,9 +476,22 @@ fn stop_playback_internal(state: &SharedState) -> Result<(), String> {
     }
 
     if !exited {
-        let _ = managed.child.kill();
-        let _ = managed.child.wait();
-        push_log(&state.logs, format!("Force-stopped preview process {pid}."));
+        if let Err(error) = managed.child.kill() {
+            push_log(
+                &state.logs,
+                format!("Warning: failed to kill preview process {pid}: {error}"),
+            );
+        }
+        match managed.child.wait() {
+            Ok(status) => push_log(
+                &state.logs,
+                format!("Force-stopped preview process {pid} (exit {status})."),
+            ),
+            Err(error) => push_log(
+                &state.logs,
+                format!("Warning: failed to wait on preview process {pid}: {error}"),
+            ),
+        }
     }
 
     remove_staged_file(&managed.staged_path, &state.logs);
@@ -485,13 +539,10 @@ fn playback_snapshot_internal(state: &SharedState) -> Result<PlaybackSnapshot, S
         remove_staged_file(&path, &state.logs);
     }
 
-    let log_lines = state
-        .logs
-        .lock()
-        .map_err(|_| "Log state lock poisoned.".to_string())?
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let log_lines = match state.logs.lock() {
+        Ok(guard) => guard.iter().cloned().collect::<Vec<_>>(),
+        Err(poisoned) => poisoned.into_inner().iter().cloned().collect::<Vec<_>>(),
+    };
 
     Ok(PlaybackSnapshot {
         running,
@@ -644,12 +695,10 @@ fn preview_song_note(request: PreviewNoteRequest, state: State<'_, SharedState>)
             Err("Note preview process is no longer running.".to_string())
         }
         Ok(None) => {
-            let command = format!(
-                "note {} {} {}\n",
-                request.genre.trim(),
-                request.instrument_name.trim(),
-                request.midi
-            );
+            let genre = sanitize_stdin_field(&request.genre, "Genre")?;
+            let instrument = sanitize_stdin_field(&request.instrument_name, "Instrument name")?;
+            let midi = validate_midi(request.midi)?;
+            let command = format!("note {} {} {}\n", genre, instrument, midi);
             if let Some(stdin) = managed.child.stdin.as_mut() {
                 stdin
                     .write_all(command.as_bytes())
@@ -696,12 +745,13 @@ fn preview_patch_note(
             Err("Note preview process is no longer running.".to_string())
         }
         Ok(None) => {
+            let path = sanitize_stdin_field(&request.path, "Patch path")?;
+            let midi = validate_midi(request.midi)?;
+            let velocity = validate_velocity(request.velocity.unwrap_or(0.72))?;
+            let duration_ms = validate_duration_ms(request.duration_ms.unwrap_or(480))?;
             let command = format!(
                 "patch\t{}\t{}\t{}\t{}\n",
-                request.path.trim(),
-                request.midi,
-                request.velocity.unwrap_or(0.72),
-                request.duration_ms.unwrap_or(480)
+                path, midi, velocity, duration_ms
             );
             if let Some(stdin) = managed.child.stdin.as_mut() {
                 stdin
@@ -764,12 +814,30 @@ fn open_patch_file() -> Result<Option<FilePayload>, String> {
 
 #[tauri::command]
 fn open_patch_file_at_path(request: ReadFileRequest) -> Result<FilePayload, String> {
-    let path = PathBuf::from(request.path);
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read {}: {error}", path.display()))?;
+    let path = PathBuf::from(&request.path);
+
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("Failed to resolve {}: {error}", path.display()))?;
+
+    match canonical.extension().and_then(|ext| ext.to_str()) {
+        Some("yaml" | "yml") => {}
+        _ => return Err(format!("Refusing to open non-YAML file: {}", canonical.display())),
+    }
+
+    let repo = repo_root()?;
+    if !canonical.starts_with(&repo) {
+        return Err(format!(
+            "Refusing to open file outside the project: {}",
+            canonical.display()
+        ));
+    }
+
+    let contents = fs::read_to_string(&canonical)
+        .map_err(|error| format!("Failed to read {}: {error}", canonical.display()))?;
 
     Ok(FilePayload {
-        path: path.display().to_string(),
+        path: canonical.display().to_string(),
         contents,
     })
 }
@@ -944,10 +1012,10 @@ fn play_song_preview(
     stop_playback_internal(&state)?;
 
     {
-        let mut logs = state
-            .logs
-            .lock()
-            .map_err(|_| "Log state lock poisoned.".to_string())?;
+        let mut logs = match state.logs.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         logs.clear();
     }
 
@@ -981,6 +1049,7 @@ fn play_song_preview(
         .stderr(Stdio::piped());
 
     let mut child = command.spawn().map_err(|error| {
+        let _ = fs::remove_file(&staged_path);
         format!(
             "Failed to launch `cabal run idou -- {}`: {error}",
             staged_path.display()
@@ -1069,48 +1138,55 @@ fn song_metadata_options() -> SongMetadataOptions {
 }
 
 #[tauri::command]
-fn dump_song_timeline(
-    request: TimelineDumpRequest,
-    state: State<'_, SharedState>,
-) -> Result<TimelinePreview, String> {
-    let repo_root = repo_root()?;
-    let staged_path = preview_path(request.suggested_name.as_deref());
-    fs::write(&staged_path, request.contents).map_err(|error| {
-        format!(
-            "Failed to write staged visualization YAML {}: {error}",
-            staged_path.display()
-        )
-    })?;
+async fn dump_song_timeline(request: TimelineDumpRequest) -> Result<TimelinePreview, String> {
+    async_runtime::spawn_blocking(move || {
+        let repo_root = repo_root()?;
+        let staged_path = preview_path(request.suggested_name.as_deref());
+        fs::write(&staged_path, request.contents).map_err(|error| {
+            format!(
+                "Failed to write staged visualization YAML {}: {error}",
+                staged_path.display()
+            )
+        })?;
 
-    let output = Command::new("cabal")
-        .current_dir(&repo_root)
-        .arg("run")
-        .arg("idou")
-        .arg("--")
-        .arg("--dump-timeline-json")
-        .arg(&staged_path)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("Failed to launch timeline dump: {error}"))?;
+        let mut command = Command::new("cabal");
+        command
+            .current_dir(&repo_root)
+            .arg("run")
+            .arg("-v0")
+            .arg("idou")
+            .arg("--")
+            .arg("--dump-timeline-json");
+        if let Some(preview_seed) = request.preview_seed {
+            command.arg("--timeline-seed").arg(preview_seed.to_string());
+        }
+        let output = command
+            .arg(&staged_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("Failed to launch timeline dump: {error}"))?;
 
-    remove_staged_file(&staged_path, &state.logs);
+        let _ = fs::remove_file(&staged_path);
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let message = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("Timeline dump failed with status {}.", output.status)
-        };
-        return Err(message);
-    }
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let message = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("Timeline dump failed with status {}.", output.status)
+            };
+            return Err(message);
+        }
 
-    serde_json::from_slice::<TimelinePreview>(&output.stdout)
-        .map_err(|error| format!("Failed to parse timeline dump JSON: {error}"))
+        serde_json::from_slice::<TimelinePreview>(&output.stdout)
+            .map_err(|error| format!("Failed to parse timeline dump JSON: {error}"))
+    })
+    .await
+    .map_err(|error| format!("Failed to join timeline dump task: {error}"))?
 }
 
 fn main() {

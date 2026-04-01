@@ -217,6 +217,13 @@ function PatchGraphCanvas({
     selectedConnectionId && patchDocument.patch.connections[selectedConnectionId]
       ? patchDocument.patch.connections[selectedConnectionId]
       : null;
+  const signalNodeIds = useMemo(
+    () =>
+      Object.entries(patchDocument.patch.nodes)
+        .filter(([, node]) => isSourceNode(node))
+        .map(([nodeId]) => nodeId),
+    [patchDocument],
+  );
 
   function setWireDraftState(next: WireDraft) {
     wireDraftRef.current = next;
@@ -717,6 +724,26 @@ function PatchGraphCanvas({
                 />
               </label>
               <label className="patch-graph-control">
+                <span>Target</span>
+                <select
+                  value={node.layerTarget}
+                  onClick={stopCanvasEvent}
+                  onChange={(event) =>
+                    onUpdateNode(nodeId, (current) => ({
+                      ...(current as Extract<PatchNode, { type: 'filter' }>),
+                      layerTarget: event.target.value,
+                    }))
+                  }
+                >
+                  <option value="all">all</option>
+                  {signalNodeIds.map((signalNodeId) => (
+                    <option key={`${nodeId}-target-${signalNodeId}`} value={signalNodeId}>
+                      {signalNodeId}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="patch-graph-control">
                 <span>Env</span>
                 <input
                   className="patch-graph-number"
@@ -773,6 +800,23 @@ function PatchGraphCanvas({
               </div>
             </label>
             <div className="patch-graph-mini-grid">
+              <label className="patch-graph-control">
+                <span>LFO</span>
+                <input
+                  className="patch-graph-number"
+                  type="number"
+                  min={0}
+                  step={0.1}
+                  value={node.lfo1RateHz}
+                  onClick={stopCanvasEvent}
+                  onChange={(event) =>
+                    onUpdateNode(nodeId, (current) => ({
+                      ...(current as Extract<PatchNode, { type: 'output' }>),
+                      lfo1RateHz: Number(event.target.value) || 0,
+                    }))
+                  }
+                />
+              </label>
               <label className="patch-graph-control">
                 <span>Mode</span>
                 <select
@@ -905,12 +949,13 @@ function PatchGraphCanvas({
                   <span>Source</span>
                   <select
                     value={selectedConnection.from}
-                    onChange={(event) =>
-                      onUpdateConnection(selectedConnectionId ?? '', (connection) => ({
+                    onChange={(event) => {
+                      if (!selectedConnectionId) return;
+                      onUpdateConnection(selectedConnectionId, (connection) => ({
                         ...connection,
                         from: event.target.value,
-                      }))
-                    }
+                      }));
+                    }}
                   >
                     {Object.keys(patchDocument.patch.nodes).map((nodeId) => (
                       <option key={`from-${nodeId}`} value={nodeId}>
@@ -923,12 +968,13 @@ function PatchGraphCanvas({
                   <span>Connection type</span>
                   <select
                     value={selectedConnection.kind}
-                    onChange={(event) =>
-                      onUpdateConnection(selectedConnectionId ?? '', (connection) => ({
+                    onChange={(event) => {
+                      if (!selectedConnectionId) return;
+                      onUpdateConnection(selectedConnectionId, (connection) => ({
                         ...connection,
                         kind: event.target.value as PatchConnectionKind,
-                      }))
-                    }
+                      }));
+                    }}
                   >
                     {CONNECTION_KIND_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -941,12 +987,13 @@ function PatchGraphCanvas({
                   <span>Destination</span>
                   <select
                     value={selectedConnection.to}
-                    onChange={(event) =>
-                      onUpdateConnection(selectedConnectionId ?? '', (connection) => ({
+                    onChange={(event) => {
+                      if (!selectedConnectionId) return;
+                      onUpdateConnection(selectedConnectionId, (connection) => ({
                         ...connection,
                         to: event.target.value,
-                      }))
-                    }
+                      }));
+                    }}
                   >
                     {Object.keys(patchDocument.patch.nodes).map((nodeId) => (
                       <option key={`to-${nodeId}`} value={nodeId}>

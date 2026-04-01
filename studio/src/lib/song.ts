@@ -1,6 +1,7 @@
 import yaml from 'js-yaml';
 import { midiToNoteName, noteNameToMidi } from './note';
 import { PATCH_ROLE_OPTIONS, type PatchRole } from './patch';
+import type { ValidationIssue } from './validation';
 
 const CHORD_ROOTS = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'] as const;
 const CHORD_ROOT_INDEX = new Map<string, number>([
@@ -544,7 +545,7 @@ export function normalizeChordRegions(regions: ChordRegion[], phraseBeats: numbe
     .sort((left, right) => left.startBeat - right.startBeat || left.symbol.localeCompare(right.symbol));
 
   if (sanitized.length === 0) {
-    return [];
+    return [{ id: createChordRegionId(), symbol: 'C', startBeat: 0 }];
   }
 
   return sanitized.map((region, index) => ({
@@ -556,13 +557,13 @@ export function normalizeChordRegions(regions: ChordRegion[], phraseBeats: numbe
 function buildEvenChordRegions(chords: string[], phraseBeats: number): ChordRegion[] {
   const sanitized = sanitizeChordList(chords);
   if (sanitized.length === 0) {
-    return [];
+    return [{ id: createChordRegionId(), symbol: 'C', startBeat: 0 }];
   }
-  const step = phraseBeats / sanitized.length;
+  const count = sanitized.length;
   return sanitized.map((symbol, index) => ({
     id: createChordRegionId(),
     symbol,
-    startBeat: Math.round(index * step * 1000) / 1000,
+    startBeat: Math.round((index * phraseBeats * 1000) / count) / 1000,
   }));
 }
 
@@ -720,7 +721,7 @@ export function serializeSong(document: SongDocument): string {
       const evenSpacing =
         chordRegions.length > 0
           && chordRegions.every((region, index) => {
-            const expectedStart = Math.round((index * phraseBeats) / chordRegions.length * 1000) / 1000;
+            const expectedStart = Math.round((index * phraseBeats * 1000) / chordRegions.length) / 1000;
             return Math.abs(region.startBeat - expectedStart) < 0.001;
           });
       if (chordRegions.length > 0 && !evenSpacing) {
@@ -755,58 +756,135 @@ export function sectionTotalBeats(document: SongDocument, section: SongSection):
   return Math.max(1, section.barsPerPhrase * section.phraseCount * beatsPerBar);
 }
 
-export function validateSong(document: SongDocument): string[] {
-  const issues: string[] = [];
+function songIssueId(...parts: Array<string | number>): string {
+  return ['song', ...parts].join(':');
+}
+
+function createSongIssue(
+  id: string,
+  title: string,
+  message: string,
+  focus: ValidationIssue['focus'] = { kind: 'song' },
+): ValidationIssue {
+  return {
+    id,
+    scope: 'song',
+    severity: 'error',
+    title,
+    message,
+    focus,
+  };
+}
+
+export function validateSong(document: SongDocument): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
   const names = new Set<string>();
 
   if (!document.song.genre.trim()) {
-    issues.push('Song genre is required.');
+    issues.push(createSongIssue(songIssueId('setup', 'genre'), 'Song setup', 'Genre is required.'));
   }
   if (!document.song.mood.trim()) {
-    issues.push('Song mood is required.');
+    issues.push(createSongIssue(songIssueId('setup', 'mood'), 'Song setup', 'Mood is required.'));
   }
   for (const role of PATCH_ROLE_OPTIONS) {
     const path = document.song.patches[role];
     if (path !== null && path.trim() === '') {
-      issues.push(`Patch override for "${role}" must not be blank.`);
+      issues.push(
+        createSongIssue(
+          songIssueId('patch', role, 'blank'),
+          'Sound assignments',
+          `Patch override for "${role}" must not be blank.`,
+        ),
+      );
     }
   }
   if (document.sections.length === 0) {
-    issues.push('Add at least one section.');
+    issues.push(createSongIssue(songIssueId('sections', 'missing'), 'Song flow', 'Add at least one section.'));
   }
 
-  document.sections.forEach((section) => {
+  document.sections.forEach((section, sectionIndex) => {
     const normalizedName = normalizeSectionName(section.name);
+    const sectionFocus = { kind: 'song-section', sectionName: section.name } as const;
+    const sectionTitle = `Section "${normalizedName}"`;
     if (names.has(normalizedName)) {
-      issues.push(`Section name "${normalizedName}" is duplicated.`);
+      issues.push(
+        createSongIssue(
+          songIssueId('section', sectionIndex, 'duplicate-name'),
+          sectionTitle,
+          'Name is duplicated.',
+          sectionFocus,
+        ),
+      );
     }
     names.add(normalizedName);
 
     const chordRegions = sectionChordRegions(document, section);
     if (chordRegions.length === 0) {
-      issues.push(`Section "${normalizedName}" should define at least one chord.`);
+      issues.push(
+        createSongIssue(
+          songIssueId('section', sectionIndex, 'missing-chords'),
+          sectionTitle,
+          'Define at least one chord.',
+          sectionFocus,
+        ),
+      );
     }
     const phraseBeats = sectionPhraseBeats(document, section);
     chordRegions.forEach((region, index) => {
       const nextRegion = chordRegions[index + 1] ?? null;
       if (region.startBeat < 0) {
-        issues.push(`Section "${normalizedName}" has a chord change before beat 0.`);
+        issues.push(
+          createSongIssue(
+            songIssueId('section', sectionIndex, 'chord-region', region.id, 'before-zero'),
+            sectionTitle,
+            `Chord "${region.symbol}" starts before beat 0.`,
+            sectionFocus,
+          ),
+        );
       }
       if (region.startBeat >= phraseBeats) {
-        issues.push(`Section "${normalizedName}" has a chord change outside the phrase length.`);
+        issues.push(
+          createSongIssue(
+            songIssueId('section', sectionIndex, 'chord-region', region.id, 'outside-phrase'),
+            sectionTitle,
+            `Chord "${region.symbol}" starts outside the phrase length.`,
+            sectionFocus,
+          ),
+        );
       }
       if (nextRegion && nextRegion.startBeat <= region.startBeat) {
-        issues.push(`Section "${normalizedName}" has overlapping or out-of-order chord changes.`);
+        issues.push(
+          createSongIssue(
+            songIssueId('section', sectionIndex, 'chord-region', region.id, 'overlap'),
+            sectionTitle,
+            'Chord changes overlap or are out of order.',
+            sectionFocus,
+          ),
+        );
       }
     });
 
     const totalBeats = sectionTotalBeats(document, section);
     section.melody.forEach((note) => {
       if (note.beat < 0) {
-        issues.push(`Section "${normalizedName}" has a melody note before beat 0.`);
+        issues.push(
+          createSongIssue(
+            songIssueId('section', sectionIndex, 'melody', note.id, 'before-zero'),
+            `${sectionTitle} melody`,
+            `${midiToNoteName(note.note)} starts before beat 0.`,
+            sectionFocus,
+          ),
+        );
       }
       if (note.beat + note.duration > totalBeats + 0.001) {
-        issues.push(`Section "${normalizedName}" has a melody note extending past the phrase length.`);
+        issues.push(
+          createSongIssue(
+            songIssueId('section', sectionIndex, 'melody', note.id, 'outside-phrase'),
+            `${sectionTitle} melody`,
+            `${midiToNoteName(note.note)} extends past the phrase length.`,
+            sectionFocus,
+          ),
+        );
       }
     });
   });

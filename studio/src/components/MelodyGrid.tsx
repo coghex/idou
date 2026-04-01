@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { PointerEvent as ReactPointerEvent } from 'react';
+import type { MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from 'react';
 import type { WheelEvent as ReactWheelEvent } from 'react';
 import { createNoteId, type MelodyNote } from '../lib/song';
 import { clamp, midiToNoteName, quantizeBeat } from '../lib/note';
@@ -11,6 +11,9 @@ const HEADER_WIDTH = 64;
 const GRID_PADDING = 8;
 const HANDLE_WIDTH = 8;
 const CHORD_LANE_HEIGHT = 28;
+const CHORD_BOUNDARY_HIT_WIDTH = 6;
+const FLOAT_EPSILON = 0.0001;
+const MIN_NOTE_DURATION_BEATS = 0.25;
 
 export type OverlayNote = {
   id: string;
@@ -41,6 +44,7 @@ type Props = {
   minBeatWidth?: number;
   maxBeatWidth?: number;
   quantizeStep: number;
+  chordQuantizeStep?: number;
   notes: MelodyNote[];
   chordRegions?: ChordRegionShape[];
   overlayNotes?: OverlayNote[];
@@ -48,10 +52,15 @@ type Props = {
   selectedChordRegionId?: string | null;
   onSelectNote: (noteId: string | null) => void;
   onSelectChordRegion?: (regionId: string | null) => void;
-  onUpsertChordRegion?: (region: Pick<ChordRegionShape, 'id' | 'startBeat'>) => void;
+  onCreateChordRegion?: (startBeat: number, anchor: { x: number; y: number }) => void;
+  onEditChordRegion?: (regionId: string, anchor: { x: number; y: number }) => void;
+  onDeleteChordRegion?: (regionId: string) => void;
+  onReorderChordRegion?: (regionId: string, targetIndex: number) => void;
+  onResizeChordBoundary?: (rightRegionId: string, startBeat: number) => void;
   onBeatWidthChange?: (nextBeatWidth: number) => void;
   onUpsertNote: (note: MelodyNote) => void;
   onPreviewNote?: (midi: number) => void;
+  readOnly?: boolean;
 };
 
 type DragState =
@@ -70,12 +79,21 @@ type DragState =
       pointerBeat: number;
     }
   | {
-      kind: 'move-chord';
+      kind: 'reorder-chord';
       regionId: string;
-      originStartBeat: number;
-      pointerBeat: number;
+    }
+  | {
+      kind: 'resize-chord-boundary';
+      rightRegionId: string;
     }
   | null;
+
+type ChordContextMenuState = {
+  clientX: number;
+  clientY: number;
+  regionId: string | null;
+  startBeat: number;
+} | null;
 
 function isBlackKey(midi: number): boolean {
   const pitchClass = ((midi % 12) + 12) % 12;
@@ -83,7 +101,7 @@ function isBlackKey(midi: number): boolean {
 }
 
 function isNearInteger(value: number): boolean {
-  return Math.abs(value - Math.round(value)) < 0.0001;
+  return Math.abs(value - Math.round(value)) < FLOAT_EPSILON;
 }
 
 function noteRect(note: NoteShape, beatWidth: number) {
@@ -122,6 +140,7 @@ export default function MelodyGrid(props: Props) {
     minBeatWidth = 24,
     maxBeatWidth = 84,
     quantizeStep,
+    chordQuantizeStep = 0.5,
     notes,
     chordRegions = [],
     overlayNotes = [],
@@ -129,36 +148,70 @@ export default function MelodyGrid(props: Props) {
     selectedChordRegionId = null,
     onSelectNote,
     onSelectChordRegion,
-    onUpsertChordRegion,
+    onCreateChordRegion,
+    onEditChordRegion,
+    onDeleteChordRegion,
+    onReorderChordRegion,
+    onResizeChordBoundary,
     onBeatWidthChange,
     onUpsertNote,
     onPreviewNote,
+    readOnly = false,
   } =
     props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<DragState>(null);
   const zoomAnchorRef = useRef<{ beat: number; localX: number } | null>(null);
+
+  const dragPropsRef = useRef({
+    resolvedBeatWidth: 0,
+    quantizeStep,
+    chordQuantizeStep,
+    phraseBeats,
+    totalBeats,
+    notes,
+    chordRegions,
+    onUpsertNote,
+    onReorderChordRegion,
+    onResizeChordBoundary,
+  });
+  // Keep ref in sync every render so drag handlers always see current values.
+  Object.assign(dragPropsRef.current, {
+    quantizeStep,
+    chordQuantizeStep,
+    phraseBeats,
+    totalBeats,
+    notes,
+    chordRegions,
+    onUpsertNote,
+    onReorderChordRegion,
+    onResizeChordBoundary,
+  });
   const [viewportWidth, setViewportWidth] = useState(0);
+  const [chordContextMenu, setChordContextMenu] = useState<ChordContextMenuState>(null);
   const fitBeatWidth = useMemo(() => {
     const availableWidth = viewportWidth - HEADER_WIDTH - GRID_PADDING * 2;
     if (availableWidth <= 0 || totalBeats <= 0) {
       return beatWidth;
     }
     const rawFitWidth = availableWidth / totalBeats;
-    const snappedFitWidth = Math.round(rawFitWidth / 2) * 2;
+    const snappedFitWidth = Math.max(2, Math.floor(rawFitWidth / 2) * 2);
     return clamp(snappedFitWidth, minBeatWidth, maxBeatWidth);
   }, [beatWidth, maxBeatWidth, minBeatWidth, totalBeats, viewportWidth]);
   const resolvedBeatWidth = Math.max(beatWidth, fitBeatWidth);
+  dragPropsRef.current.resolvedBeatWidth = resolvedBeatWidth;
 
-  const displayBeats = useMemo(() => {
-    const visibleBeatCount = Math.ceil(Math.max(0, viewportWidth - HEADER_WIDTH - GRID_PADDING * 2) / resolvedBeatWidth);
-    return Math.max(totalBeats, visibleBeatCount);
-  }, [resolvedBeatWidth, totalBeats, viewportWidth]);
-  const width = useMemo(
-    () => HEADER_WIDTH + GRID_PADDING * 2 + displayBeats * resolvedBeatWidth,
-    [displayBeats, resolvedBeatWidth],
+  const contentWidth = useMemo(
+    () => HEADER_WIDTH + GRID_PADDING * 2 + totalBeats * resolvedBeatWidth,
+    [resolvedBeatWidth, totalBeats],
   );
+  const width = useMemo(() => Math.max(contentWidth, viewportWidth), [contentWidth, viewportWidth]);
+  const displayBeats = useMemo(() => {
+    const visibleBeatCount = Math.max(0, width - HEADER_WIDTH - GRID_PADDING * 2) / resolvedBeatWidth;
+    return Math.max(totalBeats, visibleBeatCount);
+  }, [resolvedBeatWidth, totalBeats, width]);
   const height = useMemo(() => GRID_PADDING * 2 + CHORD_LANE_HEIGHT + (MAX_MIDI - MIN_MIDI + 1) * ROW_HEIGHT, []);
   const renderedChordRegions = useMemo(
     () =>
@@ -172,6 +225,22 @@ export default function MelodyGrid(props: Props) {
       ),
     [chordRegions, phraseBeats, phraseCount, totalBeats],
   );
+
+  const hitChordRegion = (localX: number) =>
+    [...renderedChordRegions].reverse().find((region) => {
+      const regionX = HEADER_WIDTH + GRID_PADDING + region.renderStartBeat * resolvedBeatWidth;
+      const regionWidth = Math.max(20, region.durationBeats * resolvedBeatWidth);
+      return localX >= regionX && localX <= regionX + regionWidth;
+    });
+
+  const hitChordBoundary = (localX: number) =>
+    [...renderedChordRegions].reverse().find((region) => {
+      if (region.startBeat <= 0) {
+        return false;
+      }
+      const boundaryX = HEADER_WIDTH + GRID_PADDING + region.renderStartBeat * resolvedBeatWidth;
+      return Math.abs(localX - boundaryX) <= CHORD_BOUNDARY_HIT_WIDTH;
+    });
 
   useEffect(() => {
     const host = hostRef.current;
@@ -223,6 +292,12 @@ export default function MelodyGrid(props: Props) {
     ctx.fillRect(HEADER_WIDTH, GRID_PADDING, width - HEADER_WIDTH, CHORD_LANE_HEIGHT);
     ctx.fillStyle = '#d4d4d8';
     ctx.fillRect(0, GRID_PADDING, HEADER_WIDTH - 1, CHORD_LANE_HEIGHT);
+    ctx.fillStyle = '#3f3f46';
+    const chordIconX = 14;
+    const chordIconY = GRID_PADDING + 5;
+    ctx.fillRect(chordIconX, chordIconY + 10, 22, 3);
+    ctx.fillRect(chordIconX + 5, chordIconY + 4, 22, 3);
+    ctx.fillRect(chordIconX + 10, chordIconY - 2, 22, 3);
     ctx.strokeStyle = '#202024';
     ctx.beginPath();
     ctx.moveTo(HEADER_WIDTH, GRID_PADDING + CHORD_LANE_HEIGHT + 0.5);
@@ -350,48 +425,57 @@ export default function MelodyGrid(props: Props) {
         return;
       }
 
-      if (dragState.kind === 'move-chord') {
-        const regionIndex = chordRegions.findIndex((entry) => entry.id === dragState.regionId);
-        const region = regionIndex >= 0 ? chordRegions[regionIndex] : null;
-        if (!region || !onUpsertChordRegion) {
+      const dp = dragPropsRef.current;
+
+      if (dragState.kind === 'resize-chord-boundary') {
+        if (!dp.onResizeChordBoundary) {
           return;
         }
-        const prevStartBeat = regionIndex > 0 ? chordRegions[regionIndex - 1]?.startBeat ?? 0 : 0;
-        const nextStartBeat = chordRegions[regionIndex + 1]?.startBeat ?? phraseBeats;
         const nextBeat = clamp(
-          dragState.originStartBeat + pointerToPhraseBeat(event.clientX, bounds, resolvedBeatWidth, quantizeStep, phraseBeats) - dragState.pointerBeat,
-          prevStartBeat + quantizeStep,
-          Math.max(prevStartBeat + quantizeStep, nextStartBeat - quantizeStep),
+          pointerToPhraseBeat(event.clientX, bounds, dp.resolvedBeatWidth, dp.chordQuantizeStep, dp.phraseBeats),
+          0,
+          Math.max(0, dp.phraseBeats - dp.chordQuantizeStep),
         );
-        onUpsertChordRegion({ id: region.id, startBeat: quantizeBeat(nextBeat, quantizeStep) });
+        dp.onResizeChordBoundary(dragState.rightRegionId, nextBeat);
         return;
       }
 
-      const note = notes.find((entry) => entry.id === dragState.noteId);
+      if (dragState.kind === 'reorder-chord') {
+        if (!dp.onReorderChordRegion) {
+          return;
+        }
+        const rawBeat = (event.clientX - bounds.left - HEADER_WIDTH - GRID_PADDING) / dp.resolvedBeatWidth;
+        const normalizedBeat = clamp(((rawBeat % dp.phraseBeats) + dp.phraseBeats) % dp.phraseBeats, 0, Math.max(0, dp.phraseBeats - 0.001));
+        const targetIndex = dp.chordRegions.findIndex((region) => normalizedBeat >= region.startBeat && normalizedBeat < region.endBeat);
+        dp.onReorderChordRegion(dragState.regionId, targetIndex >= 0 ? targetIndex : dp.chordRegions.length - 1);
+        return;
+      }
+
+      const note = dp.notes.find((entry) => entry.id === dragState.noteId);
       if (!note) {
         return;
       }
 
       if (dragState.kind === 'move') {
         const nextBeat = clamp(
-          dragState.originBeat + pointerToBeat(event.clientX, bounds, resolvedBeatWidth, quantizeStep) - dragState.pointerBeat,
+          dragState.originBeat + pointerToBeat(event.clientX, bounds, dp.resolvedBeatWidth, dp.quantizeStep) - dragState.pointerBeat,
           0,
-          Math.max(0, totalBeats - note.duration),
+          Math.max(0, dp.totalBeats - note.duration),
         );
         const nextMidi = clamp(
           dragState.originMidi + pointerToMidi(event.clientY, bounds) - dragState.pointerMidi,
           MIN_MIDI,
           MAX_MIDI,
         );
-        onUpsertNote({ ...note, beat: quantizeBeat(nextBeat, quantizeStep), note: nextMidi });
+        dp.onUpsertNote({ ...note, beat: quantizeBeat(nextBeat, dp.quantizeStep), note: nextMidi });
       } else {
-          const nextBeat = pointerToBeat(event.clientX, bounds, resolvedBeatWidth, quantizeStep);
+        const nextBeat = pointerToBeat(event.clientX, bounds, dp.resolvedBeatWidth, dp.quantizeStep);
         const nextDuration = clamp(
           dragState.originDuration + nextBeat - dragState.pointerBeat,
-          quantizeStep,
-          Math.max(quantizeStep, totalBeats - note.beat),
+          dp.quantizeStep,
+          Math.max(dp.quantizeStep, dp.totalBeats - note.beat),
         );
-        onUpsertNote({ ...note, duration: quantizeBeat(nextDuration, quantizeStep) });
+        dp.onUpsertNote({ ...note, duration: quantizeBeat(nextDuration, dp.quantizeStep) });
       }
     };
 
@@ -405,10 +489,43 @@ export default function MelodyGrid(props: Props) {
       window.removeEventListener('pointermove', handlePointerMove);
       window.removeEventListener('pointerup', handlePointerUp);
     };
-  }, [chordRegions, notes, onUpsertChordRegion, onUpsertNote, phraseBeats, quantizeStep, resolvedBeatWidth, totalBeats]);
+  }, []);
+
+  useEffect(() => {
+    if (!chordContextMenu) {
+      return;
+    }
+
+    const handleGlobalPointerDown = (event: PointerEvent) => {
+      if (contextMenuRef.current?.contains(event.target as Node)) {
+        return;
+      }
+      setChordContextMenu(null);
+    };
+
+    const handleGlobalKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setChordContextMenu(null);
+      }
+    };
+
+    window.addEventListener('pointerdown', handleGlobalPointerDown);
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => {
+      window.removeEventListener('pointerdown', handleGlobalPointerDown);
+      window.removeEventListener('keydown', handleGlobalKeyDown);
+    };
+  }, [chordContextMenu]);
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (readOnly) {
+      return;
+    }
+    if (event.button !== 0) {
+      return;
+    }
     event.preventDefault();
+    setChordContextMenu(null);
     const bounds = hostRef.current?.getBoundingClientRect();
     if (!bounds) {
       return;
@@ -434,19 +551,19 @@ export default function MelodyGrid(props: Props) {
     }
 
     if (y >= GRID_PADDING && y <= GRID_PADDING + CHORD_LANE_HEIGHT) {
-      const hitRegion = [...renderedChordRegions].reverse().find((region) => {
-        const regionX = HEADER_WIDTH + GRID_PADDING + region.renderStartBeat * resolvedBeatWidth;
-        const regionWidth = Math.max(20, region.durationBeats * resolvedBeatWidth);
-        return x >= regionX && x <= regionX + regionWidth;
-      });
+      const hitBoundary = hitChordBoundary(x);
+      const hitRegion = hitChordRegion(x);
       onSelectNote(null);
       onSelectChordRegion?.(hitRegion?.id ?? null);
-      if (hitRegion && onUpsertChordRegion && hitRegion.startBeat > 0) {
+      if (hitBoundary && onResizeChordBoundary) {
         dragStateRef.current = {
-          kind: 'move-chord',
+          kind: 'resize-chord-boundary',
+          rightRegionId: hitBoundary.id,
+        };
+      } else if (hitRegion && onReorderChordRegion) {
+        dragStateRef.current = {
+          kind: 'reorder-chord',
           regionId: hitRegion.id,
-          originStartBeat: hitRegion.startBeat,
-          pointerBeat: pointerToPhraseBeat(event.clientX, bounds, resolvedBeatWidth, quantizeStep, phraseBeats),
         };
       }
       return;
@@ -458,7 +575,7 @@ export default function MelodyGrid(props: Props) {
     });
 
     if (!hit) {
-      const defaultDuration = Math.max(quantizeStep, 0.25);
+      const defaultDuration = Math.max(quantizeStep, MIN_NOTE_DURATION_BEATS);
       const nextNote: MelodyNote = {
         id: createNoteId(),
         beat,
@@ -499,7 +616,43 @@ export default function MelodyGrid(props: Props) {
           };
   };
 
+  const handleContextMenu = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (readOnly) {
+      setChordContextMenu(null);
+      return;
+    }
+    const bounds = hostRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      return;
+    }
+
+    const x = event.clientX - bounds.left;
+    const y = event.clientY - bounds.top;
+    const withinChordLane = x > HEADER_WIDTH && y >= GRID_PADDING && y <= GRID_PADDING + CHORD_LANE_HEIGHT;
+    if (!withinChordLane) {
+      setChordContextMenu(null);
+      return;
+    }
+
+    event.preventDefault();
+    const hitRegion = hitChordRegion(x);
+    const startBeat = clamp(
+      pointerToPhraseBeat(event.clientX, bounds, resolvedBeatWidth, chordQuantizeStep, phraseBeats),
+      0,
+      Math.max(0, phraseBeats - chordQuantizeStep),
+    );
+    onSelectNote(null);
+    onSelectChordRegion?.(hitRegion?.id ?? null);
+    setChordContextMenu({
+      clientX: event.clientX + 4,
+      clientY: event.clientY + 4,
+      regionId: hitRegion?.id ?? null,
+      startBeat,
+    });
+  };
+
   const handleWheel = (event: ReactWheelEvent<HTMLDivElement>) => {
+    setChordContextMenu(null);
     const host = hostRef.current;
     if (!host) {
       return;
@@ -528,11 +681,68 @@ export default function MelodyGrid(props: Props) {
     }
   };
 
+  const handleCreateChordRegion = () => {
+    if (!chordContextMenu || !onCreateChordRegion) {
+      return;
+    }
+    onCreateChordRegion(chordContextMenu.startBeat, {
+      x: chordContextMenu.clientX,
+      y: chordContextMenu.clientY,
+    });
+    setChordContextMenu(null);
+  };
+
+  const handleEditChordRegion = () => {
+    if (!chordContextMenu?.regionId || !onEditChordRegion) {
+      return;
+    }
+    onEditChordRegion(chordContextMenu.regionId, {
+      x: chordContextMenu.clientX,
+      y: chordContextMenu.clientY,
+    });
+    setChordContextMenu(null);
+  };
+
+  const handleDeleteChordRegion = () => {
+    if (!chordContextMenu?.regionId || !onDeleteChordRegion) {
+      return;
+    }
+    onDeleteChordRegion(chordContextMenu.regionId);
+    setChordContextMenu(null);
+  };
+
   return (
     <div className="melody-grid-shell">
-      <div className="melody-grid-scroll" ref={hostRef} onPointerDown={handlePointerDown} onWheel={handleWheel}>
+      <div
+        className="melody-grid-scroll"
+        ref={hostRef}
+        onPointerDown={handlePointerDown}
+        onContextMenu={handleContextMenu}
+        onWheel={handleWheel}
+      >
         <canvas ref={canvasRef} />
       </div>
+      {!readOnly && chordContextMenu ? (
+        <div
+          className="melody-grid-context-menu"
+          ref={contextMenuRef}
+          style={{ left: chordContextMenu.clientX, top: chordContextMenu.clientY }}
+        >
+          {chordContextMenu.regionId ? (
+            <button type="button" onClick={handleEditChordRegion}>
+              Edit chord
+            </button>
+          ) : null}
+          <button type="button" onClick={handleCreateChordRegion}>
+            Add chord here
+          </button>
+          {chordContextMenu.regionId ? (
+            <button type="button" onClick={handleDeleteChordRegion} disabled={chordRegions.length <= 1}>
+              Delete chord
+            </button>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
