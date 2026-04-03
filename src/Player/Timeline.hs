@@ -19,12 +19,15 @@ module Player.Timeline
   , parseSongSpecText
   , cueSectionOrder
   , compileTimelineBars
+  , compileSectionNotes
   , prepareTimelineRuntime
+  , sectionBarFrames
   , setTimelineTargets
   , popReadyBars
   , popRetargetTelemetry
   , popLookaheadTelemetry
   , popTransitionTelemetry
+  , stampLookaheadPerfMetrics
   , setTimelineGenre
   , validateSongGenre
   , generatedInstrumentSpecs
@@ -35,7 +38,7 @@ module Player.Timeline
   , timelineRuntimeEndFrame
   ) where
 
-import Player.Timeline.Arrangement (compileTimelineBars, cueSectionOrder)
+import Player.Timeline.Arrangement (compileSectionNotes, compileTimelineBars, cueSectionOrder, sectionBarFrames)
 import Player.Timeline.Parse
   ( generatedInstrumentSpecs
   , loadSongSpec
@@ -48,6 +51,7 @@ import Player.Timeline.Runtime
   , popRetargetTelemetry
   , popLookaheadTelemetry
   , popTransitionTelemetry
+  , stampLookaheadPerfMetrics
   , prepareTimelineRuntime
   , setTimelineGenre
   , setTimelineTargets

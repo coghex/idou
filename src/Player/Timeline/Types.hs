@@ -145,6 +145,8 @@ data TimelineLookaheadTelemetry = TimelineLookaheadTelemetry
   , tltGenre              ∷ !String
   , tltSeedStart          ∷ !Word64
   , tltSeedEnd            ∷ !Word64
+  , tltGenerationDurationUs ∷ !(Maybe Word64)
+  , tltGenerationBarsPerSecond ∷ !(Maybe Float)
   }
   deriving (Eq, Show)
 

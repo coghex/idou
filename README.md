@@ -14,6 +14,10 @@ cabal run idou -- path/to/file.mid
 cabal run idou -- path/to/file.wav
 cabal run idou -- song1.yaml
 cabal run idou -- config/song.yaml
+cabal run idou -- --explain-timeline config/song.yaml
+cabal run idou -- --audio-health=verbose config/song.yaml
+cabal run idou -- --baseline-report --baseline-bars 16 config/song.yaml
+cabal run idou -- --baseline-report --baseline-scenario rapid-retarget config/song.yaml
 ```
 
 ## Game runtime contract
@@ -94,6 +98,10 @@ In practical terms:
 - Mood, energy, and live genre changes update adaptive targets immediately, but the runtime treats already-buffered lookahead bars as stable. The new targets apply from the next bar that has not been generated yet.
 - That “future-generated-bars-only” policy is now surfaced through `TimelineRetargetTelemetry` / `PlayerEventTimelineRetargeted`, including how many future bars were already buffered and the frame where newly generated material will begin.
 - Lookahead extension is also observable through `TimelineLookaheadTelemetry` / `PlayerEventTimelineLookahead`, which reports why bars were generated (`lookahead-horizon`, next-bar query, or boundary-span query), how many bars were added, the generated frame range, and the seed range used for deterministic replay.
+- Live player-thread lookahead telemetry now also includes measured generation cost when available (`gen-us` and derived `bars/s`), so adaptive-arrangement regressions are visible during normal playback.
+- For repeatable performance checks, `cabal run idou -- --baseline-report [--baseline-scenario <name>] [--baseline-bars <count>] <song.yaml>` runs the live engine for a fixed number of deterministic bars and prints a compact summary of aggregated lookahead and audio metrics.
+- Built-in baseline scenarios currently include `steady-song`, `rapid-retarget`, `genre-sweep`, and `long-lookahead`; if you omit `--baseline-bars`, the runner uses the selected scenario's default length.
+- For CLI debugging, `cabal run idou -- --explain-timeline <song.yaml>` now drains the timeline runtime offline and prints a readable explain trace: lookahead generation, weighted section transitions, retarget state, and per-bar instrument/note summaries.
 
 ## Idou Studio
 
@@ -144,9 +152,18 @@ The repository now includes an experimental voice-local patch loader/compiler in
 
 - Patch files live separately from songs, for example `config/patches/warm-pad.yaml`
 - The current schema uses explicit typed `nodes` and `connections`
+- Patch files may also declare `modulations.<name>` entries with `source`, `target`, `destination`, and `amount`, which compile into the runtime modulation matrix
+- Oscillator and noise nodes may also declare an inline `amp_envelope` block as a shortcut for per-layer amplitude shaping
+- Output nodes may declare `lfo1_rate_hz`; when it is positive, patch `lfo1` runs autonomously at that rate, and when it is omitted or `0`, the previous vibrato/mod-wheel-coupled behavior is preserved
+- Filter nodes may declare `layer_target`; use `all` (default) to keep the current global filter behavior, or point at an active oscillator/noise node such as `osc1` to filter only that compiled layer while the others stay dry
 - Supported node types in this first pass are `oscillator`, `noise`, `envelope`, `filter`, and `output`
 - The compiler lowers those graphs into the current runtime `Instrument` type
 - Signal graphs are intentionally constrained to the current engine model: up to 4 signal layers, at most one compiled filter stage in the active path, and no global/shared FX routing yet
+- Supported modulation sources currently match the runtime engine surface: `lfo1`, `amp_envelope`, `filter_envelope`, `key_track`, `channel_aftertouch`, and `poly_aftertouch`
+- Supported modulation destinations currently target the active compiled graph only: signal-layer `pitch_cents`, the active filter's `filter_cutoff_oct`, and the output node's `amp_gain`
+- Patch modulation routes are validated at load time and capped at 8 routes per instrument to match the current render loop budget
+- A signal layer may use either an inline `amp_envelope` block or an explicit `amp_envelope` connection, but not both
+- Filter `layer_target` values are validated against the active compiled graph, so Studio and the engine will reject targets that do not point at an active oscillator/noise node
 - Song YAML can now point at external patch files:
   - explicit pattern instruments may set `instruments.<name>.patch` or `instruments.<name>.patch_file`
   - generated song-intent roles may set `song.patches.<role>` or `song.patches.<role>.patch`
@@ -222,6 +239,7 @@ Runtime automation lanes are available via `PlayerAutomateEnergyNextBar` (with `
 Deterministic replay is defined by authored song data + start frame/seed + the ordered stream of runtime control events. Given the same inputs, the arranger, conductor, and variation layer should emit the same generated bars and telemetry.
 Transition observability is exposed via `PlayerEventTimelineTransition`, which reports section boundary transitions with from/to sections, reason, candidate weights (base + final), boundary timing, active mood/energy targets, and weighted-pick ticket info.
 Retarget and lookahead observability are exposed via `PlayerEventTimelineRetargeted` and `PlayerEventTimelineLookahead`, so the game can explain why a musical reaction has or has not taken effect yet without guessing about the lookahead buffer.
+The CLI now renders those telemetry events in a more human-readable explanation format during interactive timeline playback, instead of falling back to raw `show` output for transitions.
 
 If a section has no explicit drum pattern, timeline generation now injects a fallback drum groove on instrument/channel 10 (`InstrumentId 9`) so tracks keep percussion by default.
 For drum instruments (channel/instrument 10, `InstrumentId 9`), fills are applied automatically on phrase-boundary bars when a section fill is defined.

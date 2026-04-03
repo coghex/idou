@@ -18,6 +18,11 @@ patch:
       color: mix
       mix: 0.35
       level: 0.08
+      amp_envelope:
+        attack: 0.00
+        decay: 0.04
+        sustain: 0.00
+        release: 0.05
     amp_env:
       type: envelope
       attack: 0.08
@@ -37,15 +42,33 @@ patch:
       q: 0.74
       slope: 24
       key_track: 0.38
+      layer_target: osc1
       env_amount_oct: 1.45
       q_env_amount: 0.08
     out:
       type: output
       gain: 0.82
       layer_spread: 0.18
+      lfo1_rate_hz: 4.5
       play_mode: poly
       poly_max: 12
       voice_steal: quietest
+  modulations:
+    pressure_to_filter:
+      source: channel_aftertouch
+      target: filter1
+      destination: filter_cutoff_oct
+      amount: 0.22
+    pressure_to_amp:
+      source: poly_aftertouch
+      target: out
+      destination: amp_gain
+      amount: 0.10
+    vibrato_to_osc2:
+      source: lfo1
+      target: osc2
+      destination: pitch_cents
+      amount: 14
   connections:
     osc1_to_filter:
       from: osc1

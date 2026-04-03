@@ -9,6 +9,7 @@ module Audio.Thread.Types
   , AudioUserData(..)
   , clamp01
   , maxLayers
+  , maxModRoutes
   ) where
 
 import Data.IORef (IORef)
@@ -38,6 +39,9 @@ import Sound.Miniaudio.RingBuffer (MaRB)
 maxLayers ∷ Int
 maxLayers = 4
 
+maxModRoutes ∷ Int
+maxModRoutes = 8
+
 data Voice = Voice
   { vOscs       ∷ !(MV.IOVector Osc)
   , vOscCount   ∷ !Int
@@ -60,6 +64,7 @@ data Voice = Voice
   , vAmpL       ∷ !Float
   , vAmpR       ∷ !Float
   , vInstrGain  ∷ !Float
+  , vLfo1RateHz ∷ !Float
   , vModRoutes  ∷ ![ModRoute]
 
   , vADSR       ∷ !ADSR

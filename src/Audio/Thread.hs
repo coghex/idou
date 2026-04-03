@@ -6,6 +6,8 @@ module Audio.Thread
   , stopAudioSystem
   , sendAudio
   , tryReadAudioEvent
+  , AudioHealthSnapshot(..)
+  , readAudioHealth
   , readTransportFrame
   , scheduleAudioActionAtFrame
   , scheduleAudioActionAfterFrames
@@ -42,6 +44,7 @@ data AudioSystem = AudioSystem
   { asHandle     ∷ !AudioHandle
   , asThread     ∷ !ThreadState
   , asTransportFrameRef ∷ !(IORef Word64)
+  , asHealthRef  ∷ !(IORef AudioHealthSnapshot)
   , asDevice     ∷ !(Ptr MaDevice)
   , asCfg        ∷ !(Ptr MaDeviceConfig)
   , asCallback   ∷ !(FunPtr MaDataCallback)
@@ -60,6 +63,9 @@ sendAudio sys msg = Q.writeQueue (audioQueue (asHandle sys)) msg
 
 tryReadAudioEvent ∷ AudioSystem → IO (Maybe AudioEvent)
 tryReadAudioEvent sys = Q.tryReadQueue (audioEventQueue (asHandle sys))
+
+readAudioHealth ∷ AudioSystem → IO AudioHealthSnapshot
+readAudioHealth = readIORef . asHealthRef
 
 readTransportFrame ∷ AudioSystem → IO Word64
 readTransportFrame = readIORef . asTransportFrameRef
@@ -189,6 +195,7 @@ startAudioSystem audioCfg healthVerbosity = do
             }
     (st1, _) <- Audio.Thread.Render.renderIfNeeded (audioEventQueue h) (applyScheduledAction h) rb chunkFrames st0
     stRef <- newIORef st1
+    healthRef <- newIORef emptyAudioHealthSnapshot
 
     controlRef <- newIORef ThreadRunning
     doneVar <- newEmptyMVar
@@ -196,7 +203,7 @@ startAudioSystem audioCfg healthVerbosity = do
     (`onException` cleanupStartedSystem) $ do
       startDevice dev
       tid <- forkIO $
-        runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg transportFrameRef
+        runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg transportFrameRef healthRef
           `finally` putMVar doneVar ()
 
       let ts = ThreadState controlRef tid doneVar
@@ -204,6 +211,7 @@ startAudioSystem audioCfg healthVerbosity = do
         { asHandle = h
         , asThread = ts
         , asTransportFrameRef = transportFrameRef
+        , asHealthRef = healthRef
         , asDevice = dev
         , asCfg = cfg
         , asCallback = cbFun
@@ -271,8 +279,9 @@ runAudioLoop
   → AudioHealthVerbosity
   → AudioTelemetryConfig
   → IORef Word64
+  → IORef AudioHealthSnapshot
   → IO ()
-runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg transportFrameRef =
+runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telemetryCfg transportFrameRef healthRef =
   go 0 0 0 0 emptyHealthStats
   where
     verboseEveryLoops = fromIntegral (atVerboseReportEveryLoops telemetryCfg) ∷ Word64
@@ -297,6 +306,7 @@ runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telem
 
           let health' = absorbRenderStats health rs
           u <- readIORef underrunRef
+          writeIORef healthRef (snapshotAudioHealth u health')
           let partialNow = hsPartialWrites health'
               zeroNow = hsZeroWrites health'
               partialDelta = partialNow - lastPartialWrites
@@ -323,30 +333,93 @@ runAudioLoop h controlRef stRef rb chunkFrames underrunRef healthVerbosity telem
 
 data HealthStats = HealthStats
   { hsLoopCount     ∷ !Word64
+  , hsRenderPassCount ∷ !Word64
   , hsFramesMixed   ∷ !Word64
   , hsFramesWritten ∷ !Word64
   , hsPartialWrites ∷ !Word64
   , hsZeroWrites    ∷ !Word64
+  , hsMixDurationUs ∷ !Word64
+  , hsPeakMixDurationUs ∷ !Word64
+  , hsPeakActiveVoices ∷ !Word64
+  , hsPeakActiveClips ∷ !Word64
   } deriving (Eq, Show)
+
+data AudioHealthSnapshot = AudioHealthSnapshot
+  { ahsUnderruns         ∷ !Word64
+  , ahsLoopCount         ∷ !Word64
+  , ahsRenderPassCount   ∷ !Word64
+  , ahsFramesMixed       ∷ !Word64
+  , ahsFramesWritten     ∷ !Word64
+  , ahsPartialWrites     ∷ !Word64
+  , ahsZeroWrites        ∷ !Word64
+  , ahsMixDurationUs     ∷ !Word64
+  , ahsPeakMixDurationUs ∷ !Word64
+  , ahsPeakActiveVoices  ∷ !Word64
+  , ahsPeakActiveClips   ∷ !Word64
+  } deriving (Eq, Show)
+
+emptyAudioHealthSnapshot ∷ AudioHealthSnapshot
+emptyAudioHealthSnapshot =
+  AudioHealthSnapshot
+    { ahsUnderruns = 0
+    , ahsLoopCount = 0
+    , ahsRenderPassCount = 0
+    , ahsFramesMixed = 0
+    , ahsFramesWritten = 0
+    , ahsPartialWrites = 0
+    , ahsZeroWrites = 0
+    , ahsMixDurationUs = 0
+    , ahsPeakMixDurationUs = 0
+    , ahsPeakActiveVoices = 0
+    , ahsPeakActiveClips = 0
+    }
 
 emptyHealthStats ∷ HealthStats
 emptyHealthStats =
   HealthStats
     { hsLoopCount = 0
+    , hsRenderPassCount = 0
     , hsFramesMixed = 0
     , hsFramesWritten = 0
     , hsPartialWrites = 0
     , hsZeroWrites = 0
+    , hsMixDurationUs = 0
+    , hsPeakMixDurationUs = 0
+    , hsPeakActiveVoices = 0
+    , hsPeakActiveClips = 0
     }
 
 absorbRenderStats ∷ HealthStats → RenderStats → HealthStats
 absorbRenderStats hs rs =
   hs
     { hsLoopCount = hsLoopCount hs + 1
+    , hsRenderPassCount =
+        hsRenderPassCount hs
+          + if rsFramesMixed rs > 0 then 1 else 0
     , hsFramesMixed = hsFramesMixed hs + fromIntegral (rsFramesMixed rs)
     , hsFramesWritten = hsFramesWritten hs + fromIntegral (rsFramesWritten rs)
     , hsPartialWrites = hsPartialWrites hs + fromIntegral (rsPartialWrites rs)
     , hsZeroWrites = hsZeroWrites hs + fromIntegral (rsZeroWrites rs)
+    , hsMixDurationUs = hsMixDurationUs hs + rsMixDurationUs rs
+    , hsPeakMixDurationUs = max (hsPeakMixDurationUs hs) (rsMixDurationUs rs)
+    , hsPeakActiveVoices = max (hsPeakActiveVoices hs) (fromIntegral (rsPeakActiveVoices rs))
+    , hsPeakActiveClips = max (hsPeakActiveClips hs) (fromIntegral (rsPeakActiveClips rs))
+    }
+
+snapshotAudioHealth ∷ Word64 → HealthStats → AudioHealthSnapshot
+snapshotAudioHealth underruns hs =
+  AudioHealthSnapshot
+    { ahsUnderruns = underruns
+    , ahsLoopCount = hsLoopCount hs
+    , ahsRenderPassCount = hsRenderPassCount hs
+    , ahsFramesMixed = hsFramesMixed hs
+    , ahsFramesWritten = hsFramesWritten hs
+    , ahsPartialWrites = hsPartialWrites hs
+    , ahsZeroWrites = hsZeroWrites hs
+    , ahsMixDurationUs = hsMixDurationUs hs
+    , ahsPeakMixDurationUs = hsPeakMixDurationUs hs
+    , ahsPeakActiveVoices = hsPeakActiveVoices hs
+    , ahsPeakActiveClips = hsPeakActiveClips hs
     }
 
 emitHealthLog ∷ AudioHandle → Ptr MaRB → Word64 → HealthStats → IO ()
@@ -355,6 +428,10 @@ emitHealthLog h rb underruns hs = do
   availRead <- rbAvailableRead rb
   availWrite <- rbAvailableWrite rb
   let rbTotal = availRead + availWrite
+      avgMixUs =
+        if hsRenderPassCount hs == 0
+          then 0
+          else hsMixDurationUs hs `div` hsRenderPassCount hs
       rbFillPct ∷ Double
       rbFillPct =
         if rbTotal == 0
@@ -368,6 +445,10 @@ emitHealthLog h rb underruns hs = do
       <> " written=" <> show (hsFramesWritten hs)
       <> " partialWrites=" <> show (hsPartialWrites hs)
       <> " zeroWrites=" <> show (hsZeroWrites hs)
+      <> " renderPasses=" <> show (hsRenderPassCount hs)
+      <> " mixUs(avg/peak)=" <> show avgMixUs <> "/" <> show (hsPeakMixDurationUs hs)
+      <> " peakVoices=" <> show (hsPeakActiveVoices hs)
+      <> " peakClips=" <> show (hsPeakActiveClips hs)
 
 processMsgs ∷ AudioHandle → Ptr MaRB → AudioState → IO AudioState
 processMsgs h rb st = do

@@ -10,7 +10,7 @@ module Audio.Patch
 
 import Audio.Envelope (ADSR(..))
 import Audio.Filter.Biquad (FilterType(..))
-import Audio.Filter.Types (FilterSlope(..), FilterSpec(..), KeyTrack(..))
+import Audio.Filter.Types (FilterSlope(..), FilterSpec(..), FilterTarget(..), KeyTrack(..))
 import Audio.Types
 
 defaultMidiProgram ∷ Int
@@ -62,7 +62,7 @@ gmDrumInstrument key =
       | key < 41 -> snarePatch 0.1
       | key < 49 -> tomPatch 0.15
       | key < 57 -> crashPatch 0.25
-       | otherwise -> percussionPatch
+      | otherwise -> percussionPatch
 
 gmProgramInstrument ∷ Int → Instrument
 gmProgramInstrument program =
@@ -122,6 +122,7 @@ lpFilter cutoffHz q keyTrack envAmount envAdsr =
     , fQ = q
     , fSlope = S24
     , fKeyTrack = KeyTrack keyTrack
+    , fTarget = FilterTargetAll
     , fEnvAmountOct = envAmount
     , fEnvADSR = envAdsr
     , fQEnvAmount = 0
@@ -135,6 +136,7 @@ bpFilter cutoffHz q keyTrack envAmount envAdsr =
     , fQ = q
     , fSlope = S12
     , fKeyTrack = KeyTrack keyTrack
+    , fTarget = FilterTargetAll
     , fEnvAmountOct = envAmount
     , fEnvADSR = envAdsr
     , fQEnvAmount = 0
@@ -148,6 +150,7 @@ hpFilter cutoffHz q keyTrack envAmount envAdsr =
     , fQ = q
     , fSlope = S12
     , fKeyTrack = KeyTrack keyTrack
+    , fTarget = FilterTargetAll
     , fEnvAmountOct = envAmount
     , fEnvADSR = envAdsr
     , fQEnvAmount = 0
@@ -169,6 +172,7 @@ mkPatch layers spread adsr gain filt routes polyMax =
     , iAdsrDefault = adsr
     , iGain = gain
     , iFilter = filt
+    , iLfo1RateHz = 0
     , iModRoutes = routes
     , iPlayMode = Poly
     , iPolyMax = polyMax

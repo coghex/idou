@@ -5,6 +5,7 @@ module Midi.Play.Util
   , popHeldNote
   , enqueueDeferredRelease
   , takeDeferredReleases
+  , ticksToMicrosecondsEither
   , ticksToMicroseconds
   ) where
 
@@ -43,13 +44,20 @@ takeDeferredReleases ch deferred =
     Nothing -> ([], deferred)
     Just instIds -> (instIds, M.delete ch deferred)
 
+ticksToMicrosecondsEither ∷ Int → Int → Int → Either String Int
+ticksToMicrosecondsEither ppqn tempoUSPerQN dtTicks
+  | ppqn <= 0 = Left "ticksToMicroseconds: ppqn must be greater than 0"
+  | tempoUSPerQN < 0 = Left "ticksToMicroseconds: tempo must be non-negative"
+  | dtTicks <= 0 = Right 0
+  | otherwise =
+      let micros = (toInteger dtTicks * toInteger tempoUSPerQN) `div` toInteger ppqn
+      in
+        if micros > toInteger (maxBound ∷ Int)
+          then Left "ticksToMicroseconds: computed delay exceeds Int range"
+          else Right (fromInteger micros)
+
 ticksToMicroseconds ∷ Int → Int → Int → Int
-ticksToMicroseconds ppqn tempoUSPerQN dtTicks
-  | ppqn <= 0 = error "ticksToMicroseconds: ppqn must be greater than 0"
-  | tempoUSPerQN < 0 = error "ticksToMicroseconds: tempo must be non-negative"
-  | dtTicks <= 0 = 0
-  | micros > toInteger (maxBound ∷ Int) =
-      error "ticksToMicroseconds: computed delay exceeds Int range"
-  | otherwise = fromInteger micros
-  where
-    micros = (toInteger dtTicks * toInteger tempoUSPerQN) `div` toInteger ppqn
+ticksToMicroseconds ppqn tempoUSPerQN dtTicks =
+  case ticksToMicrosecondsEither ppqn tempoUSPerQN dtTicks of
+    Left err -> error err
+    Right micros -> micros

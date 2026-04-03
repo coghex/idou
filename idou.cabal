@@ -50,9 +50,11 @@ executable idou
                      Player.Thread
                      Player.Timeline
                      Player.Timeline.Arrangement
+                     Player.Timeline.Explain
                      Player.Timeline.Parse
                      Player.Timeline.Runtime
                      Player.Timeline.Types
+                     Perf.Baseline
                      Audio.Envelope
                     Audio.Oscillator
                     Audio.Filter
@@ -84,7 +86,11 @@ test-suite idou-tests
   hs-source-dirs:   test
                   , src
   main-is:          Main.hs
-  other-modules:    Audio.Config
+  other-modules:    TestSupport
+                    Tests.ConfigPatch
+                    Tests.Timeline
+                    Tests.Audio
+                    Audio.Config
                     Audio.Patch.Loader
                     Audio.Patch
                     Player.Instrument
@@ -95,13 +101,15 @@ test-suite idou-tests
                     Audio.Thread.Types
                     Audio.Thread.Render
                     Audio.Thread.Voice
-                     Audio.Thread.InstrumentTable
-                     Player.Automation
-                     Player.Timeline
-                     Player.Timeline.Arrangement
-                     Player.Timeline.Parse
+                    Audio.Thread.InstrumentTable
+                    Player.Automation
+                    Player.Timeline
+                    Player.Timeline.Arrangement
+                    Player.Timeline.Explain
+                    Player.Timeline.Parse
                      Player.Timeline.Runtime
                      Player.Timeline.Types
+                     Perf.Baseline
                      Audio.Envelope
                     Audio.Oscillator
                     Audio.Filter

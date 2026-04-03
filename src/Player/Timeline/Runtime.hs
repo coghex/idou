@@ -7,6 +7,7 @@ module Player.Timeline.Runtime
   , popRetargetTelemetry
   , popLookaheadTelemetry
   , popTransitionTelemetry
+  , stampLookaheadPerfMetrics
   , setTimelineGenre
   , timelineNextBarBoundaryFrame
   , timelineBoundarySpanFromNextBar
@@ -102,18 +103,20 @@ setTimelineGenre genreRaw rt = do
            ))
 
 popReadyBars ∷ Word64 → TimelineRuntime → ([TimelineBar], TimelineRuntime)
-popReadyBars now runtime = go [] (ensureGeneratedToHorizon "lookahead-horizon" now runtime)
+popReadyBars now runtime =
+  let rt0 = ensureGeneratedToHorizon "lookahead-horizon" now runtime
+      horizon = now + fromIntegral (trLookaheadBars rt0) * currentSectionBarFrames rt0
+  in go horizon [] rt0
   where
-    go acc rt =
+    go horizon acc rt =
       case nextBar rt of
         Nothing -> (reverse acc, dropConsumedBars rt)
         Just bar ->
           let barStartAbs = trStartFrame rt + tbStartOffsetFrames bar
-              lookaheadFrames = fromIntegral (trLookaheadBars rt) * tbLengthFrames bar
-              horizon = now + lookaheadFrames
           in if barStartAbs <= horizon
                then
                  go
+                   horizon
                    (bar : acc)
                    rt { trNextBarIx = trNextBarIx rt + 1 }
                else
@@ -179,7 +182,7 @@ firstFutureBoundary now rt =
 
 futureBarStartFrames ∷ Word64 → TimelineRuntime → [Word64]
 futureBarStartFrames now rt =
-  let seqIx = trNextBarIx rt - trBarOffset rt
+  let seqIx = max 0 (trNextBarIx rt - trBarOffset rt)
       futureBars = Seq.drop seqIx (trBars rt)
   in [ frame
      | bar <- toList futureBars
@@ -217,7 +220,7 @@ appendRetargetTelemetry policy rt =
           , trtEnergyTarget = trTargetEnergy rt
           , trtGenre = trSongGenre rt
           }
-  in rt { trPendingRetargets = event : trPendingRetargets rt }
+  in rt { trPendingRetargets = cappedPrepend event (trPendingRetargets rt) }
 
 appendLookaheadTelemetry ∷ String → TimelineRuntime → TimelineRuntime → TimelineRuntime
 appendLookaheadTelemetry reason before after =
@@ -234,13 +237,30 @@ appendLookaheadTelemetry reason before after =
                  , tltStartFrame = trStartFrame before + trNextBarOffset before
                  , tltEndFrame = trStartFrame after + trNextBarOffset after
                  , tltBufferedFutureBars = futureBufferedBarsCount after
-                 , tltMoodTarget = trTargetMood after
-                 , tltEnergyTarget = trTargetEnergy after
-                 , tltGenre = trSongGenre after
-                 , tltSeedStart = trRngState before
-                 , tltSeedEnd = trRngState after
-                 }
-         in after { trPendingLookahead = event : trPendingLookahead after }
+                  , tltMoodTarget = trTargetMood after
+                  , tltEnergyTarget = trTargetEnergy after
+                  , tltGenre = trSongGenre after
+                  , tltSeedStart = trRngState before
+                  , tltSeedEnd = trRngState after
+                  , tltGenerationDurationUs = Nothing
+                  , tltGenerationBarsPerSecond = Nothing
+                  }
+          in after { trPendingLookahead = cappedPrepend event (trPendingLookahead after) }
+
+stampLookaheadPerfMetrics ∷ Word64 → TimelineLookaheadTelemetry → TimelineLookaheadTelemetry
+stampLookaheadPerfMetrics durationUs telemetry =
+  let barsPerSecond
+        | durationUs <= 0 = Nothing
+        | otherwise =
+            Just
+              ( (fromIntegral (tltGeneratedBarCount telemetry) * 1000000)
+                  / fromIntegral durationUs
+              )
+  in
+    telemetry
+      { tltGenerationDurationUs = Just durationUs
+      , tltGenerationBarsPerSecond = barsPerSecond
+      }
 
 futureBufferedBarsCount ∷ TimelineRuntime → Int
 futureBufferedBarsCount rt =
@@ -344,7 +364,7 @@ advanceSection rt
             , trCurrentSectionBar = 0
             , trRngState = tcNextSeed choice
             , trTransitionCount = trTransitionCount rt + 1
-            , trPendingTransitions = tcTelemetry choice : trPendingTransitions rt
+            , trPendingTransitions = cappedPrepend (tcTelemetry choice) (trPendingTransitions rt)
             }
 
 data TransitionChoice = TransitionChoice
@@ -939,20 +959,23 @@ instrumentIdInt iid =
 initialSectionName ∷ SongSpec → String
 initialSectionName spec =
   case cueSectionOrder spec of
-    name : _ -> name
-    [] ->
+    name : _ | M.member name (sgSections spec) -> name
+    _ ->
       case M.keys (sgSections spec) of
         name : _ -> name
         [] -> ""
 
 nextBar ∷ TimelineRuntime → Maybe TimelineBar
 nextBar rt =
-  let seqIx = trNextBarIx rt - trBarOffset rt
+  let seqIx = max 0 (trNextBarIx rt - trBarOffset rt)
   in Seq.lookup seqIx (trBars rt)
 
 dropConsumedBars ∷ TimelineRuntime → TimelineRuntime
 dropConsumedBars rt =
-  let toDrop = min (trNextBarIx rt - trBarOffset rt) (Seq.length (trBars rt) - 1)
+  let consumed = trNextBarIx rt - trBarOffset rt
+      seqLen  = Seq.length (trBars rt)
+      keep    = if trDone rt then 1 else 0
+      toDrop  = max 0 (min consumed (seqLen - keep))
   in if toDrop <= 0
        then rt
        else rt { trBars = Seq.drop toDrop (trBars rt)
@@ -961,6 +984,12 @@ dropConsumedBars rt =
 
 trim ∷ String → String
 trim = dropWhileEnd isSpace . dropWhile isSpace
+
+maxPendingTelemetry ∷ Int
+maxPendingTelemetry = 256
+
+cappedPrepend ∷ a → [a] → [a]
+cappedPrepend x xs = x : take (maxPendingTelemetry - 1) xs
 
 dropWhileEnd ∷ (Char → Bool) → String → String
 dropWhileEnd p = reverse . dropWhile p . reverse

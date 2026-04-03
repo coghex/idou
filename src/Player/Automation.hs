@@ -192,7 +192,7 @@ automationCurveValue ∷ AutomationCurve → Double → Double
 automationCurveValue curve t0 =
   let t = clamp01D t0
   in case curve of
-       AutomationStep -> if t < 1 then 0 else 1
+       AutomationStep -> if t < 0.5 then 0 else 1
        AutomationLinear -> t
        AutomationEaseInOut -> t * t * (3 - 2 * t)
 

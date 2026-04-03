@@ -4,6 +4,7 @@ module Audio.Filter
   ( FilterType(..)
   , FilterSlope(..)
   , KeyTrack(..)
+  , FilterTarget(..)
   , FilterSpec(..)
   , FilterProfile(..)
   , FilterState(..)

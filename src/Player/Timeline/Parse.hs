@@ -10,7 +10,7 @@ module Player.Timeline.Parse
   , instrumentPatchOverrides
   ) where
 
-import Control.Exception (evaluate)
+import Control.Exception (SomeException, displayException, evaluate, try)
 import Data.Char (isAlpha, isAlphaNum, isDigit, isSpace, toLower)
 import Data.List (find, isInfixOf, nub, sortOn)
 import Data.Map.Strict (Map)
@@ -25,9 +25,13 @@ import Player.Timeline.Types
 
 loadSongSpec ∷ FilePath → IO (Either String SongSpec)
 loadSongSpec path = do
-  text <- readFile path
-  _ <- evaluate (length text)
-  pure (parseSongSpecText text >>= resolveSongSpecPatchPaths (takeDirectory path))
+  textResult <- try (readFile path >>= \text -> evaluate (length text) >> pure text) ∷ IO (Either SomeException String)
+  pure $
+    case textResult of
+      Left ex ->
+        Left ("Failed to read song spec " <> path <> ": " <> displayException ex)
+      Right text ->
+        parseSongSpecText text >>= resolveSongSpecPatchPaths (takeDirectory path)
 
 parseSongSpecText ∷ String → Either String SongSpec
 parseSongSpecText contents = do

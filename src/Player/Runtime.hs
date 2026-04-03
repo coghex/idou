@@ -10,8 +10,11 @@ module Player.Runtime
   , tryReadEvent
   , requestStatus
   , loadSong
+  , loadSongChecked
   , loadClipFile
+  , loadClipFileChecked
   , startSongNextBar
+  , startSongNextBarChecked
   , stopSong
   , pausePlayback
   , resumePlayback
@@ -63,7 +66,9 @@ import Player.Thread
   , clearPlayerGenreTarget
   , clearPlayerMoodTarget
   , loadPlayerClip
+  , loadPlayerClipChecked
   , loadPlayerSongTimeline
+  , loadPlayerSongTimelineChecked
   , nextBarFrame
   , panicPlayer
   , pausePlayer
@@ -83,6 +88,7 @@ import Player.Thread
   , setPlayerMoodTarget
   , setPlayerTempoBpm
   , startPlayerSongTimeline
+  , startPlayerSongTimelineChecked
   , startPlayerThread
   , stopPlayerBusNow
   , stopPlayerClipNow
@@ -114,13 +120,22 @@ requestStatus = requestPlayerStatus
 loadSong ∷ PlayerSystem → FilePath → IO ()
 loadSong = loadPlayerSongTimeline
 
+loadSongChecked ∷ PlayerSystem → FilePath → IO (Either String ())
+loadSongChecked = loadPlayerSongTimelineChecked
+
 -- | Immediate: decode and stage a clip asset for later playback.
 loadClipFile ∷ PlayerSystem → ClipId → FilePath → IO ()
 loadClipFile = loadPlayerClip
 
+loadClipFileChecked ∷ PlayerSystem → ClipId → FilePath → IO (Either String ())
+loadClipFileChecked = loadPlayerClipChecked
+
 -- | Next bar: begins the staged adaptive song on the next transport boundary.
 startSongNextBar ∷ PlayerSystem → IO ()
 startSongNextBar = startPlayerSongTimeline
+
+startSongNextBarChecked ∷ PlayerSystem → IO (Either String ())
+startSongNextBarChecked = startPlayerSongTimelineChecked
 
 -- | Immediate: stops the adaptive song timeline and clears active voices.
 stopSong ∷ PlayerSystem → IO ()

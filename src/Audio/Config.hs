@@ -6,9 +6,11 @@ module Audio.Config
   , AudioTelemetryConfig(..)
   , audioConfigPath
   , defaultAudioConfig
+  , loadAudioConfigEither
   , loadAudioConfig
   , parseAudioConfigText
   ) where
+import Control.Exception (SomeException, displayException, evaluate, try)
 import Data.List (intercalate)
 import Data.Word (Word32)
 
@@ -63,12 +65,26 @@ defaultAudioConfig =
           }
     }
 
+loadAudioConfigEither ∷ FilePath → IO (Either String AudioConfig)
+loadAudioConfigEither path = do
+  contentsResult <- try (readFile path >>= \contents -> evaluate (length contents) >> pure contents) ∷ IO (Either SomeException String)
+  pure $
+    case contentsResult of
+      Left ex ->
+        Left ("Failed to read audio config " <> path <> ": " <> displayException ex)
+      Right contents ->
+        case parseAudioConfigText contents of
+          Left err ->
+            Left ("Invalid audio config in " <> path <> ": " <> err)
+          Right cfg ->
+            Right cfg
+
 loadAudioConfig ∷ FilePath → IO AudioConfig
 loadAudioConfig path = do
-  contents <- readFile path
-  case parseAudioConfigText contents of
+  result <- loadAudioConfigEither path
+  case result of
     Left err ->
-      ioError (userError ("Invalid audio config in " <> path <> ": " <> err))
+      ioError (userError err)
     Right cfg ->
       pure cfg
 

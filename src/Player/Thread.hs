@@ -23,8 +23,11 @@ module Player.Thread
   , cancelPlayerEnergyAutomation
   , cancelPlayerMoodAutomation
   , loadPlayerSongTimeline
+  , loadPlayerSongTimelineChecked
   , startPlayerSongTimeline
+  , startPlayerSongTimelineChecked
   , stopPlayerSongTimeline
+  , loadPlayerClipChecked
   , schedulePlayerClipNextBar
   , schedulePlayerBusGainNextBar
   , schedulePlayerNoteOnNextBar
@@ -41,13 +44,14 @@ module Player.Thread
   ) where
 
 import Control.Concurrent (forkIO, threadDelay)
-import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.Exception (SomeException, displayException, finally, try)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, putMVar, takeMVar)
+import Control.Exception (SomeException, displayException, evaluate, finally, try)
 import Control.Monad (foldM)
 import Data.Char (isSpace, toLower)
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef, writeIORef)
 import Data.Maybe (fromMaybe)
 import Data.Word (Word32, Word64)
+import GHC.Clock (getMonotonicTimeNSec)
 
 import qualified Data.Sequence as Seq
 
@@ -87,12 +91,12 @@ import Player.Automation
   , stepEnergyLane
   , stepMoodLane
   )
-import Player.Instrument (loadResolvedInstrument, lookupInstrumentSpec, usesBuiltInDrumPatch)
+import Player.Instrument (loadResolvedInstrumentEither, lookupInstrumentSpec, usesBuiltInDrumPatch)
 import Player.Timeline
   ( InstrumentPatternSpec(..)
   , SongSpec
   , TimelineBar(..)
-  , TimelineLookaheadTelemetry
+  , TimelineLookaheadTelemetry(..)
   , TimelineNote(..)
   , TimelineRetargetTelemetry
   , TimelineTransitionTelemetry
@@ -103,17 +107,18 @@ import Player.Timeline
   , popRetargetTelemetry
   , popTransitionTelemetry
   , popReadyBars
-    , prepareTimelineRuntime
-    , setTimelineGenre
-    , setTimelineTargets
-    , sgGenre
-    , sgInstruments
-    , timelineBoundarySpanFromNextBar
-    , timelineNextBarBoundaryFrame
-    , timelineRuntimeDone
-    , timelineRuntimeEndFrame
-    , validateSongGenre
-    )
+  , prepareTimelineRuntime
+  , setTimelineGenre
+  , setTimelineTargets
+  , sgGenre
+  , sgInstruments
+  , stampLookaheadPerfMetrics
+  , timelineBoundarySpanFromNextBar
+  , timelineNextBarBoundaryFrame
+  , timelineRuntimeDone
+  , timelineRuntimeEndFrame
+  , validateSongGenre
+  )
 
 data PlayerMsg
   = PlayerShutdown
@@ -151,11 +156,23 @@ data PlayerMsg
   | PlayerLoadSongTimeline
       { pmSongPath ∷ !FilePath
       }
+  | PlayerLoadSongTimelineChecked
+      { pmSongPath ∷ !FilePath
+      , pmSongReply ∷ !(MVar (Either String ()))
+      }
   | PlayerLoadClip
       { pmLoadClipId   ∷ !ClipId
       , pmLoadClipPath ∷ !FilePath
       }
+  | PlayerLoadClipChecked
+      { pmLoadClipId   ∷ !ClipId
+      , pmLoadClipPath ∷ !FilePath
+      , pmLoadClipReply ∷ !(MVar (Either String ()))
+      }
   | PlayerStartSongTimeline
+  | PlayerStartSongTimelineChecked
+      { pmStartSongReply ∷ !(MVar (Either String ()))
+      }
   | PlayerStopSongTimeline
   | PlayerPlayClipNow
       { pmPlayClipId   ∷ !ClipId
@@ -214,7 +231,6 @@ data PlayerMsg
       { pmNoteOffInstrumentId ∷ !InstrumentId
       , pmNoteOffInstanceId ∷ !NoteInstanceId
       }
-  deriving (Eq, Show)
 
 data PlayerRuntimeStatus = PlayerRuntimeStatus
   { prsTransportFrame    ∷ !Word64
@@ -374,11 +390,29 @@ cancelPlayerMoodAutomation ps = sendPlayer ps PlayerCancelMoodAutomation
 loadPlayerSongTimeline ∷ PlayerSystem → FilePath → IO ()
 loadPlayerSongTimeline ps path = sendPlayer ps (PlayerLoadSongTimeline path)
 
+loadPlayerSongTimelineChecked ∷ PlayerSystem → FilePath → IO (Either String ())
+loadPlayerSongTimelineChecked ps path = do
+  reply <- newEmptyMVar
+  sendPlayer ps (PlayerLoadSongTimelineChecked path reply)
+  takeMVar reply
+
 loadPlayerClip ∷ PlayerSystem → ClipId → FilePath → IO ()
 loadPlayerClip ps clipId path = sendPlayer ps (PlayerLoadClip clipId path)
 
+loadPlayerClipChecked ∷ PlayerSystem → ClipId → FilePath → IO (Either String ())
+loadPlayerClipChecked ps clipId path = do
+  reply <- newEmptyMVar
+  sendPlayer ps (PlayerLoadClipChecked clipId path reply)
+  takeMVar reply
+
 startPlayerSongTimeline ∷ PlayerSystem → IO ()
 startPlayerSongTimeline ps = sendPlayer ps PlayerStartSongTimeline
+
+startPlayerSongTimelineChecked ∷ PlayerSystem → IO (Either String ())
+startPlayerSongTimelineChecked ps = do
+  reply <- newEmptyMVar
+  sendPlayer ps (PlayerStartSongTimelineChecked reply)
+  takeMVar reply
 
 stopPlayerSongTimeline ∷ PlayerSystem → IO ()
 stopPlayerSongTimeline ps = sendPlayer ps PlayerStopSongTimeline
@@ -510,10 +544,10 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
               Q.writeQueue evQ (PlayerEventGenreChangeRejected genreRaw err)
             Right currentGenre -> do
               let ps' = applyLiveTimelineSettings (ps { pstGenreTarget = genre' })
-              preloadResult <- try (preloadActiveTimelineInstruments audioSys ps') ∷ IO (Either SomeException ())
+              preloadResult <- preloadActiveTimelineInstruments audioSys ps'
               case preloadResult of
-                Left ex ->
-                  Q.writeQueue evQ (PlayerEventGenreChangeRejected genreRaw (displayException ex))
+                Left err ->
+                  Q.writeQueue evQ (PlayerEventGenreChangeRejected genreRaw err)
                 Right () -> do
                   writeIORef playerStateRef ps'
                   Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
@@ -524,10 +558,10 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
               Q.writeQueue evQ (PlayerEventGenreChangeRejected "<default>" err)
             Right currentGenre -> do
               let ps' = applyLiveTimelineSettings (ps { pstGenreTarget = Nothing })
-              preloadResult <- try (preloadActiveTimelineInstruments audioSys ps') ∷ IO (Either SomeException ())
+              preloadResult <- preloadActiveTimelineInstruments audioSys ps'
               case preloadResult of
-                Left ex ->
-                  Q.writeQueue evQ (PlayerEventGenreChangeRejected "<default>" (displayException ex))
+                Left err ->
+                  Q.writeQueue evQ (PlayerEventGenreChangeRejected "<default>" err)
                 Right () -> do
                   writeIORef playerStateRef ps'
                   Q.writeQueue evQ (PlayerEventGenreChanged currentGenre)
@@ -548,13 +582,13 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerAutomateEnergyNextBar target bars curve -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let (lane, ps') = mkEnergyLane audioSys now target bars curve ps
+          (lane, ps') <- mkEnergyLane audioSys now target bars curve ps
           writeIORef playerStateRef ps' { pstEnergyLane = Just lane }
         PlayerAutomateMoodNextBar moodRaw bars -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
           let target = normalizeMoodTarget moodRaw
-              (lane, ps') = mkMoodLane audioSys now target bars ps
+          (lane, ps') <- mkMoodLane audioSys now target bars ps
           writeIORef playerStateRef ps' { pstMoodLane = Just lane }
         PlayerCancelEnergyAutomation -> do
           ps <- readIORef playerStateRef
@@ -568,72 +602,18 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           case pstMoodLane ps of
             Nothing -> pure ()
             Just _ -> Q.writeQueue evQ PlayerEventMoodAutomationCanceled
-        PlayerLoadSongTimeline path -> do
-          loaded <- loadSongSpec path
-          case loaded of
-            Left err ->
-              Q.writeQueue evQ (PlayerEventTimelineLoadFailed path err)
-            Right spec -> do
-              preloadResult <- try (preloadInstrumentSpecs audioSys (sgInstruments spec)) ∷ IO (Either SomeException ())
-              case preloadResult of
-                Left ex ->
-                  Q.writeQueue evQ (PlayerEventTimelineLoadFailed path (displayException ex))
-                Right () -> do
-                  let bars = compileTimelineBars (sampleRate (asHandle audioSys)) spec
-                  case bars of
-                    [] -> pure ()
-                    firstBar : _ -> do
-                      modifyIORef'
-                        playerStateRef
-                        ( \s ->
-                            s
-                              { pstBeatsPerBar = tbBeatsPerBar firstBar
-                              , pstTempoBpm = tbTempoBpm firstBar
-                              }
-                        )
-                      sendAudio audioSys (AudioSetTransportBpm (tbTempoBpm firstBar))
-                  modifyIORef'
-                    playerStateRef
-                    (\s -> s { pstSongSpec = Just spec, pstGenreTarget = Nothing, pstTimeline = Nothing })
-                  Q.writeQueue evQ (PlayerEventTimelineLoaded path)
+        PlayerLoadSongTimeline path ->
+          handleLoadSongTimeline path Nothing
+        PlayerLoadSongTimelineChecked path reply ->
+          handleLoadSongTimeline path (Just reply)
         PlayerLoadClip clipId path -> do
-          loaded <- try (loadClipFromFile audioSys clipId path) ∷ IO (Either SomeException ())
-          case loaded of
-            Left ex ->
-              Q.writeQueue evQ (PlayerEventClipLoadFailed clipId path (displayException ex))
-            Right () ->
-              Q.writeQueue evQ (PlayerEventClipLoaded clipId path)
-        PlayerStartSongTimeline -> do
-          ps <- readIORef playerStateRef
-          case pstSongSpec ps of
-            Nothing ->
-              Q.writeQueue
-                evQ
-                (PlayerEventTimelineLoadFailed "<runtime>" "no song loaded")
-            Just spec -> do
-              now <- readTransportFrame audioSys
-              let frame =
-                    nextBarFrame
-                      now
-                      (sampleRate (asHandle audioSys))
-                      (pstBeatsPerBar ps)
-                      (pstTempoBpm ps)
-                  runtime =
-                    applyLiveTimelineRuntime
-                      ps
-                      ( prepareTimelineRuntime
-                          (sampleRate (asHandle audioSys))
-                          frame
-                          spec
-                      )
-                  estimatedBars = max 1 (length (compileTimelineBars (sampleRate (asHandle audioSys)) spec))
-              preloadResult <- try (preloadInstrumentSpecs audioSys (trInstruments runtime)) ∷ IO (Either SomeException ())
-              case preloadResult of
-                Left ex ->
-                  Q.writeQueue evQ (PlayerEventTimelineLoadFailed "<runtime>" (displayException ex))
-                Right () -> do
-                  modifyIORef' playerStateRef (\s -> s { pstTimeline = Just runtime })
-                  Q.writeQueue evQ (PlayerEventTimelineStarted frame estimatedBars)
+          handleLoadClip clipId path Nothing
+        PlayerLoadClipChecked clipId path reply ->
+          handleLoadClip clipId path (Just reply)
+        PlayerStartSongTimeline ->
+          handleStartSongTimeline Nothing
+        PlayerStartSongTimelineChecked reply ->
+          handleStartSongTimeline (Just reply)
         PlayerStopSongTimeline -> do
           modifyIORef' playerStateRef (\s -> s { pstTimeline = Nothing })
           sendAudio audioSys AudioStopAll
@@ -679,7 +659,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerScheduleClipNextBar cid bus gain pan loop -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          (frame, ps') <- resolveNextBarBoundary audioSys now ps
           writeIORef playerStateRef ps'
           let
               action =
@@ -695,7 +675,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerScheduleBusGainNextBar bus gain -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          (frame, ps') <- resolveNextBarBoundary audioSys now ps
           writeIORef playerStateRef ps'
           let
               action = ScheduledSetBusGain bus gain
@@ -704,7 +684,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerScheduleNoteOnNextBar bus iid amp pan key noteInst vel adsrOverride -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          (frame, ps') <- resolveNextBarBoundary audioSys now ps
           writeIORef playerStateRef ps'
           let
               action =
@@ -723,7 +703,7 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
         PlayerScheduleNoteOffNextBar iid noteInst -> do
           ps <- readIORef playerStateRef
           now <- readTransportFrame audioSys
-          let (frame, ps') = resolveNextBarBoundary audioSys now ps
+          (frame, ps') <- resolveNextBarBoundary audioSys now ps
           writeIORef playerStateRef ps'
           let
               action =
@@ -734,6 +714,92 @@ processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef = do
           scheduleAudioActionAtFrame audioSys frame action
           Q.writeQueue evQ (PlayerEventScheduled frame action)
       processPlayerMsgs audioSys controlRef msgQ evQ playerStateRef
+  where
+    finishReply :: Maybe (MVar (Either String ())) -> Either String () -> IO ()
+    finishReply mReply result =
+      case mReply of
+        Nothing -> pure ()
+        Just reply -> putMVar reply result
+
+    handleLoadSongTimeline :: FilePath -> Maybe (MVar (Either String ())) -> IO ()
+    handleLoadSongTimeline path mReply = do
+      loaded <- loadSongSpec path
+      case loaded of
+        Left err -> do
+          Q.writeQueue evQ (PlayerEventTimelineLoadFailed path err)
+          finishReply mReply (Left err)
+        Right spec -> do
+          preloadResult <- preloadInstrumentSpecs audioSys (sgInstruments spec)
+          case preloadResult of
+            Left err -> do
+              Q.writeQueue evQ (PlayerEventTimelineLoadFailed path err)
+              finishReply mReply (Left err)
+            Right () -> do
+              let bars = compileTimelineBars (sampleRate (asHandle audioSys)) spec
+              case bars of
+                [] -> pure ()
+                firstBar : _ -> do
+                  modifyIORef'
+                    playerStateRef
+                    ( \s ->
+                        s
+                          { pstBeatsPerBar = tbBeatsPerBar firstBar
+                          , pstTempoBpm = tbTempoBpm firstBar
+                          }
+                    )
+                  sendAudio audioSys (AudioSetTransportBpm (tbTempoBpm firstBar))
+              modifyIORef'
+                playerStateRef
+                (\s -> s { pstSongSpec = Just spec, pstGenreTarget = Nothing, pstTimeline = Nothing })
+              Q.writeQueue evQ (PlayerEventTimelineLoaded path)
+              finishReply mReply (Right ())
+
+    handleStartSongTimeline :: Maybe (MVar (Either String ())) -> IO ()
+    handleStartSongTimeline mReply = do
+      ps <- readIORef playerStateRef
+      case pstSongSpec ps of
+        Nothing -> do
+          let err = "no song loaded"
+          Q.writeQueue evQ (PlayerEventTimelineLoadFailed "<runtime>" err)
+          finishReply mReply (Left err)
+        Just spec -> do
+          now <- readTransportFrame audioSys
+          let frame =
+                nextBarFrame
+                  now
+                  (sampleRate (asHandle audioSys))
+                  (pstBeatsPerBar ps)
+                  (pstTempoBpm ps)
+              runtime =
+                applyLiveTimelineRuntime
+                  ps
+                  ( prepareTimelineRuntime
+                      (sampleRate (asHandle audioSys))
+                      frame
+                      spec
+                  )
+              estimatedBars = max 1 (length (compileTimelineBars (sampleRate (asHandle audioSys)) spec))
+          preloadResult <- preloadInstrumentSpecs audioSys (trInstruments runtime)
+          case preloadResult of
+            Left err -> do
+              Q.writeQueue evQ (PlayerEventTimelineLoadFailed "<runtime>" err)
+              finishReply mReply (Left err)
+            Right () -> do
+              modifyIORef' playerStateRef (\s -> s { pstTimeline = Just runtime })
+              Q.writeQueue evQ (PlayerEventTimelineStarted frame estimatedBars)
+              finishReply mReply (Right ())
+
+    handleLoadClip :: ClipId -> FilePath -> Maybe (MVar (Either String ())) -> IO ()
+    handleLoadClip clipId path mReply = do
+      loaded <- try (loadClipFromFile audioSys clipId path) ∷ IO (Either SomeException ())
+      case loaded of
+        Left ex -> do
+          let err = displayException ex
+          Q.writeQueue evQ (PlayerEventClipLoadFailed clipId path err)
+          finishReply mReply (Left err)
+        Right () -> do
+          Q.writeQueue evQ (PlayerEventClipLoaded clipId path)
+          finishReply mReply (Right ())
 
 applyLiveTimelineSettings ∷ PlayerState → PlayerState
 applyLiveTimelineSettings ps =
@@ -760,22 +826,33 @@ applyLiveTimelineRuntime ps timeline =
             Left _ -> timeline'
             Right timeline'' -> timeline''
 
-preloadActiveTimelineInstruments ∷ AudioSystem → PlayerState → IO ()
+preloadActiveTimelineInstruments ∷ AudioSystem → PlayerState → IO (Either String ())
 preloadActiveTimelineInstruments audioSys ps =
   case pstTimeline ps of
-    Nothing -> pure ()
+    Nothing -> pure (Right ())
     Just timeline -> preloadInstrumentSpecs audioSys (trInstruments timeline)
 
-preloadInstrumentSpecs ∷ AudioSystem → [InstrumentPatternSpec] → IO ()
-preloadInstrumentSpecs audioSys =
-  mapM_ preloadInstrument
+preloadInstrumentSpecs ∷ AudioSystem → [InstrumentPatternSpec] → IO (Either String ())
+preloadInstrumentSpecs audioSys = go
   where
+    go [] = pure (Right ())
+    go (spec : rest) = do
+      result <- preloadInstrument spec
+      case result of
+        Left err -> pure (Left err)
+        Right () -> go rest
+
     preloadInstrument spec =
       if usesBuiltInDrumPatch spec
-        then pure ()
+        then pure (Right ())
         else do
-          inst <- loadResolvedInstrument spec
-          sendAudio audioSys (AudioLoadInstrument (ipInstrumentId spec) inst)
+          instResult <- loadResolvedInstrumentEither spec
+          case instResult of
+            Left err ->
+              pure (Left err)
+            Right inst -> do
+              sendAudio audioSys (AudioLoadInstrument (ipInstrumentId spec) inst)
+              pure (Right ())
 
 normalizeMoodTarget ∷ String → Maybe String
 normalizeMoodTarget raw =
@@ -876,8 +953,8 @@ pumpTimeline audioSys evQ playerStateRef = do
   case pstTimeline ps of
     Nothing -> pure ()
     Just runtime -> do
-      let (readyBars, runtime1) = popReadyBars now runtime
-          (retargetTelemetry, runtime2) = popRetargetTelemetry runtime1
+      (readyBars, runtime1) <- timedPopReadyBars now runtime
+      let (retargetTelemetry, runtime2) = popRetargetTelemetry runtime1
           (lookaheadTelemetry, runtime3) = popLookaheadTelemetry runtime2
           (transitionTelemetry, runtime4) = popTransitionTelemetry runtime3
       mapM_ (Q.writeQueue evQ . PlayerEventTimelineRetargeted) retargetTelemetry
@@ -966,7 +1043,7 @@ applyMoodAutomation now ps =
         MoodLaneCompleted endF finalM ->
           PlayerEventMoodAutomationCompleted endF finalM
 
-resolveNextBarBoundary ∷ AudioSystem → Word64 → PlayerState → (Word64, PlayerState)
+resolveNextBarBoundary ∷ AudioSystem → Word64 → PlayerState → IO (Word64, PlayerState)
 resolveNextBarBoundary audioSys now ps =
   let fallback =
         nextBarFrame
@@ -976,11 +1053,11 @@ resolveNextBarBoundary audioSys now ps =
           (pstTempoBpm ps)
   in
     case pstTimeline ps of
-      Nothing -> (fallback, ps)
-      Just runtime ->
-        let (mFrame, runtime') = timelineNextBarBoundaryFrame now runtime
-            frame = maybe fallback id mFrame
-        in (frame, ps { pstTimeline = Just runtime' })
+      Nothing -> pure (fallback, ps)
+      Just runtime -> do
+        (mFrame, runtime') <- timedNextBarBoundary now runtime
+        let frame = maybe fallback id mFrame
+        pure (frame, ps { pstTimeline = Just runtime' })
 
 mkEnergyLane
   ∷ AudioSystem
@@ -989,7 +1066,7 @@ mkEnergyLane
   → Int
   → AutomationCurve
   → PlayerState
-  → (EnergyLane, PlayerState)
+  → IO (EnergyLane, PlayerState)
 mkEnergyLane audioSys now target bars curve ps =
   let fallback =
         scheduleEnergyLaneNextBar
@@ -1003,10 +1080,10 @@ mkEnergyLane audioSys now target bars curve ps =
           curve
   in
     case pstTimeline ps of
-      Nothing -> (fallback, ps)
-      Just runtime ->
-        let (mSpan, runtime') = timelineBoundarySpanFromNextBar now bars runtime
-            lane =
+      Nothing -> pure (fallback, ps)
+      Just runtime -> do
+        (mSpan, runtime') <- timedBoundarySpan now bars runtime
+        let lane =
               case mSpan of
                 Just (startFrame, endFrame) ->
                   EnergyLane
@@ -1018,7 +1095,7 @@ mkEnergyLane audioSys now target bars curve ps =
                     , elStarted = False
                     }
                 Nothing -> fallback
-        in (lane, ps { pstTimeline = Just runtime' })
+        pure (lane, ps { pstTimeline = Just runtime' })
 
 mkMoodLane
   ∷ AudioSystem
@@ -1026,7 +1103,7 @@ mkMoodLane
   → Maybe String
   → Int
   → PlayerState
-  → (MoodLane, PlayerState)
+  → IO (MoodLane, PlayerState)
 mkMoodLane audioSys now target bars ps =
   let fallback =
         scheduleMoodLaneNextBar
@@ -1039,10 +1116,10 @@ mkMoodLane audioSys now target bars ps =
           bars
   in
     case pstTimeline ps of
-      Nothing -> (fallback, ps)
-      Just runtime ->
-        let (mSpan, runtime') = timelineBoundarySpanFromNextBar now bars runtime
-            lane =
+      Nothing -> pure (fallback, ps)
+      Just runtime -> do
+        (mSpan, runtime') <- timedBoundarySpan now bars runtime
+        let lane =
               case mSpan of
                 Just (startFrame, endFrame) ->
                   MoodLane
@@ -1053,7 +1130,73 @@ mkMoodLane audioSys now target bars ps =
                     , mlStarted = False
                     }
                 Nothing -> fallback
-        in (lane, ps { pstTimeline = Just runtime' })
+        pure (lane, ps { pstTimeline = Just runtime' })
+
+timedPopReadyBars ∷ Word64 → TimelineRuntime → IO ([TimelineBar], TimelineRuntime)
+timedPopReadyBars now runtime = do
+  startNs <- getMonotonicTimeNSec
+  let (readyBars, runtime') = popReadyBars now runtime
+  _ <- evaluate (length readyBars)
+  _ <- evaluate (trGeneratedBarCount runtime')
+  _ <- evaluate (length (trPendingLookahead runtime'))
+  endNs <- getMonotonicTimeNSec
+  pure
+    ( readyBars
+    , annotateNewLookaheadPerfMetrics
+        (nanosecondsToMicroseconds (endNs - startNs))
+        runtime
+        runtime'
+    )
+
+timedNextBarBoundary ∷ Word64 → TimelineRuntime → IO (Maybe Word64, TimelineRuntime)
+timedNextBarBoundary now runtime = do
+  startNs <- getMonotonicTimeNSec
+  let (mFrame, runtime') = timelineNextBarBoundaryFrame now runtime
+  _ <- evaluate mFrame
+  _ <- evaluate (trGeneratedBarCount runtime')
+  _ <- evaluate (length (trPendingLookahead runtime'))
+  endNs <- getMonotonicTimeNSec
+  pure
+    ( mFrame
+    , annotateNewLookaheadPerfMetrics
+        (nanosecondsToMicroseconds (endNs - startNs))
+        runtime
+        runtime'
+    )
+
+timedBoundarySpan ∷ Word64 → Int → TimelineRuntime → IO (Maybe (Word64, Word64), TimelineRuntime)
+timedBoundarySpan now bars runtime = do
+  startNs <- getMonotonicTimeNSec
+  let (mSpan, runtime') = timelineBoundarySpanFromNextBar now bars runtime
+  _ <- evaluate mSpan
+  _ <- evaluate (trGeneratedBarCount runtime')
+  _ <- evaluate (length (trPendingLookahead runtime'))
+  endNs <- getMonotonicTimeNSec
+  pure
+    ( mSpan
+    , annotateNewLookaheadPerfMetrics
+        (nanosecondsToMicroseconds (endNs - startNs))
+        runtime
+        runtime'
+    )
+
+annotateNewLookaheadPerfMetrics ∷ Word64 → TimelineRuntime → TimelineRuntime → TimelineRuntime
+annotateNewLookaheadPerfMetrics durationUs before after =
+  let beforeCount = length (trPendingLookahead before)
+      afterPending = trPendingLookahead after
+      newCount = max 0 (length afterPending - beforeCount)
+      (newEvents, priorEvents) = splitAt newCount afterPending
+  in
+    if newCount <= 0
+      then after
+      else
+        after
+          { trPendingLookahead =
+              map (stampLookaheadPerfMetrics durationUs) newEvents <> priorEvents
+          }
+
+nanosecondsToMicroseconds ∷ Word64 → Word64
+nanosecondsToMicroseconds ns = ns `div` 1000
 
 scheduleTimelineBar
   ∷ AudioSystem

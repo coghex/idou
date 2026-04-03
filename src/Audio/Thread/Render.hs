@@ -10,6 +10,7 @@ module Audio.Thread.Render
 import Control.Monad (when)
 import Foreign
 import Foreign.C
+import GHC.Clock (getMonotonicTimeNSec)
 
 import qualified Data.Vector.Mutable as MV
 import qualified Data.Vector.Unboxed as VU
@@ -64,10 +65,13 @@ data RenderStats = RenderStats
   , rsFramesWritten ∷ !Int
   , rsPartialWrites ∷ !Int
   , rsZeroWrites    ∷ !Int
+  , rsPeakActiveVoices ∷ !Int
+  , rsPeakActiveClips  ∷ !Int
+  , rsMixDurationUs    ∷ !Word64
   } deriving (Eq, Show)
 
 emptyRenderStats ∷ RenderStats
-emptyRenderStats = RenderStats 0 0 0 0
+emptyRenderStats = RenderStats 0 0 0 0 0 0 0
 
 renderIfNeeded
   ∷ Queue AudioEvent
@@ -80,6 +84,7 @@ renderIfNeeded eventsQ runScheduled rb chunkFrames st0 = do
   if chunkFrames <= 0
     then error "renderIfNeeded: chunkFrames must be > 0"
     else do
+      startNs <- getMonotonicTimeNSec
       let targetFrames = stTargetBufferFrames st0
           loop stats st = do
             availRead  <- rbAvailableRead rb
@@ -88,20 +93,38 @@ renderIfNeeded eventsQ runScheduled rb chunkFrames st0 = do
               then pure (st, stats)
               else do
                 let framesNow = min chunkFrames (fromIntegral availWrite)
+                    stats0 = noteRenderLoad st stats
                 (st', wroteFrames) <- renderChunkFrames eventsQ runScheduled rb framesNow st
                 let partialWrite = if wroteFrames < framesNow then 1 else 0
                     zeroWrite = if wroteFrames <= 0 then 1 else 0
+                    stats1 = noteRenderLoad st' stats0
                     stats' =
-                      RenderStats
-                        { rsFramesMixed = rsFramesMixed stats + framesNow
-                        , rsFramesWritten = rsFramesWritten stats + wroteFrames
-                        , rsPartialWrites = rsPartialWrites stats + partialWrite
-                        , rsZeroWrites = rsZeroWrites stats + zeroWrite
+                      stats1
+                        { rsFramesMixed = rsFramesMixed stats1 + framesNow
+                        , rsFramesWritten = rsFramesWritten stats1 + wroteFrames
+                        , rsPartialWrites = rsPartialWrites stats1 + partialWrite
+                        , rsZeroWrites = rsZeroWrites stats1 + zeroWrite
                         }
                 if wroteFrames <= 0
                   then pure (st', stats')
                   else loop stats' st'
-      loop emptyRenderStats st0
+      (stFinal, stats0) <- loop emptyRenderStats st0
+      endNs <- getMonotonicTimeNSec
+      let stats =
+            if rsFramesMixed stats0 <= 0
+              then stats0
+              else stats0 { rsMixDurationUs = nanosecondsToMicroseconds (endNs - startNs) }
+      pure (stFinal, stats)
+
+noteRenderLoad ∷ AudioState → RenderStats → RenderStats
+noteRenderLoad st stats =
+  stats
+    { rsPeakActiveVoices = max (rsPeakActiveVoices stats) (stActiveCount st)
+    , rsPeakActiveClips = max (rsPeakActiveClips stats) (stClipActiveCount st)
+    }
+
+nanosecondsToMicroseconds ∷ Word64 → Word64
+nanosecondsToMicroseconds ns = ns `div` 1000
 
 renderChunkFrames
   ∷ Queue AudioEvent
@@ -330,7 +353,6 @@ mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouc
       retuneEvery = 16 ∷ Int
       modEvery = 16 ∷ Int
       centsToRatio c = 2 ** (c / 1200)
-      maxRoutes = 8 ∷ Int
       pitchModRatScratch = stPitchModScratch st
       pitchCentsScratch = stPitchCentsScratch st
       baseAmp = stereoAmp (vBaseAmpL v0) (vBaseAmpR v0)
@@ -338,11 +360,16 @@ mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouc
       finalPan = clampPan (basePan + channelPan)
       busGain = busGainFor st (vBus v0)
       (voiceAmpL0, voiceAmpR0) = panGains (baseAmp * vInstrGain v0 * channelGain * busGain) finalPan
-      lfoRateHz
+      vibLfoRateHz
         | vibRateHz > 0 = vibRateHz
         | modWheel > 0 = defaultModWheelLfoRateHz
         | otherwise = 0
+      patchLfoRateHz = max 0 (vLfo1RateHz v0)
+      lfo1RateHz
+        | patchLfoRateHz > 0 = patchLfoRateHz
+        | otherwise = vibLfoRateHz
       lfoScale
+        | patchLfoRateHz > 0 = 1
         | vibRateHz > 0 = 1
         | otherwise = modWheel
       vibDepthCentsEff
@@ -359,20 +386,20 @@ mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouc
 
             -- vibrato ratio (pitch vibrato)
             let phV0 = vVibPhase v
-                vibOn = lfoRateHz > 0 && vibDepthCentsEff > 0
+                vibOn = vibLfoRateHz > 0 && vibDepthCentsEff > 0
                 vibCents = if vibOn then vibDepthCentsEff * sin (2*pi*phV0) else 0
                 vibRatio = if vibOn then centsToRatio vibCents else 1
                 phV1 =
                   if vibOn
-                    then let x = phV0 + (lfoRateHz / srF)
+                    then let x = phV0 + (vibLfoRateHz / srF)
                          in x - fromIntegral (floor x ∷ Int)
                     else phV0
 
-            -- LFO1 phase follows the vibrato rate, or a mod-wheel fallback rate.
+            -- LFO1 can follow a patch-local rate, or fall back to the existing vibrato/mod-wheel timing.
             let phL0 = vLfo1Phase v
                 phL1 =
-                  if lfoRateHz > 0
-                    then let x = phL0 + (lfoRateHz / srF)
+                  if lfo1RateHz > 0
+                    then let x = phL0 + (lfo1RateHz / srF)
                          in x - fromIntegral (floor x ∷ Int)
                     else phL0
 
@@ -380,21 +407,35 @@ mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouc
             (ampModMul, filtModOct', v') <-
               if tick `mod` modEvery == 0
                 then do
-                  let lfo1Value = lfoScale * sin (2*pi*phL1)
-                  (ampMul, fOct) <- computeMods maxRoutes lfo1Value envAmp channelAftertouch (vNoteAftertouch v) v pitchCentsScratch pitchModRatScratch
+                  let lfo1Value
+                        | lfo1RateHz > 0 = lfoScale * sin (2*pi*phL1)
+                        | otherwise = 0
+                  (ampMul, fOct) <- computeMods maxModRoutes lfo1Value envAmp channelAftertouch (vNoteAftertouch v) v pitchCentsScratch pitchModRatScratch
                   pure (ampMul, fOct, v)
                 else pure (1, filtModOct, v)
 
             let nOsc = vOscCount v'
                 bentNoteHz = vNoteHz v' * bendRatio
-            (xL0, xR0) <- stepOscsSync4StereoMod srF bentNoteHz nOsc vibRatio pitchModRatScratch v'
-            let xMono = 0.5 * (xL0 + xR0)
+            (layer0Mono, layer1Mono, layer2Mono, layer3Mono) <- stepOscsSync4MonoLayersMod srF bentNoteHz nOsc vibRatio pitchModRatScratch v'
+            let xMono = layer0Mono + layer1Mono + layer2Mono + layer3Mono
 
             let (mfilt1, mfenv1, tick1, x1) =
                   case vFilter v' of
                     Nothing -> (Nothing, vFiltEnv v', vFiltTick v', xMono)
                     Just fs0 ->
                       let spec = fsSpec fs0
+                          targetInput =
+                            case fTarget spec of
+                              FilterTargetAll -> xMono
+                              FilterTargetLayer 0 -> layer0Mono
+                              FilterTargetLayer 1 -> layer1Mono
+                              FilterTargetLayer 2 -> layer2Mono
+                              FilterTargetLayer 3 -> layer3Mono
+                              FilterTargetLayer _ -> 0
+                          dryInput =
+                            case fTarget spec of
+                              FilterTargetAll -> 0
+                              FilterTargetLayer _ -> xMono - targetInput
                           tick0 = vFiltTick v'
                           tickN = tick0 + 1
                           (mfenvN, envLvl) =
@@ -417,8 +458,8 @@ mixOneVoice srF chunkFrames out channelGain channelPan modWheel channelAftertouc
                             if (fEnvAmountOct spec /= 0 || fQEnvAmount spec /= 0 || filtModOct' /= 0) && (tickN `mod` retuneEvery == 0)
                               then filterRetune srF cutoffHz qEff fs0
                               else fs0
-                          (fs1, y0) = filterStep srF fsRetuned xMono
-                      in (Just fs1, mfenvN, tickN, y0)
+                          (fs1, y0) = filterStep srF fsRetuned targetInput
+                      in (Just fs1, mfenvN, tickN, dryInput + y0)
 
             let ampL = voiceAmpL0 * ampModMul
                 ampR = voiceAmpR0 * ampModMul
@@ -516,9 +557,9 @@ keyTrack01 hz =
       x = (logBase 2 h - logBase 2 55) / (logBase 2 1760 - logBase 2 55)
   in max 0 (min 1 x)
 
-stepOscsSync4StereoMod
-  :: Float -> Float -> Int -> Float -> MV.IOVector Float -> Voice -> IO (Float, Float)
-stepOscsSync4StereoMod srF baseHz n vibRatio pitchModRat v = do
+stepOscsSync4MonoLayersMod
+  :: Float -> Float -> Int -> Float -> MV.IOVector Float -> Voice -> IO (Float, Float, Float, Float)
+stepOscsSync4MonoLayersMod srF baseHz n vibRatio pitchModRat v = do
 
   let stepOne li wm0 wm1 wm2 wm3 = do
         osc0 <- MV.read (vOscs v) li
@@ -545,15 +586,16 @@ stepOscsSync4StereoMod srF baseHz n vibRatio pitchModRat v = do
 
         MV.write (vOscs v) li osc1
         let xScaled = lvl * x
-        pure ((xScaled * gL, xScaled * gR), wrapped)
+            xMono = xScaled * (0.5 * (gL + gR))
+        pure (xMono, wrapped)
 
-  ((x0L, x0R), w0) <-
-    if n > 0 then stepOne 0 False False False False else pure ((0,0), False)
-  ((x1L, x1R), w1) <-
-    if n > 1 then stepOne 1 w0 False False False else pure ((0,0), False)
-  ((x2L, x2R), w2) <-
-    if n > 2 then stepOne 2 w0 w1 False False else pure ((0,0), False)
-  ((x3L, x3R), _w3) <-
-    if n > 3 then stepOne 3 w0 w1 w2 False else pure ((0,0), False)
+  (x0, w0) <-
+    if n > 0 then stepOne 0 False False False False else pure (0, False)
+  (x1, w1) <-
+    if n > 1 then stepOne 1 w0 False False False else pure (0, False)
+  (x2, w2) <-
+    if n > 2 then stepOne 2 w0 w1 False False else pure (0, False)
+  (x3, _w3) <-
+    if n > 3 then stepOne 3 w0 w1 w2 False else pure (0, False)
 
-  pure (x0L + x1L + x2L + x3L, x0R + x1R + x2R + x3R)
+  pure (x0, x1, x2, x3)

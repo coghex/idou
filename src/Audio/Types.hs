@@ -125,6 +125,7 @@ data Instrument = Instrument
   , iAdsrDefault ∷ !ADSR
   , iGain        ∷ !Float
   , iFilter      ∷ !(Maybe FilterSpec)
+  , iLfo1RateHz  ∷ !Float
   , iModRoutes   ∷ ![ModRoute]
   , iPlayMode    ∷ !PlayMode
   , iPolyMax     ∷ !Int

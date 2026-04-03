@@ -5,6 +5,7 @@ module Audio.Filter.Types
   , FilterSlope(..)
   , slopeStages
   , KeyTrack(..)
+  , FilterTarget(..)
   , FilterSpec(..)
   , FilterProfile(..)
   ) where
@@ -31,12 +32,18 @@ slopeStages s =
 newtype KeyTrack = KeyTrack Float
   deriving (Eq, Show)
 
+data FilterTarget
+  = FilterTargetAll
+  | FilterTargetLayer !Int
+  deriving (Eq, Show)
+
 data FilterSpec = FilterSpec
   { fType         ∷ !FilterType
   , fCutoffHz     ∷ !Float
   , fQ            ∷ !Float
   , fSlope        ∷ !FilterSlope
   , fKeyTrack     ∷ !KeyTrack
+  , fTarget       ∷ !FilterTarget
 
   -- Envelope -> cutoff in octaves:
   , fEnvAmountOct ∷ !Float

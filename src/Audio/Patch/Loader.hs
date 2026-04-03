@@ -10,11 +10,16 @@ module Audio.Patch.Loader
   , OutputNode(..)
   , PatchConnection(..)
   , ConnectionKind(..)
+  , PatchModulation(..)
+  , PatchModulationDestination(..)
   , parsePatchGraphText
   , compilePatchGraph
   , compilePatchText
+  , loadInstrumentPatchEither
   , loadInstrumentPatch
   ) where
+
+import Control.Exception (SomeException, displayException, evaluate, try)
 
 import Data.Char (isAlphaNum, toLower)
 import Data.List (nub)
@@ -25,8 +30,8 @@ import qualified Data.Map.Strict as M
 
 import Audio.Envelope (ADSR(..))
 import Audio.Filter.Biquad (FilterType(..))
-import Audio.Filter.Types (FilterSlope(..), FilterSpec(..), KeyTrack(..))
-import Audio.Thread.Types (maxLayers)
+import Audio.Filter.Types (FilterSlope(..), FilterSpec(..), FilterTarget(..), KeyTrack(..))
+import Audio.Thread.Types (maxLayers, maxModRoutes)
 import Audio.Types
 import Engine.Config.FlatYaml
   ( FlatYaml
@@ -47,6 +52,7 @@ data PatchGraph = PatchGraph
   { pgName        ∷ !(Maybe String)
   , pgNodes       ∷ !(Map String PatchNode)
   , pgConnections ∷ !(Map String PatchConnection)
+  , pgModulations ∷ !(Map String PatchModulation)
   } deriving (Eq, Show)
 
 data PatchNode
@@ -61,11 +67,13 @@ data OscillatorNode = OscillatorNode
   { onWaveform ∷ !Waveform
   , onPitch    ∷ !PitchSpec
   , onLevel    ∷ !Float
+  , onAmpEnv   ∷ !(Maybe ADSR)
   } deriving (Eq, Show)
 
 data NoiseNode = NoiseNode
   { nnWaveform ∷ !Waveform
   , nnLevel    ∷ !Float
+  , nnAmpEnv   ∷ !(Maybe ADSR)
   } deriving (Eq, Show)
 
 data EnvelopeNode = EnvelopeNode
@@ -78,6 +86,7 @@ data FilterNode = FilterNode
   , fnQ            ∷ !Float
   , fnSlope        ∷ !FilterSlope
   , fnKeyTrack     ∷ !Float
+  , fnLayerTarget  ∷ !(Maybe String)
   , fnEnvAmountOct ∷ !Float
   , fnQEnvAmount   ∷ !Float
   } deriving (Eq, Show)
@@ -85,6 +94,7 @@ data FilterNode = FilterNode
 data OutputNode = OutputNode
   { outGain        ∷ !Float
   , outLayerSpread ∷ !Float
+  , outLfo1RateHz  ∷ !Float
   , outPlayMode    ∷ !PlayMode
   , outPolyMax     ∷ !Int
   , outVoiceSteal  ∷ !VoiceSteal
@@ -103,11 +113,25 @@ data PatchConnection = PatchConnection
   , pcKind ∷ !ConnectionKind
   } deriving (Eq, Show)
 
+data PatchModulationDestination
+  = PatchModDstPitchCents
+  | PatchModDstFilterCutoffOct
+  | PatchModDstAmpGain
+  deriving (Eq, Show)
+
+data PatchModulation = PatchModulation
+  { pmSource      ∷ !ModSrc
+  , pmTarget      ∷ !String
+  , pmDestination ∷ !PatchModulationDestination
+  , pmAmount      ∷ !Float
+  } deriving (Eq, Show)
+
 parsePatchGraphText ∷ String → Either String PatchGraph
 parsePatchGraphText contents = do
   entries <- parseFlatYaml contents
   let nodeIds = childKeys ["patch", "nodes"] entries
       connectionIds = childKeys ["patch", "connections"] entries
+      modulationIds = childKeys ["patch", "modulations"] entries
       patchName =
         case lookupMaybeKey ["patch", "name"] entries of
           Nothing -> Nothing
@@ -117,22 +141,38 @@ parsePatchGraphText contents = do
   ensure (not (null nodeIds)) "patch.nodes must define at least one node"
   nodes <- mapM (parsePatchNode entries) nodeIds
   connections <- mapM (parsePatchConnection entries) connectionIds
+  modulations <- mapM (parsePatchModulation entries) modulationIds
   pure
     PatchGraph
       { pgName = patchName
       , pgNodes = M.fromList nodes
       , pgConnections = M.fromList connections
+      , pgModulations = M.fromList modulations
       }
 
 compilePatchText ∷ String → Either String Instrument
 compilePatchText contents = parsePatchGraphText contents >>= compilePatchGraph
 
+loadInstrumentPatchEither ∷ FilePath → IO (Either String Instrument)
+loadInstrumentPatchEither path = do
+  contentsResult <- try (readFile path >>= \contents -> evaluate (length contents) >> pure contents) ∷ IO (Either SomeException String)
+  pure $
+    case contentsResult of
+      Left ex ->
+        Left ("Failed to read patch " <> path <> ": " <> displayException ex)
+      Right contents ->
+        case compilePatchText contents of
+          Left err ->
+            Left ("Invalid patch in " <> path <> ": " <> err)
+          Right instrument ->
+            Right instrument
+
 loadInstrumentPatch ∷ FilePath → IO Instrument
 loadInstrumentPatch path = do
-  contents <- readFile path
-  case compilePatchText contents of
+  result <- loadInstrumentPatchEither path
+  case result of
     Left err ->
-      ioError (userError ("Invalid patch in " <> path <> ": " <> err))
+      ioError (userError err)
     Right instrument ->
       pure instrument
 
@@ -141,6 +181,7 @@ compilePatchGraph graph = do
   outputId <- requireSingleOutputNode graph
   outputNode <- requireOutputNode graph outputId
   validateConnectionRefs graph
+  validateModulationRefs graph
   let allConnections = M.toList (pgConnections graph)
       signalConnections = filter ((== ConnectionSignal) . pcKind . snd) allConnections
       ampEnvelopeConnections = filter ((== ConnectionAmpEnvelope) . pcKind . snd) allConnections
@@ -201,10 +242,12 @@ compilePatchGraph graph = do
   ensure (length layerEnvelopePairs == length (nub (map fst layerEnvelopePairs)))
     "each signal layer may have at most one amp envelope connection"
   let layerEnvelopeMap = M.fromList layerEnvelopePairs
+  ensureNoInlineEnvelopeConflicts graph layerEnvelopeMap orderedSignalLayerIds
 
   filterEnvelope <- compileFilterEnvelope graph maybeFilterId outputEnvelope filterEnvelopeConnections
-  filterSpec <- compileFilterSpec graph maybeFilterId filterEnvelope
+  filterSpec <- compileFilterSpec graph maybeFilterId filterEnvelope layerIndexById
   syncMap <- compileHardSyncMap graph orderedSignalLayerIds layerIndexById hardSyncConnections
+  modRoutes <- compileModulations graph outputId maybeFilterId layerIndexById
 
   layers <- mapM (compileLayer graph layerEnvelopeMap syncMap) orderedSignalLayerIds
 
@@ -229,7 +272,8 @@ compilePatchGraph graph = do
       , iAdsrDefault = enAdsr outputEnvelope
       , iGain = outGain outputNode
       , iFilter = filterSpec
-      , iModRoutes = []
+      , iLfo1RateHz = outLfo1RateHz outputNode
+      , iModRoutes = modRoutes
       , iPlayMode = outPlayMode outputNode
       , iPolyMax = outPolyMax outputNode
       , iVoiceSteal = outVoiceSteal outputNode
@@ -260,13 +304,32 @@ parsePatchConnection entries connectionId = do
   ensure (not (null toNode)) ("patch.connections." <> connectionId <> ".to must not be empty")
   pure (connectionId, PatchConnection fromNode toNode kind)
 
+parsePatchModulation ∷ FlatYaml → String → Either String (String, PatchModulation)
+parsePatchModulation entries modulationId = do
+  let prefix = ["patch", "modulations", modulationId]
+  source <- parseModSrc =<< lookupKey (prefix <> ["source"]) entries
+  target <- trim <$> lookupKey (prefix <> ["target"]) entries
+  destination <- parsePatchModulationDestination =<< lookupKey (prefix <> ["destination"]) entries
+  amount <- lookupFloatKey (prefix <> ["amount"]) entries
+  ensure (not (null target)) ("patch.modulations." <> modulationId <> ".target must not be empty")
+  pure
+    ( modulationId
+    , PatchModulation
+        { pmSource = source
+        , pmTarget = target
+        , pmDestination = destination
+        , pmAmount = amount
+        }
+    )
+
 parseOscillatorNode ∷ FlatYaml → [String] → Either String OscillatorNode
 parseOscillatorNode entries prefix = do
   waveform <- parseOscillatorWaveform =<< lookupKey (prefix <> ["waveform"]) entries
   level <- lookupFloatKeyDefault (prefix <> ["level"]) 1 entries
   validateNonNegative (prefix <> ["level"]) level
   pitch <- parsePitchSpec entries prefix
-  pure (OscillatorNode waveform pitch level)
+  ampEnv <- parseOptionalAdsr entries (prefix <> ["amp_envelope"])
+  pure (OscillatorNode waveform pitch level ampEnv)
 
 parseNoiseNode ∷ FlatYaml → [String] → Either String NoiseNode
 parseNoiseNode entries prefix = do
@@ -281,7 +344,8 @@ parseNoiseNode entries prefix = do
       "pink" -> pure WavePinkNoise
       "mix" -> pure (WaveNoiseMix mixAmount)
       other -> Left ("unsupported noise color for " <> renderPath (prefix <> ["color"]) <> ": " <> other)
-  pure (NoiseNode waveform level)
+  ampEnv <- parseOptionalAdsr entries (prefix <> ["amp_envelope"])
+  pure (NoiseNode waveform level ampEnv)
 
 parseEnvelopeNode ∷ FlatYaml → [String] → Either String EnvelopeNode
 parseEnvelopeNode entries prefix = do
@@ -292,6 +356,19 @@ parseEnvelopeNode entries prefix = do
   validateAdsr prefix (ADSR attack decay sustain release)
   pure (EnvelopeNode (ADSR attack decay sustain release))
 
+parseOptionalAdsr ∷ FlatYaml → [String] → Either String (Maybe ADSR)
+parseOptionalAdsr entries prefix =
+  case lookupMaybeKey (prefix <> ["attack"]) entries of
+    Nothing -> pure Nothing
+    Just _ -> do
+      attack <- lookupFloatKey (prefix <> ["attack"]) entries
+      decay <- lookupFloatKey (prefix <> ["decay"]) entries
+      sustain <- lookupFloatKey (prefix <> ["sustain"]) entries
+      release <- lookupFloatKey (prefix <> ["release"]) entries
+      let adsr = ADSR attack decay sustain release
+      validateAdsr prefix adsr
+      pure (Just adsr)
+
 parseFilterNode ∷ FlatYaml → [String] → Either String FilterNode
 parseFilterNode entries prefix = do
   filterType <- parseFilterType =<< lookupKey (prefix <> ["mode"]) entries
@@ -299,6 +376,7 @@ parseFilterNode entries prefix = do
   q <- lookupFloatKeyDefault (prefix <> ["q"]) 0.707 entries
   slope <- parseFilterSlope (lookupTextKeyDefault (prefix <> ["slope"]) "24" entries)
   keyTrack <- lookupFloatKeyDefault (prefix <> ["key_track"]) 0 entries
+  layerTarget <- parseOptionalFilterLayerTarget entries prefix
   envAmount <- lookupFloatKeyDefault (prefix <> ["env_amount_oct"]) 0 entries
   qEnvAmount <- lookupFloatKeyDefault (prefix <> ["q_env_amount"]) 0 entries
   ensure (cutoffHz > 0) (renderPath (prefix <> ["cutoff_hz"]) <> " must be > 0")
@@ -311,24 +389,37 @@ parseFilterNode entries prefix = do
       , fnQ = q
       , fnSlope = slope
       , fnKeyTrack = keyTrack
+      , fnLayerTarget = layerTarget
       , fnEnvAmountOct = envAmount
       , fnQEnvAmount = qEnvAmount
       }
+
+parseOptionalFilterLayerTarget ∷ FlatYaml → [String] → Either String (Maybe String)
+parseOptionalFilterLayerTarget entries prefix =
+  case lookupMaybeKey (prefix <> ["layer_target"]) entries of
+    Nothing -> pure Nothing
+    Just raw -> do
+      let target = trim raw
+      ensure (not (null target)) (renderPath (prefix <> ["layer_target"]) <> " must not be empty")
+      pure (Just target)
 
 parseOutputNode ∷ FlatYaml → [String] → Either String OutputNode
 parseOutputNode entries prefix = do
   gain <- lookupFloatKeyDefault (prefix <> ["gain"]) 1 entries
   spread <- lookupFloatKeyDefault (prefix <> ["layer_spread"]) 0 entries
+  lfo1RateHz <- lookupFloatKeyDefault (prefix <> ["lfo1_rate_hz"]) 0 entries
   playMode <- parsePlayMode (lookupTextKeyDefault (prefix <> ["play_mode"]) "poly" entries)
   polyMax <- lookupIntKeyDefault (prefix <> ["poly_max"]) 8 entries
   voiceSteal <- parseVoiceSteal (lookupTextKeyDefault (prefix <> ["voice_steal"]) "quietest" entries)
   validateNonNegative (prefix <> ["gain"]) gain
+  validateNonNegative (prefix <> ["lfo1_rate_hz"]) lfo1RateHz
   ensure (spread >= 0 && spread <= 1) (renderPath (prefix <> ["layer_spread"]) <> " must be in [0,1]")
   ensure (polyMax > 0) (renderPath (prefix <> ["poly_max"]) <> " must be > 0")
   pure
     OutputNode
       { outGain = gain
       , outLayerSpread = spread
+      , outLfo1RateHz = lfo1RateHz
       , outPlayMode = playMode
       , outPolyMax = polyMax
       , outVoiceSteal = voiceSteal
@@ -354,7 +445,6 @@ compileLayer graph layerEnvelopeMap syncMap nodeId = do
     case M.lookup nodeId syncMap of
       Nothing -> pure NoSync
       Just syncSpec' -> pure syncSpec'
-  let ampEnvelope = enAdsr <$> M.lookup nodeId layerEnvelopeMap
   node <- requireNode graph nodeId
   case node of
     PatchNodeOscillator oscillator ->
@@ -364,7 +454,7 @@ compileLayer graph layerEnvelopeMap syncMap nodeId = do
           , olPitch = onPitch oscillator
           , olLevel = onLevel oscillator
           , olSync = syncSpec
-          , olAmpEnv = ampEnvelope
+          , olAmpEnv = resolveLayerAmpEnv (onAmpEnv oscillator) (enAdsr <$> M.lookup nodeId layerEnvelopeMap)
           }
     PatchNodeNoise noise ->
       pure
@@ -373,10 +463,16 @@ compileLayer graph layerEnvelopeMap syncMap nodeId = do
           , olPitch = PitchSpec 0 0 0 0
           , olLevel = nnLevel noise
           , olSync = syncSpec
-          , olAmpEnv = ampEnvelope
+          , olAmpEnv = resolveLayerAmpEnv (nnAmpEnv noise) (enAdsr <$> M.lookup nodeId layerEnvelopeMap)
           }
     _ ->
       Left ("node `" <> nodeId <> "` is not a signal source and cannot compile into a layer")
+
+resolveLayerAmpEnv ∷ Maybe ADSR → Maybe ADSR → Maybe ADSR
+resolveLayerAmpEnv inlineEnvelope connectedEnvelope =
+  case inlineEnvelope of
+    Just adsr -> Just adsr
+    Nothing -> connectedEnvelope
 
 compileLayerEnvelopeConnection
   ∷ PatchGraph
@@ -388,6 +484,25 @@ compileLayerEnvelopeConnection graph layerNodeIds (_, conn)
       envelope <- requireEnvelopeNode graph (pcFrom conn)
       pure (Just (pcTo conn, envelope))
   | otherwise = pure Nothing
+
+ensureNoInlineEnvelopeConflicts
+  ∷ PatchGraph
+  → Map String EnvelopeNode
+  → [String]
+  → Either String ()
+ensureNoInlineEnvelopeConflicts graph layerEnvelopeMap layerNodeIds =
+  mapM_ ensureNoConflict layerNodeIds
+  where
+    ensureNoConflict nodeId =
+      ensure (not (hasInlineAmpEnvelope graph nodeId && M.member nodeId layerEnvelopeMap))
+        ("signal layer `" <> nodeId <> "` cannot use both an inline amp_envelope block and an amp_envelope connection")
+
+hasInlineAmpEnvelope ∷ PatchGraph → String → Bool
+hasInlineAmpEnvelope graph nodeId =
+  case M.lookup nodeId (pgNodes graph) of
+    Just (PatchNodeOscillator oscillator) -> onAmpEnv oscillator /= Nothing
+    Just (PatchNodeNoise noise) -> nnAmpEnv noise /= Nothing
+    _ -> False
 
 compileFilterEnvelope
   ∷ PatchGraph
@@ -408,10 +523,11 @@ compileFilterEnvelope graph (Just filterId) outputEnvelope connections =
         [(_, conn)] -> requireEnvelopeNode graph (pcFrom conn)
         _ -> Left ("filter node `" <> filterId <> "` must have at most one filter envelope connection")
 
-compileFilterSpec ∷ PatchGraph → Maybe String → EnvelopeNode → Either String (Maybe FilterSpec)
-compileFilterSpec _ Nothing _ = pure Nothing
-compileFilterSpec graph (Just filterId) envelopeNode = do
+compileFilterSpec ∷ PatchGraph → Maybe String → EnvelopeNode → Map String Int → Either String (Maybe FilterSpec)
+compileFilterSpec _ Nothing _ _ = pure Nothing
+compileFilterSpec graph (Just filterId) envelopeNode layerIndexById = do
   filterNode <- requireFilterNode graph filterId
+  target <- compileFilterTarget filterId layerIndexById (fnLayerTarget filterNode)
   pure
     (Just
       FilterSpec
@@ -420,11 +536,25 @@ compileFilterSpec graph (Just filterId) envelopeNode = do
         , fQ = fnQ filterNode
         , fSlope = fnSlope filterNode
         , fKeyTrack = KeyTrack (fnKeyTrack filterNode)
+        , fTarget = target
         , fEnvAmountOct = fnEnvAmountOct filterNode
         , fEnvADSR = enAdsr envelopeNode
         , fQEnvAmount = fnQEnvAmount filterNode
         }
     )
+
+compileFilterTarget ∷ String → Map String Int → Maybe String → Either String FilterTarget
+compileFilterTarget _ _ Nothing = pure FilterTargetAll
+compileFilterTarget _ _ (Just targetRaw)
+  | canonical targetRaw == "all" = pure FilterTargetAll
+compileFilterTarget filterId layerIndexById (Just targetRaw) =
+  case M.lookup targetRaw layerIndexById of
+    Just layerIx -> pure (FilterTargetLayer layerIx)
+    Nothing ->
+      Left
+        ( "filter node `" <> filterId <> "` layer_target must reference an active oscillator or noise node, or `all`: "
+            <> targetRaw
+        )
 
 compileHardSyncMap
   ∷ PatchGraph
@@ -453,6 +583,66 @@ compileHardSyncMap graph layerNodeIds layerIndexById connections = do
 
     ensureSingleSync (targetId, masterIxs) =
       ensure (length masterIxs == 1) ("oscillator `" <> targetId <> "` must have at most one hard sync source")
+
+compileModulations
+  ∷ PatchGraph
+  → String
+  → Maybe String
+  → Map String Int
+  → Either String [ModRoute]
+compileModulations graph outputId maybeFilterId layerIndexById = do
+  let namedModulations = M.toList (pgModulations graph)
+  ensure (length namedModulations <= maxModRoutes)
+    ("patch uses " <> show (length namedModulations) <> " modulation routes but the engine supports at most " <> show maxModRoutes)
+  mapM compileNamedModulation namedModulations
+  where
+    compileNamedModulation (modulationId, modulation) = do
+      dst <-
+        case pmDestination modulation of
+          PatchModDstPitchCents ->
+            case M.lookup (pmTarget modulation) layerIndexById of
+              Just layerIx ->
+                pure (ModDstLayerPitchCents layerIx)
+              Nothing ->
+                Left
+                  ( "patch.modulations."
+                      <> modulationId
+                      <> " must target an active oscillator or noise layer for pitch modulation: `"
+                      <> pmTarget modulation
+                      <> "`"
+                  )
+          PatchModDstFilterCutoffOct ->
+            case maybeFilterId of
+              Just filterId
+                | pmTarget modulation == filterId ->
+                    pure ModDstFilterCutoffOct
+                | otherwise ->
+                    Left
+                      ( "patch.modulations."
+                          <> modulationId
+                          <> " must target the active filter node `"
+                          <> filterId
+                          <> "` for filter cutoff modulation"
+                      )
+              Nothing ->
+                Left ("patch.modulations." <> modulationId <> " targets filter cutoff modulation but the patch has no active filter")
+          PatchModDstAmpGain ->
+            if pmTarget modulation == outputId
+              then pure ModDstAmpGain
+              else
+                Left
+                  ( "patch.modulations."
+                      <> modulationId
+                      <> " must target the output node `"
+                      <> outputId
+                      <> "` for amp gain modulation"
+                  )
+      pure
+        ModRoute
+          { mrSrc = pmSource modulation
+          , mrDst = dst
+          , mrAmount = pmAmount modulation
+          }
 
 requireSingleOutputNode ∷ PatchGraph → Either String String
 requireSingleOutputNode graph =
@@ -483,6 +673,16 @@ validateConnectionRefs graph =
         ("patch.connections." <> connectionId <> ".from references unknown node `" <> pcFrom conn <> "`")
       ensure (M.member (pcTo conn) (pgNodes graph))
         ("patch.connections." <> connectionId <> ".to references unknown node `" <> pcTo conn <> "`")
+
+validateModulationRefs ∷ PatchGraph → Either String ()
+validateModulationRefs graph =
+  mapM_
+    validateModulation
+    (M.toList (pgModulations graph))
+  where
+    validateModulation (modulationId, modulation) =
+      ensure (M.member (pmTarget modulation) (pgNodes graph))
+        ("patch.modulations." <> modulationId <> ".target references unknown node `" <> pmTarget modulation <> "`")
 
 requireNode ∷ PatchGraph → String → Either String PatchNode
 requireNode graph nodeId =
@@ -547,6 +747,34 @@ parseConnectionKind raw =
     "filterenvelope" -> pure ConnectionFilterEnvelope
     "hardsync" -> pure ConnectionHardSync
     other -> Left ("unsupported patch connection kind: " <> other)
+
+parseModSrc ∷ String → Either String ModSrc
+parseModSrc raw =
+  case canonical raw of
+    "lfo1" -> pure ModSrcLfo1
+    "ampenvelope" -> pure ModSrcEnvAmp
+    "ampenv" -> pure ModSrcEnvAmp
+    "envamp" -> pure ModSrcEnvAmp
+    "filterenvelope" -> pure ModSrcEnvFilter
+    "filterenv" -> pure ModSrcEnvFilter
+    "envfilter" -> pure ModSrcEnvFilter
+    "keytrack" -> pure ModSrcKeyTrack
+    "channelaftertouch" -> pure ModSrcChanAftertouch
+    "chanaftertouch" -> pure ModSrcChanAftertouch
+    "polyaftertouch" -> pure ModSrcPolyAftertouch
+    "noteaftertouch" -> pure ModSrcPolyAftertouch
+    other -> Left ("unsupported patch modulation source: " <> other)
+
+parsePatchModulationDestination ∷ String → Either String PatchModulationDestination
+parsePatchModulationDestination raw =
+  case canonical raw of
+    "pitchcents" -> pure PatchModDstPitchCents
+    "layerpitchcents" -> pure PatchModDstPitchCents
+    "filtercutoffoct" -> pure PatchModDstFilterCutoffOct
+    "cutoffoct" -> pure PatchModDstFilterCutoffOct
+    "ampgain" -> pure PatchModDstAmpGain
+    "gain" -> pure PatchModDstAmpGain
+    other -> Left ("unsupported patch modulation destination: " <> other)
 
 parseOscillatorWaveform ∷ String → Either String Waveform
 parseOscillatorWaveform raw =
